@@ -1,0 +1,9 @@
+-I~/code/llvm-project/llvm/include/
+-Iparlaylib/include/
+-I/usr/include/libunwind/
+-lunwind-setjmp
+-lunwind
+-lpthread
+-xc++
+-stdlib=libc++
+-std=c++17

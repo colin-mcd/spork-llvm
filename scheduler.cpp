@@ -5,11 +5,14 @@
 
 #include <atomic>
 #include <csignal>
+#include <cstddef>
 #include <cstdint>
 #include <signal.h>
 //#include <ucontext.h>
 #include <libunwind.h>
 #include <iostream>
+//#include "libunwind/
+//Registers_x86_64::Registers_x86_64
 
 namespace parlay {
 namespace spork_spoin {
@@ -21,10 +24,11 @@ enum TokenPolicy {
 };
 
 #ifndef SPORK_PROMOTED
-#define SPORK_PROMOTED true
-#define SPORK_UNPROMOTED false
+#define SPORK_PROMOTED (true)
+#define SPORK_UNPROMOTED (false)
 #define SPORK_IS_UNPR(x) (!x)
 #define SPORK_IS_PROM(x) (x)
+#define SPORK_PROMOTE(x) (*x = SPORK_PROMOTED)
 #endif
 
 typedef unsigned int spork_id_t;
@@ -32,46 +36,12 @@ typedef unsigned int spork_id_t;
 
 /*
  * IDEA:
- * using a macros(?), make an (extensible?) enum of all lambda types
+ * using macros(?), make an (extensible?) enum of all lambda types
  * and store the specific instance value in the spork table.
  * Then, do_promote() splits on that value and instantiates
  * the spwn lambda pointer to the correct type.
  * I believe this would allow "perfect forwarding"?
  */
-
-// std::exception_ptr ex = std::current_exception();
-// std::rethrow_exception(ex);
-// struct joinpoint {
-//   std::thread leftSideThread; // = std::this_thread::get_id();
-//   std::thread::id* _Nullable rightSideThread;
-//   void* _Nullable rightSideResult;
-//   std::exception_ptr* _Nullable rightSideExn;
-
-//   // 2: both sides executing, 
-//   // 1: other side finished,
-//   // 0: both sides finished
-//   std::atomic_uint_fast8_t incounter;
-
-//   unsigned int spareHeartbeatsGiven;
-//   TokenPolicy tokenPolicy;
-
-//   joinpoint(std::thread::id leftSideThread) :
-//     leftSideThread(leftSideThread),
-//     rightSideThread(nullptr),
-//     rightSideResult(nullptr),
-//     rightSideExn(nullptr),
-//     incounter(2),
-//     spareHeartbeatsGiven(0),
-//     tokenPolicy(TokenPolicyFair) {}
-
-//   joinpoint() : joinpoint(std::this_thread::get_id()) {}
-
-//   // Atomically decrement incounter and
-//   // return whether that operation reached 0
-//   bool decrementIncounterHitsZero() {
-//     return incounter.fetch_sub(1) == 1;
-//   }
-// };
 
 thread_local volatile std::atomic_uint heartbeat_tokens = 10;
 
@@ -90,16 +60,35 @@ thread_local volatile std::atomic_uint heartbeat_tokens = 10;
   
 // }
 
-struct SpwnJob4 : WorkStealingJob {
-  explicit SpwnJob4(const std::function<void()> _f, unsigned int hbt) : WorkStealingJob(), f(_f), num_heartbeat_tokens(hbt) { }
+struct SpwnJob : WorkStealingJob {
+  explicit SpwnJob(const void* spwn_ip,
+                   const uintptr_t spwn_sp,
+                   const uintptr_t spwn_bp,
+                   const unsigned int hbt) :
+    WorkStealingJob(),
+    spwn_ip(spwn_ip),
+    spwn_sp(spwn_sp),
+    spwn_bp(spwn_bp),
+    num_heartbeat_tokens(hbt) { }
+
   void execute() override {
     heartbeat_tokens.fetch_add(num_heartbeat_tokens);
-    f();
+    //goto * ((void*) spwn_ip);
+    void* p = __builtin_frame_address(0);
+    ptrdiff_t frame_size = spwn_bp - spwn_sp;
+    std::cout << "Frame size = " << frame_size << ", spwn_ip = " << spwn_ip << std::endl;
+    void (*spwn)(void) = (void (*)())spwn_ip;
+    spwn(); // might as well try this to see if it works ¯\_(ツ)_/¯
+    //goto *new_ip;
+    //asm volatile("jmp *%0" : : "r"(new_ip) : "memory");
+    //__builtin_unreachable();
   }
  private:
-  const std::function<void()> f;
+  const void* spwn_ip;
+  const uintptr_t spwn_sp;
+  const uintptr_t spwn_bp;
  public:
-  unsigned int num_heartbeat_tokens;
+  const unsigned int num_heartbeat_tokens;
 };
 
 typedef uint_fast8_t spork_slot_idx_t;
@@ -107,11 +96,10 @@ typedef uint_fast8_t spork_slot_idx_t;
 typedef struct spork_entry_t {
   TokenPolicy token_policy;
   volatile bool* flag_offset;
-  const std::function<void()>* spwn_offset;
+  void* spwn;
 
   void offset(uintptr_t bp) {
     flag_offset = (volatile bool*) (bp - (uintptr_t) flag_offset);
-    spwn_offset = (const std::function<void()>*) (bp - (uintptr_t) spwn_offset);
   }
 } spork_entry_t;
 
@@ -119,15 +107,15 @@ typedef struct spork_row_t {
   // number of sporks this code location is nested inside
   const spork_slot_idx_t num_sporks;
   // num_sporks-length array of (promoted, spwn) offsets
-  const spork_entry_t* spork_spwn_offsets;
+  const spork_entry_t* sporks;
 } spork_row_t;
 
 //extern const spork_row_t* spork_table_lookup_ip(unw_word_t ip);
-spork_entry_t colin_default = {TokenPolicyFair, (volatile bool*) 0xd0, (const std::function<void()>*) 0x41};
+spork_entry_t colin_default = {TokenPolicyFair, (volatile bool*) 0x39, (void*) 0x555555556d0d}; // TODO: spwn label address
 spork_row_t colin_default_row = {1, &colin_default};
 spork_row_t* spork_table_lookup_ip(unw_word_t ip) {
   switch (ip) {
-    case 0x555555557c7b:
+    case 0x555555556bb6:
       return &colin_default_row;
     default:
       //return &colin_default_row;
@@ -135,7 +123,7 @@ spork_row_t* spork_table_lookup_ip(unw_word_t ip) {
   }
 }
 
-using scheduler_t = parlay::scheduler<SpwnJob4>;
+using scheduler_t = parlay::scheduler<SpwnJob>;
 
 extern inline scheduler_t& get_current_scheduler() {
   auto current_scheduler = scheduler_t::get_current_scheduler();
@@ -146,9 +134,185 @@ extern inline scheduler_t& get_current_scheduler() {
   return *current_scheduler;
 }
 
+unsigned int splitTokens(TokenPolicy policy, unsigned int tokens) {
+  unsigned int give_hbt = 0;
+  switch (policy) {
+    case TokenPolicyFair:
+      give_hbt = tokens >> 1;
+      break;
+    case TokenPolicyGive:
+      give_hbt = tokens;
+      break;
+    case TokenPolicyKeep:
+      give_hbt = 0;
+      break;
+  }
+  return give_hbt;
+}
+
 // TODO: consider how to do this from signal handler
 // (ip not a return address in current frame)
-bool do_promote() {
+unsigned int promotes(unsigned int tokens, unw_cursor_t& cursor, unw_context_t& uc) {
+  if (tokens == 0) return 0;
+  unw_word_t frame_ip, frame_sp, frame_bp;
+  const spork_row_t* row;
+
+  // find first stack frame with sporks
+  while (unw_step(&cursor) > 0) {
+    // get stored register values for this stack frame
+    unw_get_reg(&cursor, UNW_REG_SP, &frame_sp);
+    unw_get_reg(&cursor, UNW_REG_IP, &frame_ip);
+    unw_get_reg(&cursor, UNW_X86_64_RBP, &frame_bp);
+    
+
+    std::cout << "frame ip = " << (void*) frame_ip << ", frame bp = " << (void*) frame_bp << ", frame sp = " << (void*) frame_sp << std::endl;
+
+    row = spork_table_lookup_ip(frame_ip);
+    std::cout << "row = " << (void*) row << std::endl;
+    if ((row != NULL) && (row->num_sporks > 0)) break;
+  }
+
+  if (row == NULL) return tokens;
+
+  bool no_promoted_slots = true;
+
+  // inspect each spork slot
+  for (spork_slot_idx_t slot = 0; slot < row->num_sporks && tokens > 0; ++slot) {
+    spork_entry_t p = row->sporks[slot];
+    // p's offsets are relative to frame's bp and ip values
+    volatile bool* flag = (volatile bool*) (frame_bp - (uintptr_t) p.flag_offset);
+    std::cout << "checking flag at " << (void*) flag << " = " << *flag << std::endl;
+  
+    if (SPORK_IS_UNPR(*flag)) {
+      // this slot is not yet promoted
+  
+      // try promoting above us first,
+      // unless we already passed a promoted slot in this for loop
+      if (no_promoted_slots) {
+        // TODO: these copies might be somewhat expensive...
+        // investigate if there is a way to avoid copying
+        unw_context_t backup_uc = uc;
+        unw_cursor_t backup_cursor = cursor;
+        tokens = promotes(tokens, cursor, uc);
+        if (tokens > 0) {
+          uc = backup_uc;
+          cursor = backup_cursor;
+          
+        }
+      }
+  
+      if (tokens > 0) {
+        std::cout << "TOP SPORK flag = " << (void*) flag << ", spwn job = " << (void*) p.spwn << std::endl;
+        SPORK_PROMOTE(flag);
+        tokens--;
+        
+        unsigned int give_hbt = splitTokens(p.token_policy, tokens);
+        tokens -= give_hbt;
+        // TODO: ensure spawn(...)'s call to wake_up_a_worker is not blocking
+        // get_current_scheduler().spawn(new SpwnJob(p.spwn, frame_sp, frame_bp, give_hbt));
+        get_current_scheduler().spawn(new SpwnJob(p.spwn, frame_sp, frame_bp, give_hbt));
+      } else { // no more tokens
+        break;
+      }
+    } else { // think about terminating thread? Or return to spwnjob execute, which then does stuff
+      no_promoted_slots = false;
+    }
+  }
+  return tokens;
+}
+
+// TODO: consider how to do this from signal handler
+// (ip not a return address in current frame)
+// bool do_promote() {
+//   unw_cursor_t cursor;
+//   unw_context_t uc;
+//   unw_getcontext(&uc);
+//   unw_init_local(&cursor, &uc);
+//   // TODO if called from signal handler, above should be:
+//   // (although, confirm that this doesn't just search the signal stack!!)
+//   // unw_init_local2(&cursor, &uc, UNW_INIT_SIGNAL_FRAME);
+
+//   // possible optimization TODO:
+//   // only call spork_table_lookup_ip(ip)
+//   // if no frame above us succeeded.
+//   // implement this with an array buffer of
+//   // (flag,spwn) pairs and only do non-tail
+//   // recursive call when the buffer is full
+//   spork_entry_t top_spork;
+
+//   unw_word_t frame_ip, frame_sp, frame_bp;
+  
+//   bool cont = true;
+//   bool can_prom = false;
+//   while (cont && unw_step(&cursor) > 0) {
+//     unw_get_reg(&cursor, UNW_REG_SP, &frame_sp);
+//     unw_get_reg(&cursor, UNW_REG_IP, &frame_ip);
+//     unw_get_reg(&cursor, UNW_X86_64_RBP, &frame_bp);
+//     std::cout << "frame ip = " << (void*) frame_ip << ", frame bp = " << (void*) frame_bp << ", frame sp = " << (void*) frame_sp << std::endl;
+//     const spork_row_t* row = spork_table_lookup_ip(frame_ip);
+//     // if return address is a function with sporks
+//     if (row) {
+//       // now check if sporks are unpromoted
+//       const spork_slot_idx_t num_sporks = row->num_sporks;
+//       for (spork_slot_idx_t slot = 0; slot < num_sporks; ++slot) {
+//         auto p = row->sporks[slot];
+//         // p's offsets are relative to retaddr_sp
+//         p.offset(frame_bp, frame_ip);
+//         std::cout << "checking flag at " << (void*) p.flag_offset << " = " << *p.flag_offset << std::endl;
+//         if (*p.flag_offset == SPORK_UNPROMOTED) {
+//           // this slot is not yet promoted
+//           top_spork = p;
+//           can_prom = true;
+//           break;
+//         } else {
+//           // since this slot was already promoted, there cannot be any unpromoted above
+//           cont = false;
+//         }
+//       }
+//     }
+//   }
+//   if (can_prom) {
+//     std::cout << "TOP SPORK flag = " << (void*) top_spork.flag_offset << ", spwn job = " << (void*) top_spork.spwn_offset << std::endl;
+//     *top_spork.flag_offset = SPORK_PROMOTED;
+
+//     unsigned int give_hbt = 0;
+//     // this probably doesn't have to be thread-safe
+//     // because promotion should be run atomically, right?
+//     unsigned int cur_hbt = heartbeat_tokens.exchange(0);
+//     switch (top_spork.token_policy) {
+//       case TokenPolicyFair:
+//         give_hbt = cur_hbt >> 1;
+//         break;
+//       case TokenPolicyGive:
+//         give_hbt = cur_hbt;
+//         break;
+//       case TokenPolicyKeep:
+//         give_hbt = 0;
+//         break;
+//     }
+//     //top_spork.spwn_offset->num_heartbeat_tokens += give_hbt;
+//     heartbeat_tokens.fetch_add(cur_hbt - give_hbt);
+//     // TODO: ensure spawn(job)'s call to wake_up_a_worker is not blocking
+//     get_current_scheduler().spawn(new SpwnJob(top_spork.spwn_offset, TODO, TODO, give_hbt));
+//     return true;
+//   } else {
+//     return false; 
+//   }
+// }
+
+// helper function for `try_consume_tokens()`
+// __attribute__((noinline))
+// unsigned int promote_until_failure() {
+//   unsigned int old_tokens = heartbeat_tokens.exchange(0);
+//   unsigned int new_tokens = old_tokens;
+//   while (new_tokens && do_promote()) new_tokens--;
+//   heartbeat_tokens.fetch_add(new_tokens);
+//   return old_tokens - new_tokens;
+// }
+
+__attribute__((noinline))
+unsigned int promotes_until_failure() {
+  unsigned int old_tokens = heartbeat_tokens.exchange(0);
   unw_cursor_t cursor;
   unw_context_t uc;
   unw_getcontext(&uc);
@@ -156,81 +320,7 @@ bool do_promote() {
   // TODO if called from signal handler, above should be:
   // (although, confirm that this doesn't just search the signal stack!!)
   // unw_init_local2(&cursor, &uc, UNW_INIT_SIGNAL_FRAME);
-
-  // possible optimization TODO:
-  // only call spork_table_lookup_ip(ip)
-  // if no frame above us succeeded.
-  // implement this with an array buffer of
-  // (flag,spwn) pairs and only do non-tail
-  // recursive call when the buffer is full
-  spork_entry_t top_spork;
-
-  unw_word_t frame_ip, frame_sp, frame_bp;
-  
-  bool cont = true;
-  bool can_prom = false;
-  while (cont && unw_step(&cursor) > 0) {
-    unw_get_reg(&cursor, UNW_REG_SP, &frame_sp);
-    unw_get_reg(&cursor, UNW_REG_IP, &frame_ip);
-    unw_get_reg(&cursor, UNW_X86_64_RBP, &frame_bp);
-    std::cout << "frame ip = " << (void*) frame_ip << ", frame bp = " << (void*) frame_bp << ", frame sp = " << (void*) frame_sp << std::endl;
-    const spork_row_t* row = spork_table_lookup_ip(frame_ip);
-    // if return address is a function with sporks
-    if (row) {
-      // now check if sporks are unpromoted
-      const spork_slot_idx_t num_sporks = row->num_sporks;
-      for (spork_slot_idx_t slot = 0; slot < num_sporks; ++slot) {
-        auto p = row->spork_spwn_offsets[slot];
-        // p's offsets are relative to retaddr_sp
-        p.offset(frame_bp);
-        std::cout << "checking flag at " << (void*) p.flag_offset << " = " << *p.flag_offset << std::endl;
-        if (*p.flag_offset == SPORK_UNPROMOTED) {
-          // this slot is not yet promoted
-          top_spork = p;
-          can_prom = true;
-          break;
-        } else {
-          // since this slot was already promoted, there cannot be any unpromoted above
-          cont = false;
-        }
-      }
-    }
-  }
-  if (can_prom) {
-    std::cout << "TOP SPORK flag = " << (void*) top_spork.flag_offset << ", spwn job = " << (void*) top_spork.spwn_offset << std::endl;
-    *top_spork.flag_offset = SPORK_PROMOTED;
-
-    unsigned int give_hbt = 0;
-    // this probably doesn't have to be thread-safe
-    // because promotion should be run atomically, right?
-    unsigned int cur_hbt = heartbeat_tokens.exchange(0);
-    switch (top_spork.token_policy) {
-      case TokenPolicyFair:
-        give_hbt = cur_hbt >> 1;
-        break;
-      case TokenPolicyGive:
-        give_hbt = cur_hbt;
-        break;
-      case TokenPolicyKeep:
-        give_hbt = 0;
-        break;
-    }
-    //top_spork.spwn_offset->num_heartbeat_tokens += give_hbt;
-    heartbeat_tokens.fetch_add(cur_hbt - give_hbt);
-    // TODO: ensure spawn(job)'s call to wake_up_a_worker is not blocking
-    get_current_scheduler().spawn(new SpwnJob4(*top_spork.spwn_offset, give_hbt));
-    return true;
-  } else {
-    return false; 
-  }
-}
-
-// helper function for `try_consume_tokens()`
-__attribute__((noinline))
-unsigned int promote_until_failure() {
-  unsigned int old_tokens = heartbeat_tokens.exchange(0);
-  unsigned int new_tokens = old_tokens;
-  while (new_tokens && do_promote()) new_tokens--;
+  unsigned int new_tokens = promotes(old_tokens, cursor, uc);
   heartbeat_tokens.fetch_add(new_tokens);
   return old_tokens - new_tokens;
 }
@@ -240,7 +330,8 @@ unsigned int promote_until_failure() {
 __attribute__((always_inline))
 unsigned int try_consume_tokens() {
   if (heartbeat_tokens) [[unlikely]] {
-    return promote_until_failure();
+    //return promote_until_failure();
+    return promotes_until_failure();
   } else [[likely]] {
     return 0;
   }
@@ -253,10 +344,19 @@ void acquire_heartbeat_tokens(unsigned int new_tokens) {
 }
 
 //extern void __RTS_record_spork(const TokenPolicy tokenPolicy, volatile bool* flag, const SpwnJob4* spwn);
-void __RTS_record_spork(const TokenPolicy tokenPolicy, volatile bool* flag, const std::function<void()>* spwn) {}
+void __RTS_record_spork(const TokenPolicy tokenPolicy, volatile bool* flag, const void* spwn) {}
+
+//#include "UnwindRegisterRestore.S"
+
+// TODO: make this architecture-independent
+//extern "C" void __libunwind_Registers_x86_64_jumpto(unw_context_t);
 
 void dbgmsg(const void* ptr, uint64_t rbp) {
   std::cout << "ptr = " << (void*) ptr << ", rbp = " << (void*) rbp << ", diff = " << (void*) (rbp - (uint64_t) ptr) << std::endl;
+}
+
+void* get_instruction_pointer() {
+    return __builtin_return_address(0);
 }
 
 // TODO: exception handling
@@ -274,47 +374,50 @@ static void spork(A1&& body,
   uint64_t rbp_value;
   // Inline assembly to move the value of rsp into the C++ variable rsp_value
   __asm__("mov %%rbp, %0" : "=r"(rbp_value));
-  dbgmsg(&spwn, rbp_value);
   dbgmsg((void*) &__SPORK0_flag, rbp_value);
 
-  if (SPORK_IS_UNPR(__SPORK0_flag)) [[likely]] {
-    // spork body
+  std::cout << "spwn_label at " << (void*) &&spwn_label << std::endl;
+
+  // spork
+  if (SPORK_IS_UNPR(__SPORK0_flag)) [[likely]] { // body
     try_consume_tokens();
     std::forward<A1>(body)();
+    // arbitrary code to take time
     int result = 151515;
     for (int i = 0; i < 100000; i++) {
       result ^= 0x351141421;
       result -= 14;
     }
     std::cout << result << std::endl;
-  } else [[unlikely]] {
-    std::forward<A6
-  }
-
-  // spoin
-  if (SPORK_IS_UNPR(__SPORK0_flag)) [[likely]] {
-    // spoin unpromoted
-    std::forward<A2>(unpr)();
-  } else [[unlikely]] {
-    std::forward<A3>(prom)();
-    // spoin promoted
-    scheduler_t& scheduler = get_current_scheduler();
-    const SpwnJob4* spwn_job = scheduler.get_own_job();
-    if (spwn_job != nullptr) [[likely]] {
-      // unstolen
-      heartbeat_tokens.fetch_add(spwn_job->num_heartbeat_tokens);
-      std::forward<A4>(unst)();
-    } else [[unlikely]] {
-      // TODO: make sure this optimizes away
-      __RTS_record_spork(tokenPolicy, &__SPORK0_flag, &spwn);
-      // TODO: steal other work from this thread,
-      // make spwn's thread resume this job when it finishes
-      auto done = [&]() { return spwn_job->finished(); };
-      scheduler.wait_until(done, false);
-      assert(spwn_job->finished());
-      delete spwn_job;
-      std::forward<A5>(sync)();
+  
+    // spoin
+    if (SPORK_IS_UNPR(__SPORK0_flag)) [[likely]] { // unpromoted
+      std::forward<A2>(unpr)();
+    } else [[unlikely]] { // promoted
+      std::forward<A3>(prom)();
+      scheduler_t& scheduler = get_current_scheduler();
+      const SpwnJob* spwn_job = scheduler.get_own_job();
+      if (spwn_job != nullptr) [[likely]] {
+        // unstolen
+        heartbeat_tokens.fetch_add(spwn_job->num_heartbeat_tokens);
+        std::forward<A4>(unst)();
+      } else [[unlikely]] {
+        // TODO: make sure this optimizes away
+        __RTS_record_spork(tokenPolicy, &__SPORK0_flag, &spwn);
+        // TODO: steal other work from this thread,
+        // make spwn's thread resume this job when it finishes
+        auto done = [&]() { return spwn_job->finished(); };
+        scheduler.wait_until(done, false);
+        assert(spwn_job->finished());
+        delete spwn_job;
+        std::forward<A5>(sync)();
+      }
     }
+  } else [[unlikely]] { // spwn
+    spwn_label:
+    std::cout << "inside spwn!" << std::endl;
+    std::forward<A6>(spwn)();
+    return;
   }
 } // void spork(...)
 } // namespace spork_spoin
@@ -330,7 +433,9 @@ int main(int argc, char* argv[]) {
      [&] () { std::cout << "unpromoted!" << std::endl;
               return x += 5; },
      parlay::spork_spoin::TokenPolicyFair,
-     [&] () { x += 4; },
+     [&] () { std::cout << "spwn!" << std::endl;
+              x += 4;
+              std::cout << "spwn incremented x" << std::endl; },
      [&] () { std::cout << "promoted!" << std::endl;
               return x; },
      [&] () { std::cout << "unstolen!" << std::endl;

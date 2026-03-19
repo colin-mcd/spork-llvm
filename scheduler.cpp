@@ -61,34 +61,24 @@ thread_local volatile std::atomic_uint heartbeat_tokens = 10;
 // }
 
 struct SpwnJob : WorkStealingJob {
-  explicit SpwnJob(const void* spwn_ip,
-                   const uintptr_t spwn_sp,
-                   const uintptr_t spwn_bp,
-                   const unsigned int hbt) :
+  explicit SpwnJob(void* spwn_ip,
+                   unw_cursor_t cursor,
+                   unsigned int hbt) :
     WorkStealingJob(),
     spwn_ip(spwn_ip),
-    spwn_sp(spwn_sp),
-    spwn_bp(spwn_bp),
+    cursor(cursor),
     num_heartbeat_tokens(hbt) { }
 
   void execute() override {
     heartbeat_tokens.fetch_add(num_heartbeat_tokens);
-    //goto * ((void*) spwn_ip);
-    void* p = __builtin_frame_address(0);
-    ptrdiff_t frame_size = spwn_bp - spwn_sp;
-    std::cout << "Frame size = " << frame_size << ", spwn_ip = " << spwn_ip << std::endl;
-    void (*spwn)(void) = (void (*)())spwn_ip;
-    spwn(); // might as well try this to see if it works ¯\_(ツ)_/¯
-    //goto *new_ip;
-    //asm volatile("jmp *%0" : : "r"(new_ip) : "memory");
-    //__builtin_unreachable();
+    unw_set_reg(&cursor, (unw_regnum_t) UNW_REG_IP, (unw_word_t) spwn_ip);
+    unw_resume(&cursor);
   }
  private:
-  const void* spwn_ip;
-  const uintptr_t spwn_sp;
-  const uintptr_t spwn_bp;
+  void* spwn_ip;
+  unw_cursor_t cursor;
  public:
-  const unsigned int num_heartbeat_tokens;
+  unsigned int num_heartbeat_tokens;
 };
 
 typedef uint_fast8_t spork_slot_idx_t;
@@ -111,11 +101,11 @@ typedef struct spork_row_t {
 } spork_row_t;
 
 //extern const spork_row_t* spork_table_lookup_ip(unw_word_t ip);
-spork_entry_t colin_default = {TokenPolicyFair, (volatile bool*) 0x39, (void*) 0x555555556d0d}; // TODO: spwn label address
+spork_entry_t colin_default = {TokenPolicyFair, (volatile bool*) 0x39, (void*) 0x555555556df0}; // TODO: spwn label address
 spork_row_t colin_default_row = {1, &colin_default};
 spork_row_t* spork_table_lookup_ip(unw_word_t ip) {
   switch (ip) {
-    case 0x555555556bb6:
+    case 0x555555556c96:
       return &colin_default_row;
     default:
       //return &colin_default_row;
@@ -210,7 +200,7 @@ unsigned int promotes(unsigned int tokens, unw_cursor_t& cursor, unw_context_t& 
         tokens -= give_hbt;
         // TODO: ensure spawn(...)'s call to wake_up_a_worker is not blocking
         // get_current_scheduler().spawn(new SpwnJob(p.spwn, frame_sp, frame_bp, give_hbt));
-        get_current_scheduler().spawn(new SpwnJob(p.spwn, frame_sp, frame_bp, give_hbt));
+        get_current_scheduler().spawn(new SpwnJob(p.spwn, cursor, give_hbt));
       } else { // no more tokens
         break;
       }
@@ -435,7 +425,7 @@ int main(int argc, char* argv[]) {
      parlay::spork_spoin::TokenPolicyFair,
      [&] () { std::cout << "spwn!" << std::endl;
               x += 4;
-              std::cout << "spwn incremented x" << std::endl; },
+              std::cout << "spwn incremented x to " << x << std::endl; },
      [&] () { std::cout << "promoted!" << std::endl;
               return x; },
      [&] () { std::cout << "unstolen!" << std::endl;

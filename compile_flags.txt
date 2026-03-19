@@ -1,4 +1,3 @@
--I~/code/llvm-project/llvm/include/
 -Iparlaylib/include/
 -I/usr/include/libunwind/
 -lunwind-setjmp

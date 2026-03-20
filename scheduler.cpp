@@ -25,8 +25,8 @@ enum TokenPolicy {
 #define SPORK_UNPROMOTED (false)
 #define SPORK_IS_UNPR(x) (!x)
 #define SPORK_IS_PROM(x) (x)
-#define SPORK_SET_PROMOTED(x) (x = SPORK_PROMOTED)
-#define SPORK_SET_UNPROMOTED(x) (x = SPORK_UNPROMOTED)
+#define SPORK_SET_PROM(x) (x = SPORK_PROMOTED)
+#define SPORK_SET_UNPR(x) (x = SPORK_UNPROMOTED)
 #endif
 
 typedef unsigned int spork_id_t;
@@ -90,23 +90,26 @@ void this_spwn_wait() noexcept {
 }
 
 struct SpwnJob : WorkStealingJob {
-  explicit SpwnJob(std::function<void(SpwnJob*)>* spwn,
+  explicit SpwnJob(void* spwn,
+                   void (*exec_spwn)(void*),
                    unsigned int hbt) :
     WorkStealingJob(),
     spwn(spwn),
+    exec_spwn(exec_spwn),
     num_heartbeat_tokens(hbt) { }
 
   // __attribute__((noinline))
   void execute() override {
     heartbeat_tokens.fetch_add(num_heartbeat_tokens);
     this_spwn_done = &done;
-    (*spwn)(this);
+    exec_spwn(spwn);
     num_heartbeat_tokens = heartbeat_tokens.exchange(0);
     std::cout << "after spawn!!!" << std::endl;
     return;
   }
  private:
-  std::function<void(SpwnJob*)>* spwn;
+  void* spwn;
+  void (*exec_spwn)(void*);
   unw_cursor_t cursor;
  public:
   unsigned int num_heartbeat_tokens;
@@ -117,11 +120,13 @@ typedef uint_fast8_t spork_slot_idx_t;
 typedef struct spork_entry_t {
   TokenPolicy token_policy;
   volatile bool* flag_offset;
-  std::function<void(SpwnJob*)>* spwn_offset;
+  volatile SpwnJob** job_offset;
+  void* spwn_offset;
+  void (*exec_spwn)(void*);
 
-  void offset(uintptr_t bp) {
-    flag_offset = (volatile bool*) (bp - (uintptr_t) flag_offset);
-  }
+  // void offset(uintptr_t bp) {
+  //   flag_offset = (volatile bool*) (bp - (uintptr_t) flag_offset);
+  // }
 } spork_entry_t;
 
 typedef struct spork_row_t {
@@ -133,14 +138,16 @@ typedef struct spork_row_t {
 
 //extern const spork_row_t* spork_table_lookup_ip(unw_word_t ip);
 volatile bool* ad_hoc_spork_flag;
-std::function<void(SpwnJob*)>* ad_hoc_spwn;
+volatile SpwnJob** ad_hoc_job;
+void* ad_hoc_spwn;
+void (*ad_hoc_exec_lambda)(void*);
 //void* ad_hoc_spwn_ip;
 void* ad_hoc_spork_ip;
 
 spork_entry_t colin_default;
 spork_row_t colin_default_row = {1, &colin_default};
 void set_colin_default() {
-  colin_default = {TokenPolicyFair, ad_hoc_spork_flag, ad_hoc_spwn};
+  colin_default = {TokenPolicyFair, ad_hoc_spork_flag, ad_hoc_job, ad_hoc_spwn, ad_hoc_exec_lambda};
 }
 spork_row_t* spork_table_lookup_ip(unw_word_t ip) {
   if ((void*) ip == ad_hoc_spork_ip) return &colin_default_row;
@@ -174,17 +181,19 @@ unsigned int splitTokens(TokenPolicy policy, unsigned int tokens) {
   return give_hbt;
 }
 
-void do_promotion(volatile bool* flag, std::function<void(SpwnJob*)>* spwn,
+void do_promotion(volatile bool* flag, volatile SpwnJob** job,
+                  void* spwn, void (*exec_spwn)(void*),
                   unsigned int& tokens, TokenPolicy token_policy) noexcept {
   std::cout << "TOP SPORK flag = " << (void*) flag << ", spwn job = " << (void*) spwn << std::endl;
-  SPORK_SET_PROMOTED(*flag);
+  SPORK_SET_PROM(*flag);
   tokens--;
   
   unsigned int give_hbt = splitTokens(token_policy, tokens);
   tokens -= give_hbt;
+  SpwnJob* j = new SpwnJob(spwn, exec_spwn, give_hbt);
+  *job = j;
   // TODO: ensure spawn(...)'s call to wake_up_a_worker is not blocking
-  // get_current_scheduler().spawn(new SpwnJob(p.spwn, frame_sp, frame_bp, give_hbt));
-  get_current_scheduler().spawn(new SpwnJob(spwn, give_hbt));
+  get_current_scheduler().spawn(j);
 }
 
 // TODO: consider how to do this from signal handler
@@ -238,9 +247,9 @@ unsigned int promotes(unsigned int tokens, unw_cursor_t& cursor, unw_context_t& 
       }
   
       if (tokens > 0) {
-        std::function<void(SpwnJob*)>* spwn =
-          (std::function<void(SpwnJob*)>*) (frame_bp - (uintptr_t) slot.spwn_offset);
-        do_promotion(flag, spwn, tokens, slot.token_policy);
+        void* spwn = (void*) (frame_bp - (uintptr_t) slot.spwn_offset);
+        volatile SpwnJob** job = (volatile SpwnJob**) (frame_bp - (uintptr_t) slot.job_offset);
+        do_promotion(flag, job, spwn, slot.exec_spwn, tokens, slot.token_policy);
       } else { // no more tokens
         break;
       }
@@ -296,6 +305,13 @@ void dbgmsg(const void* ptr, uint64_t rbp) {
   std::cout << "ptr = " << (void*) ptr << ", rbp = " << (void*) rbp << ", diff = " << (void*) (rbp - (uint64_t) ptr) << std::endl;
 }
 
+template <typename A6>
+void execute_lambda(void* x) {
+  A6* f = (A6*) x;
+  //static_assert(std::is_invocable_v<A6&>);
+  (*f)();
+}
+
 // TODO: exception handling
 template <typename A1, typename A2, typename A3, typename A4, typename A5, typename A6>
 __attribute__((always_inline))
@@ -308,14 +324,13 @@ static void spork(A1&& body,
                   A5&& sync) {
   // vvv TODO: make sure clang sees these locals are loop-invariant
   const SpwnJob* sj = nullptr;
-  const SpwnJob** const sjptr = &sj;
-  const std::function<void(SpwnJob*)> spwn_wrapper =
-    [sjptr,&spwn] (SpwnJob* sj2) { *sjptr = sj2; std::forward<A6>(spwn)(); };
   volatile bool __SPORK0_flag = SPORK_UNPROMOTED;
   // ^^^
 
-  ad_hoc_spwn = (std::function<void(SpwnJob*)>*) ((uintptr_t) __builtin_frame_address(0) - (uintptr_t) &spwn_wrapper);
+  ad_hoc_spwn = (void*) ((uintptr_t) __builtin_frame_address(0) - (uintptr_t) &spwn);
   ad_hoc_spork_flag = (volatile bool*) ((uintptr_t) __builtin_frame_address(0) - (uintptr_t) &__SPORK0_flag);
+  ad_hoc_exec_lambda = &execute_lambda<A6>;
+  ad_hoc_job = (volatile SpwnJob**) ((uintptr_t) __builtin_frame_address(0) - (uintptr_t) &sj);
 
   //const int spid0 = FRESH_SPORK_ID;
 
@@ -338,7 +353,7 @@ static void spork(A1&& body,
       // reset flag so if we run this spork again later, the flag is unpromoted
       // TODO: make sure __SPORK0_flag initialization gets moved
       // outside loops (may need to be done with a special pass)
-      SPORK_SET_UNPROMOTED(__SPORK0_flag);
+      SPORK_SET_UNPR(__SPORK0_flag);
       std::forward<A3>(prom)();
       scheduler_t& scheduler = get_current_scheduler();
       const SpwnJob* spwn_job = scheduler.get_own_job();
@@ -348,13 +363,14 @@ static void spork(A1&& body,
         std::forward<A4>(unst)();
       } else [[unlikely]] { // stolen
         // TODO: make sure this optimizes away
-        __RTS_record_spork(tokenPolicy, &__SPORK0_flag, &spwn_wrapper);
+        __RTS_record_spork(tokenPolicy, &__SPORK0_flag, &spwn);
         // TODO: steal other work from this thread,
         // make spwn's thread resume this job when it finishes
         //auto done = [&]() { return spwn_job->finished(); };
         //scheduler.wait_until(done, false);
         sj->wait();
         delete sj;
+        sj = nullptr;
         std::forward<A5>(sync)();
       }
     }
@@ -378,7 +394,7 @@ static void spork(A1&& body,
 int main(int argc, char* argv[]) {
   parlay::spork_spoin::get_current_scheduler();
   volatile int x = 10;
-  for (int i = 0; i < 1; i++) {
+  for (int i = 0; i < 7; i++) {
   std::cout << "hello world inside loop" << std::endl;
   parlay::spork_spoin::spork
     ([&] () { std::cout << "body!" << std::endl;

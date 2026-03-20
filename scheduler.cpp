@@ -232,95 +232,6 @@ unsigned int promotes(unsigned int tokens, unw_cursor_t& cursor, unw_context_t& 
   return tokens;
 }
 
-// TODO: consider how to do this from signal handler
-// (ip not a return address in current frame)
-// bool do_promote() {
-//   unw_cursor_t cursor;
-//   unw_context_t uc;
-//   unw_getcontext(&uc);
-//   unw_init_local(&cursor, &uc);
-//   // TODO if called from signal handler, above should be:
-//   // (although, confirm that this doesn't just search the signal stack!!)
-//   // unw_init_local2(&cursor, &uc, UNW_INIT_SIGNAL_FRAME);
-
-//   // possible optimization TODO:
-//   // only call spork_table_lookup_ip(ip)
-//   // if no frame above us succeeded.
-//   // implement this with an array buffer of
-//   // (flag,spwn) pairs and only do non-tail
-//   // recursive call when the buffer is full
-//   spork_entry_t top_spork;
-
-//   unw_word_t frame_ip, frame_sp, frame_bp;
-  
-//   bool cont = true;
-//   bool can_prom = false;
-//   while (cont && unw_step(&cursor) > 0) {
-//     unw_get_reg(&cursor, UNW_REG_SP, &frame_sp);
-//     unw_get_reg(&cursor, UNW_REG_IP, &frame_ip);
-//     unw_get_reg(&cursor, UNW_X86_64_RBP, &frame_bp);
-//     std::cout << "frame ip = " << (void*) frame_ip << ", frame bp = " << (void*) frame_bp << ", frame sp = " << (void*) frame_sp << std::endl;
-//     const spork_row_t* row = spork_table_lookup_ip(frame_ip);
-//     // if return address is a function with sporks
-//     if (row) {
-//       // now check if sporks are unpromoted
-//       const spork_slot_idx_t num_sporks = row->num_sporks;
-//       for (spork_slot_idx_t slot = 0; slot < num_sporks; ++slot) {
-//         auto p = row->sporks[slot];
-//         // p's offsets are relative to retaddr_sp
-//         p.offset(frame_bp, frame_ip);
-//         std::cout << "checking flag at " << (void*) p.flag_offset << " = " << *p.flag_offset << std::endl;
-//         if (*p.flag_offset == SPORK_UNPROMOTED) {
-//           // this slot is not yet promoted
-//           top_spork = p;
-//           can_prom = true;
-//           break;
-//         } else {
-//           // since this slot was already promoted, there cannot be any unpromoted above
-//           cont = false;
-//         }
-//       }
-//     }
-//   }
-//   if (can_prom) {
-//     std::cout << "TOP SPORK flag = " << (void*) top_spork.flag_offset << ", spwn job = " << (void*) top_spork.spwn_offset << std::endl;
-//     *top_spork.flag_offset = SPORK_PROMOTED;
-
-//     unsigned int give_hbt = 0;
-//     // this probably doesn't have to be thread-safe
-//     // because promotion should be run atomically, right?
-//     unsigned int cur_hbt = heartbeat_tokens.exchange(0);
-//     switch (top_spork.token_policy) {
-//       case TokenPolicyFair:
-//         give_hbt = cur_hbt >> 1;
-//         break;
-//       case TokenPolicyGive:
-//         give_hbt = cur_hbt;
-//         break;
-//       case TokenPolicyKeep:
-//         give_hbt = 0;
-//         break;
-//     }
-//     //top_spork.spwn_offset->num_heartbeat_tokens += give_hbt;
-//     heartbeat_tokens.fetch_add(cur_hbt - give_hbt);
-//     // TODO: ensure spawn(job)'s call to wake_up_a_worker is not blocking
-//     get_current_scheduler().spawn(new SpwnJob(top_spork.spwn_offset, TODO, TODO, give_hbt));
-//     return true;
-//   } else {
-//     return false; 
-//   }
-// }
-
-// helper function for `try_consume_tokens()`
-// __attribute__((noinline))
-// unsigned int promote_until_failure() {
-//   unsigned int old_tokens = heartbeat_tokens.exchange(0);
-//   unsigned int new_tokens = old_tokens;
-//   while (new_tokens && do_promote()) new_tokens--;
-//   heartbeat_tokens.fetch_add(new_tokens);
-//   return old_tokens - new_tokens;
-// }
-
 __attribute__((noinline))
 unsigned int promotes_until_failure() {
   ad_hoc_spork_ip = __builtin_return_address(0);
@@ -361,11 +272,6 @@ void acquire_heartbeat_tokens(unsigned int new_tokens) {
 
 //extern void __RTS_record_spork(const TokenPolicy tokenPolicy, volatile bool* flag, const SpwnJob4* spwn);
 void __RTS_record_spork(const TokenPolicy tokenPolicy, volatile bool* flag, const void* spwn) {}
-
-//#include "UnwindRegisterRestore.S"
-
-// TODO: make this architecture-independent
-//extern "C" void __libunwind_Registers_x86_64_jumpto(unw_context_t);
 
 void dbgmsg(const void* ptr, uint64_t rbp) {
   std::cout << "ptr = " << (void*) ptr << ", rbp = " << (void*) rbp << ", diff = " << (void*) (rbp - (uint64_t) ptr) << std::endl;

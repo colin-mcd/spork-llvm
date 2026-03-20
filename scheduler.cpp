@@ -374,10 +374,10 @@ static void spork(A1&& body,
         std::forward<A5>(sync)();
       }
     }
-  } // else [[unlikely]] { // spwn
+  } else [[unlikely]] { // spwn
     // spwn_label:
     // std::cout << "inside spwn!" << std::endl;
-    // std::forward<A6>(spwn)();
+    std::forward<A6>(spwn)();
     // int result = 1234556;
     // for (int i = 0; i < 1000000; i++) {
     //   result ^= 0x351141421;
@@ -386,7 +386,7 @@ static void spork(A1&& body,
     // std::cout << result << std::endl;
     // unw_resume(&this_prom_cursor);
     // spwn();
-  // }
+  }
 } // void spork(...)
 } // namespace spork_spoin
 } // namespace parlay

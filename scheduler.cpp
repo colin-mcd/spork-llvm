@@ -375,17 +375,10 @@ static void spork(A1&& body,
       }
     }
   } else [[unlikely]] { // spwn
-    // spwn_label:
-    // std::cout << "inside spwn!" << std::endl;
+    // this branch may or may not be necessary;
+    // technically, it is *never* reached
+    // but may be necessary to stop DCE from eliminating spwn
     std::forward<A6>(spwn)();
-    // int result = 1234556;
-    // for (int i = 0; i < 1000000; i++) {
-    //   result ^= 0x351141421;
-    //   result -= 14;
-    // }
-    // std::cout << result << std::endl;
-    // unw_resume(&this_prom_cursor);
-    // spwn();
   }
 } // void spork(...)
 } // namespace spork_spoin

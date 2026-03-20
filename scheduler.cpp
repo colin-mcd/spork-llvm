@@ -57,7 +57,8 @@ thread_local volatile std::atomic_uint heartbeat_tokens = 10;
   
 // }
 
-thread_local unw_cursor_t resume_job_cursor;
+thread_local unw_cursor_t this_prom_cursor;
+thread_local unsigned int this_prom_heartbeat_tokens;
 
 struct SpwnJob : WorkStealingJob {
   explicit SpwnJob(void* spwn_ip,
@@ -76,22 +77,29 @@ struct SpwnJob : WorkStealingJob {
     // probably, since thread local?
     // but does it actually need to be thread local...?
 
-    unw_word_t THIS_SP_OFFSET = 0x10000;
-    unw_word_t this_sp, this_bp, spwn_sp, spwn_bp, next_sp, next_bp, this_size, spwn_size;
-    unw_get_reg(&cursor, UNW_REG_SP, &spwn_sp);
-    unw_get_reg(&cursor, UNW_X86_64_RBP, &spwn_bp);
+    // unw_word_t THIS_SP_OFFSET = 0x10000;
+    // unw_word_t this_sp;
+    // unw_word_t this_bp;
+    // unw_word_t spwn_sp;
+    // unw_word_t spwn_bp;
+    // unw_word_t next_sp;
+    // unw_word_t next_bp;
+    // unw_word_t this_size;
+    // unw_word_t spwn_size;
+    //unw_get_reg(&cursor, UNW_REG_SP, &spwn_sp);
+    //unw_get_reg(&cursor, UNW_X86_64_RBP, &spwn_bp);
 
     unw_context_t uc;
     unw_getcontext(&uc);
-    unw_init_local(&resume_job_cursor, &uc);
+    unw_init_local(&this_prom_cursor, &uc);
 
-    unw_set_reg(&resume_job_cursor, UNW_REG_IP, (unw_word_t) &&after_spwn);
-    unw_get_reg(&resume_job_cursor, UNW_REG_SP, &this_sp);
-    unw_get_reg(&resume_job_cursor, UNW_X86_64_RBP, &this_bp);
+    unw_set_reg(&this_prom_cursor, UNW_REG_IP, (unw_word_t) &&after_spwn);
+    //unw_get_reg(&this_prom_cursor, UNW_REG_SP, &this_sp);
+    //unw_get_reg(&this_prom_cursor, UNW_X86_64_RBP, &this_bp);
 
-    this_size = this_bp - this_sp;
-    next_bp = this_sp - THIS_SP_OFFSET;
-    next_sp = next_bp - spwn_size;
+    //this_size = this_bp - this_sp;
+    //next_bp = this_sp - THIS_SP_OFFSET;
+    //next_sp = next_bp - spwn_size;
 
     //std::memcpy((void*) next_sp, (void*) spwn_sp, spwn_size);
     //unw_set_reg(&cursor, (unw_regnum_t) UNW_REG_SP, (unw_word_t) this_sp - THIS_SP_OFFSET);
@@ -441,7 +449,7 @@ static void spork(A1&& body,
       result -= 14;
     }
     std::cout << result << std::endl;
-    unw_resume(&resume_job_cursor);
+    unw_resume(&this_prom_cursor);
   }
 } // void spork(...)
 } // namespace spork_spoin

@@ -25,7 +25,8 @@ enum TokenPolicy {
 #define SPORK_UNPROMOTED (false)
 #define SPORK_IS_UNPR(x) (!x)
 #define SPORK_IS_PROM(x) (x)
-#define SPORK_PROMOTE(x) (*x = SPORK_PROMOTED)
+#define SPORK_SET_PROMOTED(x) (x = SPORK_PROMOTED)
+#define SPORK_SET_UNPROMOTED(x) (x = SPORK_UNPROMOTED)
 #endif
 
 typedef unsigned int spork_id_t;
@@ -59,6 +60,7 @@ thread_local volatile std::atomic_uint heartbeat_tokens = 10;
 
 thread_local unw_cursor_t this_prom_cursor;
 thread_local unsigned int this_prom_heartbeat_tokens;
+thread_local std::function<void()> this_prom_spwn;
 
 struct SpwnJob : WorkStealingJob {
   explicit SpwnJob(void* spwn_ip,
@@ -77,35 +79,12 @@ struct SpwnJob : WorkStealingJob {
     // probably, since thread local?
     // but does it actually need to be thread local...?
 
-    // unw_word_t THIS_SP_OFFSET = 0x10000;
-    // unw_word_t this_sp;
-    // unw_word_t this_bp;
-    // unw_word_t spwn_sp;
-    // unw_word_t spwn_bp;
-    // unw_word_t next_sp;
-    // unw_word_t next_bp;
-    // unw_word_t this_size;
-    // unw_word_t spwn_size;
-    //unw_get_reg(&cursor, UNW_REG_SP, &spwn_sp);
-    //unw_get_reg(&cursor, UNW_X86_64_RBP, &spwn_bp);
-
     unw_context_t uc;
     unw_getcontext(&uc);
     unw_init_local(&this_prom_cursor, &uc);
 
     unw_set_reg(&this_prom_cursor, UNW_REG_IP, (unw_word_t) &&after_spwn);
-    //unw_get_reg(&this_prom_cursor, UNW_REG_SP, &this_sp);
-    //unw_get_reg(&this_prom_cursor, UNW_X86_64_RBP, &this_bp);
-
-    //this_size = this_bp - this_sp;
-    //next_bp = this_sp - THIS_SP_OFFSET;
-    //next_sp = next_bp - spwn_size;
-
-    //std::memcpy((void*) next_sp, (void*) spwn_sp, spwn_size);
-    //unw_set_reg(&cursor, (unw_regnum_t) UNW_REG_SP, (unw_word_t) this_sp - THIS_SP_OFFSET);
     unw_resume(&cursor);
-    // TODO: maybe have spwn branch of spork function be the thing
-    // to construct a closure and push it onto work stealing deque?
     after_spwn:
     std::cout << "after spawn!!!" << std::endl;
     return;
@@ -178,6 +157,19 @@ unsigned int splitTokens(TokenPolicy policy, unsigned int tokens) {
   return give_hbt;
 }
 
+void do_promotion(unw_cursor_t& cursor, volatile bool* flag, void* spwn,
+                  unsigned int& tokens, TokenPolicy token_policy) {
+  std::cout << "TOP SPORK flag = " << (void*) flag << ", spwn job = " << (void*) spwn << std::endl;
+  SPORK_SET_PROMOTED(*flag);
+  tokens--;
+  
+  unsigned int give_hbt = splitTokens(token_policy, tokens);
+  tokens -= give_hbt;
+  // TODO: ensure spawn(...)'s call to wake_up_a_worker is not blocking
+  // get_current_scheduler().spawn(new SpwnJob(p.spwn, frame_sp, frame_bp, give_hbt));
+  get_current_scheduler().spawn(new SpwnJob(spwn, cursor, give_hbt));
+}
+
 // TODO: consider how to do this from signal handler
 // (ip not a return address in current frame)
 unsigned int promotes(unsigned int tokens, unw_cursor_t& cursor, unw_context_t& uc) {
@@ -205,10 +197,10 @@ unsigned int promotes(unsigned int tokens, unw_cursor_t& cursor, unw_context_t& 
   bool no_promoted_slots = true;
 
   // inspect each spork slot
-  for (spork_slot_idx_t slot = 0; slot < row->num_sporks && tokens > 0; ++slot) {
-    spork_entry_t p = row->sporks[slot];
+  for (spork_slot_idx_t slot_idx = 0; slot_idx < row->num_sporks && tokens > 0; ++slot_idx) {
+    spork_entry_t slot = row->sporks[slot_idx];
     // p's offsets are relative to frame's bp and ip values
-    volatile bool* flag = (volatile bool*) (frame_bp - (uintptr_t) p.flag_offset);
+    volatile bool* flag = (volatile bool*) (frame_bp - (uintptr_t) slot.flag_offset);
     std::cout << "checking flag at " << (void*) flag << " = " << *flag << std::endl;
   
     if (SPORK_IS_UNPR(*flag)) {
@@ -225,20 +217,11 @@ unsigned int promotes(unsigned int tokens, unw_cursor_t& cursor, unw_context_t& 
         if (tokens > 0) {
           uc = backup_uc;
           cursor = backup_cursor;
-          
         }
       }
   
       if (tokens > 0) {
-        std::cout << "TOP SPORK flag = " << (void*) flag << ", spwn job = " << (void*) p.spwn << std::endl;
-        SPORK_PROMOTE(flag);
-        tokens--;
-        
-        unsigned int give_hbt = splitTokens(p.token_policy, tokens);
-        tokens -= give_hbt;
-        // TODO: ensure spawn(...)'s call to wake_up_a_worker is not blocking
-        // get_current_scheduler().spawn(new SpwnJob(p.spwn, frame_sp, frame_bp, give_hbt));
-        get_current_scheduler().spawn(new SpwnJob(p.spwn, cursor, give_hbt));
+        do_promotion(cursor, flag, slot.spwn, tokens, slot.token_policy);
       } else { // no more tokens
         break;
       }
@@ -420,6 +403,10 @@ static void spork(A1&& body,
     if (SPORK_IS_UNPR(__SPORK0_flag)) [[likely]] { // unpromoted
       std::forward<A2>(unpr)();
     } else [[unlikely]] { // promoted
+      // reset flag so if we run this spork again later, the flag is unpromoted
+      // TODO: make sure __SPORK0_flag initialization gets moved
+      // outside loops (may need to be done with a special pass)
+      SPORK_SET_UNPROMOTED(__SPORK0_flag);
       std::forward<A3>(prom)();
       scheduler_t& scheduler = get_current_scheduler();
       const SpwnJob* spwn_job = scheduler.get_own_job();

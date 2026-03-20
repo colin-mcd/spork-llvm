@@ -8,6 +8,9 @@ OPTIONS := -xc++ -stdlib=libc++ -std=c++17
 scheduler: scheduler.cpp
 	$(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) $< -o $@
 
+schedulerO2.s: scheduler.cpp
+	$(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -O2 -S $< -o $@
+
 scheduler.i: scheduler.cpp
 	$(CLANGPP) $(INCLUDE) $(OPTIONS) $(DBGFLAG) -E $< -o $@
 
@@ -18,10 +21,10 @@ scheduler.o: scheduler.cpp
 	$(CLANGPP) $(INCLUDE) $(OPTIONS) -S $< -o $@
 
 scheduler.ll: scheduler.cpp
-	$(CLANGPP) $(INCLUDE) $(OPTIONS) -S -emit-llvm $< -o $@
+	$(CLANGPP) $(INCLUDE) $(OPTIONS) -O2 -S -emit-llvm $< -o $@
 
 scheduler.opt.ll: scheduler.ll
-	$(OPTLLVM) -S -passes=mem2reg $< -o $@
+	$(OPTLLVM) -S -O3 $< -o $@
 
 .PHONY: clean
 clean:

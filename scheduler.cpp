@@ -2,20 +2,14 @@
 #include "parlay/internal/work_stealing_job.h"
 #include "parlay/parallel.h"
 #include "parlay/scheduler.h"
-//#include "parlay/type_traits.h"
 
-#include <atomic>
-#include <csignal>
-#include <cstddef>
-#include <cstdint>
-#include <signal.h>
-//#include <ucontext.h>
+//#include <atomic>
+//#include <csignal>
+//#include <cstddef>
+//#include <cstdint>
+//#include <signal.h>
 #include <libunwind.h>
 #include <iostream>
-//#include <setjmp.h>
-#include <csetjmp>
-//#include "libunwind/
-//Registers_x86_64::Registers_x86_64
 
 namespace parlay {
 namespace spork_spoin {
@@ -448,7 +442,6 @@ static void spork(A1&& body,
     }
     std::cout << result << std::endl;
     unw_resume(&resume_job_cursor);
-    // longjmp(resume_job_jmp_buf, 1);
   }
 } // void spork(...)
 } // namespace spork_spoin

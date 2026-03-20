@@ -2,6 +2,7 @@
 #include "parlay/internal/work_stealing_job.h"
 #include "parlay/parallel.h"
 #include "parlay/scheduler.h"
+//#include "parlay/type_traits.h"
 
 #include <atomic>
 #include <csignal>
@@ -62,7 +63,7 @@ thread_local volatile std::atomic_uint heartbeat_tokens = 10;
   
 // }
 
-/*thread_local*/ unw_cursor_t resume_job_cursor;
+thread_local unw_cursor_t resume_job_cursor;
 
 struct SpwnJob : WorkStealingJob {
   explicit SpwnJob(void* spwn_ip,
@@ -73,18 +74,36 @@ struct SpwnJob : WorkStealingJob {
     cursor(cursor),
     num_heartbeat_tokens(hbt) { }
 
-  __attribute__((noinline))
+  // __attribute__((noinline))
   void execute() override {
     heartbeat_tokens.fetch_add(num_heartbeat_tokens);
     unw_set_reg(&cursor, (unw_regnum_t) UNW_REG_IP, (unw_word_t) spwn_ip);
     // TODO: do we need to do this every time?
     // probably, since thread local?
     // but does it actually need to be thread local...?
+
+    unw_word_t THIS_SP_OFFSET = 0x10000;
+    unw_word_t this_sp, this_bp, spwn_sp, spwn_bp, next_sp, next_bp, this_size, spwn_size;
+    unw_get_reg(&cursor, UNW_REG_SP, &spwn_sp);
+    unw_get_reg(&cursor, UNW_X86_64_RBP, &spwn_bp);
+
     unw_context_t uc;
     unw_getcontext(&uc);
     unw_init_local(&resume_job_cursor, &uc);
-    unw_set_reg(&resume_job_cursor, (unw_regnum_t) UNW_REG_IP, (unw_word_t) &&after_spwn);
+
+    unw_set_reg(&resume_job_cursor, UNW_REG_IP, (unw_word_t) &&after_spwn);
+    unw_get_reg(&resume_job_cursor, UNW_REG_SP, &this_sp);
+    unw_get_reg(&resume_job_cursor, UNW_X86_64_RBP, &this_bp);
+
+    this_size = this_bp - this_sp;
+    next_bp = this_sp - THIS_SP_OFFSET;
+    next_sp = next_bp - spwn_size;
+
+    //std::memcpy((void*) next_sp, (void*) spwn_sp, spwn_size);
+    //unw_set_reg(&cursor, (unw_regnum_t) UNW_REG_SP, (unw_word_t) this_sp - THIS_SP_OFFSET);
     unw_resume(&cursor);
+    // TODO: maybe have spwn branch of spork function be the thing
+    // to construct a closure and push it onto work stealing deque?
     after_spwn:
     std::cout << "after spawn!!!" << std::endl;
     return;
@@ -439,15 +458,19 @@ int main(int argc, char* argv[]) {
   parlay::spork_spoin::get_current_scheduler();
   volatile int x = 10;
   //for (int i = 0; i < 10000; i++)
+  auto spwn =
+    [&] () { std::cout << "spwn!" << std::endl;
+             x += 4;
+             std::cout << "spwn incremented x to " << (int) x << std::endl; };
+  // const std::type_info tp = typeid(;
+  std::cout << typeid(spwn).name() << ", " << sizeof(spwn) << std::endl;
   parlay::spork_spoin::spork
     ([&] () { std::cout << "body!" << std::endl;
               return x++;},
      [&] () { std::cout << "unpromoted!" << std::endl;
               return x += 5; },
      parlay::spork_spoin::TokenPolicyFair,
-     [&] () { std::cout << "spwn!" << std::endl;
-              x += 4;
-              std::cout << "spwn incremented x to " << (int) x << std::endl; },
+     spwn,
      [&] () { std::cout << "promoted! x = " << (int) x << std::endl;
               return x; },
      [&] () { std::cout << "unstolen!" << std::endl;

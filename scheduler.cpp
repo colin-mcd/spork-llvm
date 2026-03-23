@@ -295,9 +295,9 @@ void dbgmsg(const void* ptr, uint64_t rbp) {
   std::cout << "ptr = " << (void*) ptr << ", rbp = " << (void*) rbp << ", diff = " << (void*) (rbp - (uint64_t) ptr) << std::endl;
 }
 
-template <typename A6>
+template <typename A3>
 void execute_lambda(void* x) {
-  A6* f = (A6*) x;
+  A3* f = (A3*) x;
   //static_assert(std::is_invocable_v<A6&>);
   (*f)();
 }
@@ -308,14 +308,14 @@ __attribute__((always_inline))
 static void spork(A1&& body,
                   A2&& unpr,
                   const TokenPolicy tokenPolicy,
-                  A6&& spwn,
-                  A3&& prom,
-                  A4&& unst,
-                  A5&& sync) {
+                  A3&& spwn,
+                  A4&& prom,
+                  A5&& unst,
+                  A6&& sync) {
   SPORK_RESET(VolSpwnJob jp);
 
   ad_hoc_spwn = (void*) ((uintptr_t) __builtin_frame_address(0) - (uintptr_t) &spwn);
-  ad_hoc_exec_lambda = &execute_lambda<A6>;
+  ad_hoc_exec_lambda = &execute_lambda<A3>;
   ad_hoc_job = (VolSpwnJob*) ((uintptr_t) __builtin_frame_address(0) - (uintptr_t) &jp);
 
   //const int spid0 = FRESH_SPORK_ID;
@@ -339,16 +339,16 @@ static void spork(A1&& body,
       // reset flag so if we run this spork again later, the flag is unpromoted
       // TODO: make sure __SPORK0_flag initialization gets moved
       // outside loops (may need to be done with a special pass)
-      std::forward<A3>(prom)();
+      std::forward<A4>(prom)();
       scheduler_t& scheduler = get_current_scheduler();
       const SpwnJob* spwn_job = scheduler.get_own_job();
       if (spwn_job != nullptr) [[likely]] { // unstolen
         heartbeat_tokens.fetch_add(spwn_job->num_heartbeat_tokens);
         delete spwn_job;
-        std::forward<A4>(unst)();
+        std::forward<A5>(unst)();
       } else [[unlikely]] { // stolen
         // TODO: make sure this optimizes away
-        __RTS_record_spork(tokenPolicy, &jp, &spwn, &execute_lambda<A6>);
+        __RTS_record_spork(tokenPolicy, &jp, &spwn, &execute_lambda<A3>);
         // TODO: steal other work from this thread,
         // make spwn's thread resume this job when it finishes
         //auto done = [&]() { return spwn_job->finished(); };
@@ -356,14 +356,14 @@ static void spork(A1&& body,
         jp->wait();
         delete jp;
         SPORK_RESET(jp);
-        std::forward<A5>(sync)();
+        std::forward<A6>(sync)();
       }
     }
   } else [[unlikely]] { // spwn
     // this branch may or may not be necessary;
     // technically, it is *never* reached
     // but may be necessary to stop DCE from eliminating spwn
-    std::forward<A6>(spwn)();
+    std::forward<A3>(spwn)();
   }
 } // void spork(...)
 } // namespace spork_spoin

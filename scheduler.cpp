@@ -157,7 +157,7 @@ extern inline scheduler_t& get_current_scheduler() {
   return *current_scheduler;
 }
 
-unsigned int splitTokens(TokenPolicy policy, unsigned int tokens) {
+unsigned int splitTokens(TokenPolicy policy, unsigned int tokens) noexcept {
   unsigned int give_hbt = 0;
   switch (policy) {
     case TokenPolicyFair:

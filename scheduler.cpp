@@ -7,8 +7,11 @@
 //#include <csignal>
 //#include <cstddef>
 //#include <cstdint>
-//#include <signal.h>
+#include <cstdlib>
+#include <signal.h>
 #include <libunwind.h>
+#include <thread>
+#include <time.h>
 #include <iostream>
 
 namespace parlay {
@@ -39,53 +42,15 @@ typedef unsigned int spork_id_t;
  * I believe this would allow "perfect forwarding"?
  */
 
-thread_local volatile std::atomic_uint heartbeat_tokens = 10;
+static const unsigned int TOKENS_PER_HEARTBEAT = 30;
+static const unsigned int HEARTBEAT_INTERVAL_US = 300;
+// I set this arbitrarily: consider tweaking
+static const unsigned int MAX_HEARTBEAT_TOKENS = TOKENS_PER_HEARTBEAT*4;
+thread_local volatile std::atomic_uint heartbeat_tokens = 0;
 
-// void handler(int sig, siginfo_t* info, void* ucontext) {
-//   int saved_errno = errno;
-//   ucontext_t* ctx = (ucontext_t*) ucontext;
-  
-//   errno = saved_errno;
-// }
+thread_local volatile std::atomic_uint num_hbs = 0;
 
-// void setup_handler() {
-//   struct sigaction sa = {};
-//   sa.sa_sigaction = handler;
-//   sa.sa_flags = SA_SIGINFO | SA_RESTART;
-//   //sigemptyset(&sa.sa_mask); // don't block extra signals during handler
-  
-// }
-
-//thread_local unsigned int this_prom_heartbeat_tokens;
-//thread_local std::function<void()> this_prom_spwn;
-
-
-// struct WorkStealingJob {
-//   WorkStealingJob() : done{false} { }
-//   virtual ~WorkStealingJob() = default;
-//   void operator()() {
-//     assert(done.load(std::memory_order_relaxed) == false);
-//     execute();
-//     done.store(true, std::memory_order_release);
-//   }
-//   [[nodiscard]] bool finished() const noexcept {
-//     return done.load(std::memory_order_acquire);
-//   }
-//   void wait() const noexcept {
-//     while (!finished())
-//       std::this_thread::yield();
-//   }
-//  protected:
-//   virtual void execute() = 0;
-//   std::atomic<bool> done;
-// };
-
-// thread_local std::atomic<bool>* this_spwn_done;
-
-// void this_spwn_wait() noexcept {
-//   while (!this_spwn_done->load(std::memory_order_acquire))
-//     std::this_thread::yield();
-// }
+//auto x = std::this_thread::get_id();
 
 struct SpwnJob : WorkStealingJob {
   explicit SpwnJob(void* spwn,
@@ -102,7 +67,7 @@ struct SpwnJob : WorkStealingJob {
     // this_spwn_done = &done;
     exec_spwn(spwn);
     num_heartbeat_tokens = heartbeat_tokens.exchange(0);
-    std::cout << "after spawn!!!" << std::endl;
+    // std::cout << "after spawn!!!" << std::endl;
     return;
   }
  private:
@@ -134,7 +99,8 @@ typedef struct spork_row_t {
 VolSpwnJob* ad_hoc_job;
 void* ad_hoc_spwn;
 void (*ad_hoc_exec_lambda)(void*);
-void* ad_hoc_spork_ip;
+void* ad_hoc_spork_ip_min = NULL;
+void* ad_hoc_spork_ip_max = NULL;
 
 spork_entry_t colin_default;
 spork_row_t colin_default_row = {1, &colin_default};
@@ -142,7 +108,8 @@ void set_colin_default() {
   colin_default = {TokenPolicyFair, ad_hoc_job, ad_hoc_spwn, ad_hoc_exec_lambda};
 }
 spork_row_t* spork_table_lookup_ip(unw_word_t ip) {
-  if ((void*) ip == ad_hoc_spork_ip) return &colin_default_row;
+  void* ip_ = (void*) ip;
+  if (ad_hoc_spork_ip_min <= ip_ && ip_ <= ad_hoc_spork_ip_max) return &colin_default_row;
   else return nullptr;
 }
 
@@ -201,10 +168,10 @@ unsigned int promotes(unsigned int tokens, unw_cursor_t& cursor, unw_context_t& 
     unw_get_reg(&cursor, UNW_X86_64_RBP, &frame_bp);
     
 
-    std::cout << "frame ip = " << (void*) frame_ip << ", frame bp = " << (void*) frame_bp << ", frame sp = " << (void*) frame_sp << std::endl;
+    // std::cout << "frame ip = " << (void*) frame_ip << ", frame bp = " << (void*) frame_bp << ", frame sp = " << (void*) frame_sp << std::endl;
 
     row = spork_table_lookup_ip(frame_ip);
-    std::cout << "row = " << (void*) row << std::endl;
+    // std::cout << "row = " << (void*) row << std::endl;
     if ((row != NULL) && (row->num_sporks > 0)) break;
   }
 
@@ -217,7 +184,7 @@ unsigned int promotes(unsigned int tokens, unw_cursor_t& cursor, unw_context_t& 
     spork_entry_t slot = row->sporks[slot_idx];
     // p's offsets are relative to frame's bp and ip values
     VolSpwnJob* jp = (VolSpwnJob*) (frame_bp - (uintptr_t) slot.job_offset);
-    std::cout << "checking jp at " << (void*) jp << " = " << (void*) *jp << std::endl;
+    // std::cout << "checking jp at " << (void*) jp << " = " << (void*) *jp << std::endl;
   
     if (SPORK_IS_UNPR(*jp)) {
       // this slot is not yet promoted
@@ -250,22 +217,43 @@ unsigned int promotes(unsigned int tokens, unw_cursor_t& cursor, unw_context_t& 
   return tokens;
 }
 
+std::atomic<bool> during_promotion = false;
+
+__attribute__((noinline))
+void* get_ip() {
+  return __builtin_return_address(0);
+}
+
 __attribute__((noinline))
 unsigned int promotes_until_failure() noexcept {
-  ad_hoc_spork_ip = __builtin_return_address(0);
-  std::cout << "ad_hoc_spork_ip = " << ad_hoc_spork_ip << std::endl;
+  // std::cout << "ad_hoc_spork_ip = " << ad_hoc_spork_ip << std::endl;
   set_colin_default();
 
-  unsigned int old_tokens = heartbeat_tokens.exchange(0);
+  // make sure we don't execute two promotes_until_failure concurrently
+  bool expected = false;
+  if (!during_promotion.compare_exchange_strong(expected, true)) return 0;
+
+  unsigned int old_tokens;
+  unsigned int new_tokens;
+  unsigned int during_tokens;
   unw_cursor_t cursor;
   unw_context_t uc;
-  unw_getcontext(&uc);
-  unw_init_local(&cursor, &uc);
-  // TODO if called from signal handler, above should be:
-  // (although, confirm that this doesn't just search the signal stack!!)
-  // unw_init_local2(&cursor, &uc, UNW_INIT_SIGNAL_FRAME);
-  unsigned int new_tokens = promotes(old_tokens, cursor, uc);
-  heartbeat_tokens.fetch_add(new_tokens);
+
+  do {
+    old_tokens = heartbeat_tokens.exchange(0);
+    unw_getcontext(&uc);
+    unw_init_local(&cursor, &uc);
+    // TODO if called from signal handler, above should be:
+    // (although, confirm that this doesn't just search the signal stack!!)
+    // unw_init_local2(&cursor, &uc, UNW_INIT_SIGNAL_FRAME);
+    new_tokens = promotes(old_tokens, cursor, uc);
+    during_tokens = heartbeat_tokens.fetch_add(new_tokens);
+    // keep trying iff this promotes() call spent all tokens AND
+    // more tokens were received by a heartbeat during that call
+    // TODO: maybe refactor promotes() to automatically notice newly received tokens?
+  } while (new_tokens == 0 && during_tokens > 0);
+
+  during_promotion.store(false);
   return old_tokens - new_tokens;
 }
 
@@ -326,6 +314,8 @@ static void spork(BodyLambda&& body,
   //const int spid0 = FRESH_SPORK_ID;
 
   // spork
+  static void* ip_min = get_ip();
+  ad_hoc_spork_ip_min = ip_min;
   if (SPORK_IS_UNPR(jp)) [[likely]] { // body
     try_consume_tokens();
     std::forward<BodyLambda>(body)();
@@ -370,14 +360,56 @@ static void spork(BodyLambda&& body,
     // but may be necessary to stop DCE from eliminating spwn
     std::forward<SpwnLambda>(spwn)();
   }
+  static void* ip_max = get_ip();
+  ad_hoc_spork_ip_max = ip_max;
 } // void spork(...)
+
+void heartbeat_handler(int sig, siginfo_t* info, void* ucontext) {
+  int saved_errno = errno;
+  //ucontext_t* ctx = (ucontext_t*) ucontext;
+
+  num_hbs.fetch_add(1);
+  unsigned int tokens = heartbeat_tokens.exchange(0);
+  tokens += tokens + TOKENS_PER_HEARTBEAT;
+  if (tokens > MAX_HEARTBEAT_TOKENS) {
+    heartbeat_tokens.store(MAX_HEARTBEAT_TOKENS);
+  } else {
+    heartbeat_tokens.fetch_add(tokens);
+  }
+  try_consume_tokens();
+  
+  errno = saved_errno;
+}
+int setup_handler() {
+  struct sigaction sa = {};
+  sa.sa_sigaction = heartbeat_handler;
+  sa.sa_flags = SA_SIGINFO;// | SA_RESTART;
+  //sigemptyset(&sa.sa_mask); // don't block extra signals during handler
+  sigaction(SIGALRM, &sa, nullptr);
+
+  timer_t tid;
+  struct sigevent sev{};
+  sev.sigev_notify = SIGEV_SIGNAL;
+  sev.sigev_signo  = SIGALRM;
+  
+  timer_create(CLOCK_MONOTONIC, &sev, &tid);
+  
+  struct itimerspec its{};
+  its.it_value.tv_nsec    = HEARTBEAT_INTERVAL_US*1000;
+  its.it_interval.tv_nsec = HEARTBEAT_INTERVAL_US*1000;
+  
+  timer_settime(tid, 0, &its, nullptr);
+  return 0;
+}
 } // namespace spork_spoin
 } // namespace parlay
 
+
 int main(int argc, char* argv[]) {
   parlay::spork_spoin::get_current_scheduler();
+  parlay::spork_spoin::setup_handler();
   volatile int x = 10;
-  for (int i = 0; i < 12345; i++) {
+  for (int i = 0; i < 100; i++) {
   std::cout << "hello world inside loop" << std::endl;
   parlay::spork_spoin::spork
     ([&] () { std::cout << "body!" << std::endl;
@@ -396,4 +428,5 @@ int main(int argc, char* argv[]) {
               return x + x; }
      );
   }
+  std::cout << "number of heartbeats = " << parlay::spork_spoin::num_hbs << std::endl;
 }

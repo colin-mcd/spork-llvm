@@ -8,8 +8,12 @@ OPTIONS := -xc++ -stdlib=libc++ -std=c++17
 scheduler: scheduler.cpp
 	$(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) $< -o $@
 
+schedulerO1.s: scheduler.cpp
+	$(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -O1 -S $< -o $@
 schedulerO2.s: scheduler.cpp
 	$(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -O2 -S $< -o $@
+schedulerO3.s: scheduler.cpp
+	$(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -O3 -S $< -o $@
 
 scheduler.i: scheduler.cpp
 	$(CLANGPP) $(INCLUDE) $(OPTIONS) $(DBGFLAG) -E $< -o $@
@@ -28,4 +32,4 @@ scheduler.opt.ll: scheduler.ll
 
 .PHONY: clean
 clean:
-	rm scheduler scheduler.ll scheduler.opt.ll scheduler.i
+	rm scheduler scheduler.ll scheduler.opt.ll scheduler.i schedulerO1.s schedulerO2.s schedulerO3.s

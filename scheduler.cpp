@@ -295,27 +295,32 @@ void dbgmsg(const void* ptr, uint64_t rbp) {
   std::cout << "ptr = " << (void*) ptr << ", rbp = " << (void*) rbp << ", diff = " << (void*) (rbp - (uint64_t) ptr) << std::endl;
 }
 
-template <typename A3>
+template <typename SpwnLambda>
 void execute_lambda(void* x) {
-  A3* f = (A3*) x;
-  //static_assert(std::is_invocable_v<A6&>);
+  SpwnLambda* f = (SpwnLambda*) x;
+  static_assert(std::is_invocable_v<SpwnLambda&>);
   (*f)();
 }
 
 // TODO: exception handling
-template <typename A1, typename A2, typename A3, typename A4, typename A5, typename A6>
+template <typename BodyLambda,
+          typename UnprLambda,
+          typename SpwnLambda,
+          typename PromLambda,
+          typename UnstLambda,
+          typename SyncLambda>
 __attribute__((always_inline))
-static void spork(A1&& body,
-                  A2&& unpr,
+static void spork(BodyLambda&& body,
+                  UnprLambda&& unpr,
                   const TokenPolicy tokenPolicy,
-                  A3&& spwn,
-                  A4&& prom,
-                  A5&& unst,
-                  A6&& sync) {
+                  SpwnLambda&& spwn,
+                  PromLambda&& prom,
+                  UnstLambda&& unst,
+                  SyncLambda&& sync) {
   SPORK_RESET(VolSpwnJob jp);
 
   ad_hoc_spwn = (void*) ((uintptr_t) __builtin_frame_address(0) - (uintptr_t) &spwn);
-  ad_hoc_exec_lambda = &execute_lambda<A3>;
+  ad_hoc_exec_lambda = &execute_lambda<SpwnLambda>;
   ad_hoc_job = (VolSpwnJob*) ((uintptr_t) __builtin_frame_address(0) - (uintptr_t) &jp);
 
   //const int spid0 = FRESH_SPORK_ID;
@@ -323,7 +328,7 @@ static void spork(A1&& body,
   // spork
   if (SPORK_IS_UNPR(jp)) [[likely]] { // body
     try_consume_tokens();
-    std::forward<A1>(body)();
+    std::forward<BodyLambda>(body)();
     // arbitrary code to take time
     int result = 151515;
     for (int i = 0; i < 100000; i++) {
@@ -334,21 +339,21 @@ static void spork(A1&& body,
   
     // spoin
     if (SPORK_IS_UNPR(jp)) [[likely]] { // unpromoted
-      std::forward<A2>(unpr)();
+      std::forward<UnprLambda>(unpr)();
     } else [[unlikely]] { // promoted
       // reset flag so if we run this spork again later, the flag is unpromoted
       // TODO: make sure __SPORK0_flag initialization gets moved
       // outside loops (may need to be done with a special pass)
-      std::forward<A4>(prom)();
+      std::forward<PromLambda>(prom)();
       scheduler_t& scheduler = get_current_scheduler();
       const SpwnJob* spwn_job = scheduler.get_own_job();
       if (spwn_job != nullptr) [[likely]] { // unstolen
         heartbeat_tokens.fetch_add(spwn_job->num_heartbeat_tokens);
         delete spwn_job;
-        std::forward<A5>(unst)();
+        std::forward<UnstLambda>(unst)();
       } else [[unlikely]] { // stolen
         // TODO: make sure this optimizes away
-        __RTS_record_spork(tokenPolicy, &jp, &spwn, &execute_lambda<A3>);
+        __RTS_record_spork(tokenPolicy, &jp, &spwn, &execute_lambda<SpwnLambda>);
         // TODO: steal other work from this thread,
         // make spwn's thread resume this job when it finishes
         //auto done = [&]() { return spwn_job->finished(); };
@@ -356,14 +361,14 @@ static void spork(A1&& body,
         jp->wait();
         delete jp;
         SPORK_RESET(jp);
-        std::forward<A6>(sync)();
+        std::forward<SyncLambda>(sync)();
       }
     }
   } else [[unlikely]] { // spwn
     // this branch may or may not be necessary;
     // technically, it is *never* reached
     // but may be necessary to stop DCE from eliminating spwn
-    std::forward<A3>(spwn)();
+    std::forward<SpwnLambda>(spwn)();
   }
 } // void spork(...)
 } // namespace spork_spoin
@@ -372,7 +377,7 @@ static void spork(A1&& body,
 int main(int argc, char* argv[]) {
   parlay::spork_spoin::get_current_scheduler();
   volatile int x = 10;
-  for (int i = 0; i < 7; i++) {
+  for (int i = 0; i < 12345; i++) {
   std::cout << "hello world inside loop" << std::endl;
   parlay::spork_spoin::spork
     ([&] () { std::cout << "body!" << std::endl;

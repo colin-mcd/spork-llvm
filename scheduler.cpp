@@ -331,7 +331,7 @@ _Ret execute_lambda(void* f, _Args... args) {
 
 // TODO: exception handling
 template <typename BodyLambda, typename PromLambda>
-//__attribute__((always_inline))
+__attribute__((always_inline))
 static void spork(BodyLambda&& body, PromLambda&& prom) {
   static_assert(std::is_invocable_v<BodyLambda&&>);
   static_assert(std::is_invocable_r_v<bool, PromLambda&&, unsigned int>);
@@ -357,38 +357,19 @@ static void spork(BodyLambda&& body, PromLambda&& prom) {
 }
 
 template <typename LambdaL, typename LambdaR>
-//__attribute__((always_inline))
+__attribute__((always_inline))
 static void par(LambdaL&& lamL, LambdaR&& lamR) {
   static_assert(std::is_invocable_v<LambdaL&>);
   static_assert(std::is_invocable_v<LambdaR&>);
   VolSpwnJob jp = nullptr;
-  auto prom = [&] (unsigned int tokens) {
-    //std::cout << "Prom!" << std::endl;
-    auto lamR2 = [&] () { std::forward<LambdaR>(lamR)(); return nullptr; };
-    jp = new SpwnJob(&lamR2, &execute_lambda<void*, decltype(lamR2)>, tokens);
-    get_current_scheduler().spawn(jp);
-    return false; // can do no more promotions here
-  };
 
-  spork(lamL, [&] (unsigned int tokens) { return prom(tokens); });
-  // volatile bool promotable_flag = true;
-  // volatile unsigned int num_promotions = 0;
-  // ad_hoc_promotable_flag = FRAME_OFFSET(volatile bool, promotable_flag);
-  // ad_hoc_num_promotions = FRAME_OFFSET(unsigned int, num_promotions);
-  // ad_hoc_prom = FRAME_OFFSET(void*, prom);
-  // ad_hoc_exec_prom = &execute_lambda<bool, decltype(prom), unsigned int>;
-
-  // // begin body
-  // static void* const ip_min = get_ip();
-  // ad_hoc_spork_ip_min = ip_min;
-  
-  // try_consume_tokens();
-  // std::forward<LambdaL>(lamL)();
-  // static void* const ip_max = get_ip();
-  // ad_hoc_spork_ip_max = ip_max;
-  // // end body
-  
-  // promotable_flag = false;
+  spork(lamL,
+        [&] (unsigned int tokens) {
+          auto lamR2 = [&] () { std::forward<LambdaR>(lamR)(); return nullptr; };
+          jp = new SpwnJob(&lamR2, &execute_lambda<void*, decltype(lamR2)>, tokens);
+          get_current_scheduler().spawn(jp);
+          return false; // can do no more promotions here
+        });
 
   if (jp == nullptr) [[likely]] {
     run_r_locally:
@@ -483,7 +464,6 @@ int main(int argc, char* argv[]) {
   parlay::spork_spoin::setup_handler();
   
   std::cout << parlay::spork_spoin::fib(40) << std::endl;
-  std::cout << parlay::spork_spoin::ad_hoc_spork_ip_min << ", " << parlay::spork_spoin::ad_hoc_spork_ip_max << std::endl;
   // volatile int x = 10;
   // for (int i = 0; i < 100; i++) {
   // std::cout << "hello world inside loop" << std::endl;

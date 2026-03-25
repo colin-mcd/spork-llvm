@@ -2,20 +2,26 @@
 #include "parlay/internal/work_stealing_job.h"
 #include "parlay/parallel.h"
 #include "parlay/scheduler.h"
+#include "parlay/alloc.h"
 
 //#include <atomic>
 //#include <csignal>
 //#include <cstddef>
 //#include <cstdint>
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <signal.h>
 #include <libunwind.h>
+#include <sys/types.h>
 #include <thread>
 #include <time.h>
 #include <iostream>
+#include <utility>
 
-namespace parlay {
-namespace spork_spoin {
+using namespace parlay;
+
+namespace spork {
 
 enum TokenPolicy {
   TokenPolicyFair,
@@ -30,7 +36,7 @@ enum TokenPolicy {
 // #define SPORK_RESET(x) x = nullptr
 // #endif
 
-typedef unsigned int spork_id_t;
+typedef uint spork_id_t;
 #define FRESH_SPORK_ID __COUNTER__
 
 /*
@@ -42,43 +48,111 @@ typedef unsigned int spork_id_t;
  * I believe this would allow "perfect forwarding"?
  */
 
-static const unsigned int TOKENS_PER_HEARTBEAT = 30;
-static const unsigned int HEARTBEAT_INTERVAL_US = 500;
+static const uint TOKENS_PER_HEARTBEAT = 30;
+static const uint HEARTBEAT_INTERVAL_US = 500;
 // I set this arbitrarily: consider tweaking
-static const unsigned int MAX_HEARTBEAT_TOKENS = TOKENS_PER_HEARTBEAT*4;
+static const uint MAX_HEARTBEAT_TOKENS = TOKENS_PER_HEARTBEAT*4;
 thread_local volatile std::atomic_uint heartbeat_tokens = 0;
 
 //auto x = std::this_thread::get_id();
 
 struct SpwnJob : WorkStealingJob {
+
+  using scheduler_t = parlay::scheduler<SpwnJob>;
+
+  static scheduler_t& get_current_scheduler(){
+    auto current_scheduler = scheduler_t::get_current_scheduler();
+    if (current_scheduler == nullptr) {
+      static thread_local scheduler_t local_scheduler(internal::init_num_workers());
+      return local_scheduler;
+    }
+    return *current_scheduler;
+  }
+
   explicit SpwnJob(void* spwn,
                    void* (*exec_spwn)(void*),
-                   unsigned int hbt,
+                   uint hbt,
                    SpwnJob* next = nullptr) :
     WorkStealingJob(),
     spwn(spwn),
     exec_spwn(exec_spwn),
     num_heartbeat_tokens(hbt),
     result(nullptr),
-    next(next) { }
+    next(next) {}
+
+  SpwnJob& operator=(const SpwnJob& other) {
+    if (this == &other) return *this;
+    spwn = other.spwn;
+    exec_spwn = other.exec_spwn;
+    num_heartbeat_tokens = other.num_heartbeat_tokens;
+    result = other.result;
+    next = other.next;
+    return *this;
+  }
+  
+  SpwnJob* fresh() {
+    SpwnJob* other = (SpwnJob*) p_malloc(sizeof(SpwnJob));
+    if (other) *other = *this;
+    return other;
+  }
+
+  SpwnJob(SpwnJob&& other) :
+    SpwnJob(other.spwn,
+            other.exec_spwn,
+            other.num_heartbeat_tokens,
+            other.next) { result = other.result; }
+
+  void enqueue() {
+    get_current_scheduler().spawn(this);
+  }
+
+  bool try_dequeue() {
+    return get_current_scheduler().get_own_job() != nullptr;
+  }
 
   // __attribute__((noinline))
   void execute() override {
     heartbeat_tokens.fetch_add(num_heartbeat_tokens);
     std::cout << "Executing spwn" << std::endl;
-    // this_spwn_done = &done;
     result = exec_spwn(spwn);
     std::cout << "after spawn!!!" << std::endl;
     return;
+  }
+
+  void execute_wo_tokens() {
+    result = exec_spwn(spwn);
+  }
+
+  void wait_or_execute() {
+    if (try_dequeue()) { // unstolen
+      execute_wo_tokens();
+    } else { // stolen
+      wait();
+    }
   }
 
   __attribute__((always_inline))
   void sync() noexcept {
     SpwnJob* jp = this;
     while (jp != nullptr) {
-      jp->wait();
+      jp->wait_or_execute();
       SpwnJob* next = jp->next;
-      delete jp;
+      p_free(jp);
+      jp = next;
+    }
+  }
+  
+  template<typename A, typename CombLambda>
+  __attribute__((always_inline))
+  void syncUpdate(A& a, CombLambda&& combine) {
+    SpwnJob* jp = this;
+    while (jp != nullptr) {
+      jp->wait_or_execute();
+      SpwnJob* next = jp->next;
+      A* r = (A*) jp->result;
+      a = std::forward<CombLambda>(combine)(a, *r);
+      p_free(r);
+      p_free(jp);
       jp = next;
     }
   }
@@ -86,32 +160,23 @@ struct SpwnJob : WorkStealingJob {
  private:
   void* spwn;
   void* (*exec_spwn)(void*);
-  unsigned int num_heartbeat_tokens;
+  uint num_heartbeat_tokens;
  public:
   void* result;
   SpwnJob* next;
 };
 
-// void syncSpwnJob(SpwnJob*& jp) {
-//   while (jp != nullptr) {
-//     jp->wait();
-//     SpwnJob* next = jp->next;
-//     delete jp;
-//     jp = next;
+// using scheduler_t = parlay::scheduler<SpwnJob>;
+
+// extern inline scheduler_t& get_current_scheduler() {
+//   auto current_scheduler = scheduler_t::get_current_scheduler();
+//   if (current_scheduler == nullptr) {
+//     std::cout << "Initializing scheduler for n = " << internal::init_num_workers() << " workers" << std::endl;
+//     static thread_local scheduler_t local_scheduler(internal::init_num_workers());
+//     return local_scheduler;
 //   }
+//   return *current_scheduler;
 // }
-
-using scheduler_t = parlay::scheduler<SpwnJob>;
-
-extern inline scheduler_t& get_current_scheduler() {
-  auto current_scheduler = scheduler_t::get_current_scheduler();
-  if (current_scheduler == nullptr) {
-    std::cout << "Initializing scheduler for n = " << internal::init_num_workers() << " workers" << std::endl;
-    static thread_local scheduler_t local_scheduler(internal::init_num_workers());
-    return local_scheduler;
-  }
-  return *current_scheduler;
-}
 
 typedef uint_fast8_t spork_slot_idx_t;
 
@@ -119,14 +184,14 @@ typedef SpwnJob* volatile VolSpwnJob;
 
 typedef struct spork_entry_t {
   volatile bool* promotable_flag;
-  volatile unsigned int* num_promotions;
+  volatile uint* num_promotions;
   void* prom;
-  bool (*exec_prom)(void* prom, unsigned int tokens);
+  bool (*exec_prom)(void* prom, uint tokens);
   
   spork_entry_t offset(unw_word_t bp) const noexcept {
     return {
       (volatile bool*) (bp - (unw_word_t) promotable_flag),
-      (volatile unsigned int*) (bp - (unw_word_t) num_promotions),
+      (volatile uint*) (bp - (unw_word_t) num_promotions),
       (void*) (bp - (unw_word_t) prom),
       exec_prom
     };
@@ -141,11 +206,9 @@ typedef struct spork_row_t {
 } spork_row_t;
 
 volatile bool* ad_hoc_promotable_flag = nullptr;
-volatile unsigned int* ad_hoc_num_promotions = nullptr;
-// void* ad_hoc_spwn;
-// void* (*ad_hoc_exec_spwn)(void*);
+volatile uint* ad_hoc_num_promotions = nullptr;
 void* ad_hoc_prom;
-bool (*ad_hoc_exec_prom)(void*, unsigned int);
+bool (*ad_hoc_exec_prom)(void*, uint);
 void* ad_hoc_spork_ip_min = nullptr;
 void* ad_hoc_spork_ip_max = nullptr;
 
@@ -165,46 +228,17 @@ spork_row_t* spork_table_lookup_ip(unw_word_t ip) {
   else return nullptr;
 }
 
-// unsigned int splitTokens(TokenPolicy policy, unsigned int tokens) noexcept {
-//   unsigned int give_hbt = 0;
-//   switch (policy) {
-//     case TokenPolicyFair:
-//       give_hbt = tokens >> 1;
-//       break;
-//     case TokenPolicyGive:
-//       give_hbt = tokens;
-//       break;
-//     case TokenPolicyKeep:
-//       give_hbt = 0;
-//       break;
-//   }
-//   return give_hbt;
-// }
-
-// unsigned int splitTokens() noexcept {
-//   unsigned int tokens = heartbeat_tokens.exchange(0);
-//   unsigned int half = tokens >> 1;
-//   heartbeat_tokens.fetch_add(tokens - half);
-//   return half;
-// }
-
 // TODO: make sure prom doesn't throw any exceptions
-void do_promotion(const spork_entry_t& slot, unsigned int& tokens) noexcept {
-  unsigned int give_hbt = tokens >> 1;
+void do_promotion(const spork_entry_t& slot, uint& tokens) noexcept {
+  uint give_hbt = tokens >> 1;
   tokens -= 1 + give_hbt;
   (*slot.num_promotions)++;
-  // unsigned int give_hbt = splitTokens(slot.token_policy, tokens);
-  // tokens -= give_hbt;
-  // SpwnJob* j = new SpwnJob(slot.spwn, slot.exec_spwn, give_hbt);
-  // marks this spork as promoted
-  // *slot.job = j;
-  // now update if this spork is promotable any further
+  // run slot's prom function,
+  // then update if this spork is promotable any further
   *slot.promotable_flag = slot.exec_prom(slot.prom, give_hbt);
-  // TODO: ensure spawn(...)'s call to wake_up_a_worker is not blocking
-  //get_current_scheduler().spawn(j);
 }
 
-unsigned int promotes(unsigned int tokens, unw_cursor_t& cursor, unw_context_t& uc) noexcept {
+uint promotes(uint tokens, unw_cursor_t& cursor, unw_context_t& uc) noexcept {
   if (tokens == 0) return 0;
   unw_word_t frame_ip, frame_sp, frame_bp;
   const spork_row_t* row;
@@ -255,12 +289,7 @@ unsigned int promotes(unsigned int tokens, unw_cursor_t& cursor, unw_context_t& 
 std::atomic<bool> during_promotion = false;
 
 __attribute__((noinline))
-static void* const get_ip() noexcept {
-  return __builtin_return_address(0);
-}
-
-__attribute__((noinline))
-unsigned int promotes_until_failure() noexcept {
+uint promotes_until_failure() noexcept {
   // std::cout << "ad_hoc_spork_ip = " << ad_hoc_spork_ip << std::endl;
   set_colin_default();
 
@@ -268,9 +297,9 @@ unsigned int promotes_until_failure() noexcept {
   bool expected = false;
   if (!during_promotion.compare_exchange_strong(expected, true)) return 0;
 
-  unsigned int old_tokens;
-  unsigned int new_tokens;
-  unsigned int during_tokens;
+  uint old_tokens;
+  uint new_tokens;
+  uint during_tokens;
   unw_cursor_t cursor;
   unw_context_t uc;
 
@@ -293,7 +322,7 @@ unsigned int promotes_until_failure() noexcept {
 // Repeatedly tries to consume 1 heartbeat token until failure,
 // returning number of times this was successful
 __attribute__((always_inline))
-unsigned int try_consume_tokens() noexcept {
+uint try_consume_tokens() noexcept {
   if (heartbeat_tokens) [[unlikely]] {
     //return promote_until_failure();
     return promotes_until_failure();
@@ -303,7 +332,7 @@ unsigned int try_consume_tokens() noexcept {
 }
 
 // Acquires `new_tokens`, then promotes until failure
-// void acquire_heartbeat_tokens(unsigned int new_tokens) noexcept {
+// void acquire_heartbeat_tokens(uint new_tokens) noexcept {
 //   heartbeat_tokens.fetch_add(new_tokens);
 //   try_consume_tokens();
 // }
@@ -334,27 +363,38 @@ template <typename BodyLambda, typename PromLambda>
 __attribute__((always_inline))
 static void spork(BodyLambda&& body, PromLambda&& prom) {
   static_assert(std::is_invocable_v<BodyLambda&&>);
-  static_assert(std::is_invocable_r_v<bool, PromLambda&&, unsigned int>);
+  static_assert(std::is_invocable_r_v<bool, PromLambda&&, uint>);
 
   volatile bool promotable_flag = true;
-  volatile unsigned int num_promotions = 0;
+  volatile uint num_promotions = 0;
   ad_hoc_promotable_flag = (volatile bool*) FRAME_OFFSET(&promotable_flag);
-  ad_hoc_num_promotions = (volatile unsigned int*) FRAME_OFFSET(&num_promotions);
+  ad_hoc_num_promotions = (volatile uint*) FRAME_OFFSET(&num_promotions);
   ad_hoc_prom = (void*) FRAME_OFFSET(&prom);
-  ad_hoc_exec_prom = &execute_lambda<bool, PromLambda, unsigned int>;
+  ad_hoc_exec_prom = &execute_lambda<bool, PromLambda, uint>;
   ad_hoc_spork_ip_min = &&begin_body;
   ad_hoc_spork_ip_max = &&end_body;
 
   // begin body
-  // static void* const ip_min = get_ip();
   begin_body:
   try_consume_tokens();
   std::forward<BodyLambda>(body)();
-  // static void* const ip_max = get_ip();
   end_body:
   // end body
   return;
 }
+
+// TODO: look into `clone` function from /usr/include/x86_64-linux-gnu/bits/sched.h
+
+// template<typename Lambda_t>
+// static void* fresh_lambda(Lambda_t& lam) {
+//   Lambda_t* ptr = (Lambda_t*) p_malloc(sizeof(Lambda_t));
+//   std::byte b [sizeof(Lambda_t)];
+//   for (unsigned int i = 0; i < sizeof(Lambda_t); i++) {
+//     *(ptr + i*sizeof(std::byte)) = *((uintptr_t) lam + i*sizeof(std::byte));
+//   }
+//   if (ptr) *ptr = lam;
+//   return (void*) ptr;
+// }
 
 template <typename LambdaL, typename LambdaR>
 __attribute__((always_inline))
@@ -363,43 +403,75 @@ static void par(LambdaL&& lamL, LambdaR&& lamR) {
   static_assert(std::is_invocable_v<LambdaR&>);
   VolSpwnJob jp = nullptr;
 
-  spork(lamL,
-        [&] (unsigned int tokens) {
+  spork(lamL, // TODO: should this be forwarded?
+        [&] (uint tokens) {
           auto lamR2 = [&] () { std::forward<LambdaR>(lamR)(); return nullptr; };
-          jp = new SpwnJob(&lamR2, &execute_lambda<void*, decltype(lamR2)>, tokens);
-          get_current_scheduler().spawn(jp);
+          // TODO: fresh lamR2, then free in execute_lambda itself
+          jp = SpwnJob(&lamR2, &execute_lambda<void*, decltype(lamR2)>, tokens).fresh();
+          jp->enqueue();
           return false; // can do no more promotions here
         });
 
   if (jp == nullptr) [[likely]] {
-    run_r_locally:
-    // std::forward<LambdaR>(lamR)();
     lamR();
   } else [[unlikely]] {
-    // try popping from scheduler deque (indicating unstolen)
-    if (get_current_scheduler().get_own_job() != nullptr) [[likely]] { // unstolen
-      //std::cout << "Unstolen!" << std::endl;
-      delete jp;
-      goto run_r_locally;
-    } else [[unlikely]] { // stolen
-      //std::cout << "Stolen!" << std::endl;
-      jp->sync();
-    }
+    jp->sync();
   }
 }
 
+__attribute__((always_inline))
+static const uint midpoint(uint i, uint j) noexcept {
+  return i + ((j - i) >> 1);
+}
+
+template <typename A, typename BodyLambda, typename CombLambda>
+__attribute__((always_inline))
+A reduce(A z, CombLambda&& combine, BodyLambda&& body, uint range_start, uint range_end) {
+  static_assert(std::is_invocable_r_v<A, BodyLambda&, uint, A>);
+  static_assert(std::is_invocable_r_v<A, CombLambda&, A, A>);
+  VolSpwnJob jp = nullptr;
+  volatile uint j = range_end;
+  uint i = range_start;
+  A a = z;
+  spork(
+    [&] () {
+      while (i < j) {
+        a = std::forward<BodyLambda>(body)(i, a);
+        i++;
+      }
+    },
+    [&] (uint tokens) {
+      // Make sure to capture i and j by value so
+      // their values aren't updated by body loop
+      auto spwn = [&, i, j] () {
+        A* aptr = (A*) p_malloc(sizeof(A));
+        *aptr = reduce(z, combine, body, midpoint(i+1, j), j);
+        return (void*) aptr;
+      };
+      j = midpoint(i+1, j);
+      jp = SpwnJob(&spwn, &execute_lambda<void*, decltype(spwn)>, tokens).fresh();
+      jp->enqueue();
+      return j > i; // determine if more promotions are possible here
+    });
+
+  if (jp != nullptr) [[unlikely]] {
+    jp->syncUpdate(a, combine);
+  }
+  return a;
+}
+
 __attribute__((noinline))
-unsigned int fib3(unsigned int n) {
+uint fib3(uint n) {
   return (n <= 1) ? n : fib3(n - 1) + fib3(n - 2);
 }
 
 __attribute__((noinline))
-unsigned int fib2(unsigned int n) {
+uint fib2(uint n) {
   // std::cout << "Fib2 called! n = " << n << std::endl;
   if (n <= 1) {
     return n;
   } else {
-    unsigned int l, r;
+    uint l, r;
     par([&] () {l = fib2(n - 1);},
         [&] () {r = fib2(n - 2);});
     return l + r;
@@ -407,12 +479,12 @@ unsigned int fib2(unsigned int n) {
 }
 
 __attribute__((noinline))
-unsigned int fib(unsigned int n) {
+uint fib(uint n) {
   // std::cout << "Fib called! n = " << n << std::endl;
   if (n <= 1) {
     return n;
   } else {
-    unsigned int l, r;
+    uint l, r;
     par([&] () {l = fib3(n - 1);},
         [&] () {r = fib3(n - 2);});
     return l + r;
@@ -423,7 +495,7 @@ void heartbeat_handler(int sig, siginfo_t* info, void* ucontext) {
   int saved_errno = errno;
   //ucontext_t* ctx = (ucontext_t*) ucontext;
 
-  unsigned int tokens = heartbeat_tokens.exchange(0);
+  uint tokens = heartbeat_tokens.exchange(0);
   tokens += tokens + TOKENS_PER_HEARTBEAT;
   if (tokens > MAX_HEARTBEAT_TOKENS) {
     heartbeat_tokens.store(MAX_HEARTBEAT_TOKENS);
@@ -455,24 +527,32 @@ int setup_handler() {
   timer_settime(tid, 0, &its, nullptr);
   return 0;
 }
-} // namespace spork_spoin
-} // namespace parlay
+} // namespace spork
 
 
 int main(int argc, char* argv[]) {
-  parlay::spork_spoin::get_current_scheduler();
-  parlay::spork_spoin::setup_handler();
+  spork::SpwnJob::get_current_scheduler();
+  spork::setup_handler();
   
-  std::cout << parlay::spork_spoin::fib(40) << std::endl;
+  // std::cout << parlay::spork::fib(40) << std::endl;
+  // uint n = atoi(argv[1]);
+  uint n = 1000000;
+  unsigned long long total =
+    spork::reduce<unsigned long long>(
+      0,
+      [&] (unsigned long long a, unsigned long long b) { return a + b; },
+      [] (uint i, unsigned long long a) { return (unsigned long long) i/10000 + a; },
+      0, n);
+  std::cout << total << std::endl;
   // volatile int x = 10;
   // for (int i = 0; i < 100; i++) {
   // std::cout << "hello world inside loop" << std::endl;
-  // parlay::spork_spoin::spork
+  // parlay::spork::spork
   //   ([&] () { std::cout << "body!" << std::endl;
   //             return x++;},
   //    [&] () { std::cout << "unpromoted!" << std::endl;
   //             return x += 5; },
-  //    parlay::spork_spoin::TokenPolicyFair,
+  //    parlay::spork::TokenPolicyFair,
   //    [&] () { std::cout << "spwn!" << std::endl;
   //             x += 4;
   //             std::cout << "spwn incremented x to " << (int) x << std::endl; },

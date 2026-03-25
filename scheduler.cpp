@@ -69,13 +69,22 @@ struct SpwnJob : WorkStealingJob {
     return *current_scheduler;
   }
 
-  explicit SpwnJob(void* spwn,
-                   void* (*exec_spwn)(void*),
+  private:
+  std::function<void*(void* data)> spwn;
+  void* data;
+  uint num_heartbeat_tokens;
+  
+  public:
+  void* result;
+  SpwnJob* next;
+
+  explicit SpwnJob(std::function<void*(void* data)> spwn,
+                   void* data,
                    uint hbt,
                    SpwnJob* next = nullptr) :
     WorkStealingJob(),
     spwn(spwn),
-    exec_spwn(exec_spwn),
+    data(data),
     num_heartbeat_tokens(hbt),
     result(nullptr),
     next(next) {}
@@ -83,22 +92,27 @@ struct SpwnJob : WorkStealingJob {
   SpwnJob& operator=(const SpwnJob& other) {
     if (this == &other) return *this;
     spwn = other.spwn;
-    exec_spwn = other.exec_spwn;
+    data = other.data;
     num_heartbeat_tokens = other.num_heartbeat_tokens;
     result = other.result;
     next = other.next;
     return *this;
   }
-  
-  SpwnJob* fresh() {
-    SpwnJob* other = (SpwnJob*) p_malloc(sizeof(SpwnJob));
-    if (other) *other = *this;
-    return other;
+
+  using JobAllocator = parlay::type_allocator<SpwnJob>;
+
+  template<typename... Args>
+  static SpwnJob* create(Args... args) {
+    return JobAllocator::create(args...);
+  }
+
+  static void destroy(SpwnJob* job) {
+    JobAllocator::destroy(job);
   }
 
   SpwnJob(SpwnJob&& other) :
     SpwnJob(other.spwn,
-            other.exec_spwn,
+            other.data,
             other.num_heartbeat_tokens,
             other.next) { result = other.result; }
 
@@ -112,15 +126,16 @@ struct SpwnJob : WorkStealingJob {
 
   // __attribute__((noinline))
   void execute() override {
+    std::cout << "Execute, before adding tokens" << std::endl;
     heartbeat_tokens.fetch_add(num_heartbeat_tokens);
     std::cout << "Executing spwn" << std::endl;
-    result = exec_spwn(spwn);
+    result = spwn(data);
     std::cout << "after spawn!!!" << std::endl;
     return;
   }
 
   void execute_wo_tokens() {
-    result = exec_spwn(spwn);
+    result = spwn(data);
   }
 
   void wait_or_execute() {
@@ -137,7 +152,7 @@ struct SpwnJob : WorkStealingJob {
     while (jp != nullptr) {
       jp->wait_or_execute();
       SpwnJob* next = jp->next;
-      p_free(jp);
+      destroy(jp);
       jp = next;
     }
   }
@@ -151,32 +166,12 @@ struct SpwnJob : WorkStealingJob {
       SpwnJob* next = jp->next;
       A* r = (A*) jp->result;
       a = std::forward<CombLambda>(combine)(a, *r);
-      p_free(r);
-      p_free(jp);
+      parlay::type_allocator<A>::destroy(r);
+      destroy(jp);
       jp = next;
     }
   }
-
- private:
-  void* spwn;
-  void* (*exec_spwn)(void*);
-  uint num_heartbeat_tokens;
- public:
-  void* result;
-  SpwnJob* next;
 };
-
-// using scheduler_t = parlay::scheduler<SpwnJob>;
-
-// extern inline scheduler_t& get_current_scheduler() {
-//   auto current_scheduler = scheduler_t::get_current_scheduler();
-//   if (current_scheduler == nullptr) {
-//     std::cout << "Initializing scheduler for n = " << internal::init_num_workers() << " workers" << std::endl;
-//     static thread_local scheduler_t local_scheduler(internal::init_num_workers());
-//     return local_scheduler;
-//   }
-//   return *current_scheduler;
-// }
 
 typedef uint_fast8_t spork_slot_idx_t;
 
@@ -376,8 +371,10 @@ static void spork(BodyLambda&& body, PromLambda&& prom) {
 
   // begin body
   begin_body:
+  {
   try_consume_tokens();
   std::forward<BodyLambda>(body)();
+  }
   end_body:
   // end body
   return;
@@ -402,18 +399,19 @@ static void par(LambdaL&& lamL, LambdaR&& lamR) {
   static_assert(std::is_invocable_v<LambdaL&>);
   static_assert(std::is_invocable_v<LambdaR&>);
   VolSpwnJob jp = nullptr;
+  // `lamR` wrapper
+  auto lamRw = [&] (void* null_data) { std::forward<LambdaR>(lamR)(); return nullptr; };
 
   spork(lamL, // TODO: should this be forwarded?
         [&] (uint tokens) {
-          auto lamR2 = [&] () { std::forward<LambdaR>(lamR)(); return nullptr; };
           // TODO: fresh lamR2, then free in execute_lambda itself
-          jp = SpwnJob(&lamR2, &execute_lambda<void*, decltype(lamR2)>, tokens).fresh();
+          jp = SpwnJob::create(lamRw, nullptr, tokens);
           jp->enqueue();
           return false; // can do no more promotions here
         });
 
   if (jp == nullptr) [[likely]] {
-    lamR();
+    lamRw(nullptr);
   } else [[unlikely]] {
     jp->sync();
   }
@@ -424,6 +422,22 @@ static const uint midpoint(uint i, uint j) noexcept {
   return i + ((j - i) >> 1);
 }
 
+struct ReduceData {
+  uint i;
+  uint j;
+  
+  ReduceData(uint i, uint j) : i(i), j(j) {}
+  
+  using ReduceAllocator = parlay::type_allocator<ReduceData>;
+  
+  static ReduceData* create(uint i, uint j) {
+    return ReduceAllocator::create(i, j);
+  }
+  static void destroy(ReduceData* data) {
+    ReduceAllocator::destroy(data);
+  }
+};
+
 template <typename A, typename BodyLambda, typename CombLambda>
 __attribute__((always_inline))
 A reduce(A z, CombLambda&& combine, BodyLambda&& body, uint range_start, uint range_end) {
@@ -433,6 +447,16 @@ A reduce(A z, CombLambda&& combine, BodyLambda&& body, uint range_start, uint ra
   volatile uint j = range_end;
   uint i = range_start;
   A a = z;
+  using AAllocator = parlay::type_allocator<A>;
+
+  auto spwn = [&] (void* data) {
+    ReduceData* rdata = (ReduceData*) data;
+    uint i = rdata->i;
+    uint j = rdata->j;
+    ReduceData::destroy(rdata);
+    return (void*) AAllocator::create(reduce(z, combine, body, midpoint(i+1, j), j));
+  };
+
   spork(
     [&] () {
       while (i < j) {
@@ -441,15 +465,12 @@ A reduce(A z, CombLambda&& combine, BodyLambda&& body, uint range_start, uint ra
       }
     },
     [&] (uint tokens) {
-      // Make sure to capture i and j by value so
+      std::cout << "Promotion!" << std::endl;
+      // Make sure to snapshot i and j so
       // their values aren't updated by body loop
-      auto spwn = [&, i, j] () {
-        A* aptr = (A*) p_malloc(sizeof(A));
-        *aptr = reduce(z, combine, body, midpoint(i+1, j), j);
-        return (void*) aptr;
-      };
+      ReduceData* data = ReduceData::create(i, j);
       j = midpoint(i+1, j);
-      jp = SpwnJob(&spwn, &execute_lambda<void*, decltype(spwn)>, tokens).fresh();
+      jp = SpwnJob::create(spwn, data, tokens);
       jp->enqueue();
       return j > i; // determine if more promotions are possible here
     });
@@ -541,7 +562,7 @@ int main(int argc, char* argv[]) {
     spork::reduce<unsigned long long>(
       0,
       [&] (unsigned long long a, unsigned long long b) { return a + b; },
-      [] (uint i, unsigned long long a) { return (unsigned long long) i/10000 + a; },
+      [] (uint i, unsigned long long a) { std::cout << "i = " << i << std::endl; return (unsigned long long) i/10000 + a; },
       0, n);
   std::cout << total << std::endl;
   // volatile int x = 10;

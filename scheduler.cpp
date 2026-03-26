@@ -8,9 +8,11 @@
 //#include <csignal>
 //#include <cstddef>
 //#include <cstdint>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <ostream>
 #include <signal.h>
 #include <libunwind.h>
 #include <sys/types.h>
@@ -51,7 +53,7 @@ typedef uint spork_id_t;
 static const uint TOKENS_PER_HEARTBEAT = 30;
 static const uint HEARTBEAT_INTERVAL_US = 500;
 // I set this arbitrarily: consider tweaking
-static const uint MAX_HEARTBEAT_TOKENS = TOKENS_PER_HEARTBEAT*4;
+static const uint MAX_HEARTBEAT_TOKENS = TOKENS_PER_HEARTBEAT;//*4;
 thread_local volatile std::atomic_uint heartbeat_tokens = 0;
 
 //auto x = std::this_thread::get_id();
@@ -61,7 +63,7 @@ struct SpwnJob : WorkStealingJob {
   using scheduler_t = parlay::scheduler<SpwnJob>;
 
   static scheduler_t& get_current_scheduler(){
-    auto current_scheduler = scheduler_t::get_current_scheduler();
+    scheduler_t* current_scheduler = scheduler_t::get_current_scheduler();
     if (current_scheduler == nullptr) {
       static thread_local scheduler_t local_scheduler(internal::init_num_workers());
       return local_scheduler;
@@ -103,7 +105,9 @@ struct SpwnJob : WorkStealingJob {
 
   template<typename... Args>
   static SpwnJob* create(Args... args) {
-    return JobAllocator::create(args...);
+    SpwnJob* jp = JobAllocator::create(args...);
+    jp->enqueue();
+    return jp;
   }
 
   static void destroy(SpwnJob* job) {
@@ -126,11 +130,8 @@ struct SpwnJob : WorkStealingJob {
 
   // __attribute__((noinline))
   void execute() override {
-    std::cout << "Execute, before adding tokens" << std::endl;
     heartbeat_tokens.fetch_add(num_heartbeat_tokens);
-    std::cout << "Executing spwn" << std::endl;
     result = spwn(data);
-    std::cout << "after spawn!!!" << std::endl;
     return;
   }
 
@@ -146,7 +147,7 @@ struct SpwnJob : WorkStealingJob {
     }
   }
 
-  __attribute__((always_inline))
+  //__attribute__((always_inline))
   void sync() noexcept {
     SpwnJob* jp = this;
     while (jp != nullptr) {
@@ -157,18 +158,17 @@ struct SpwnJob : WorkStealingJob {
     }
   }
   
-  template<typename A, typename CombLambda>
-  __attribute__((always_inline))
-  void syncUpdate(A& a, CombLambda&& combine) {
+  template<typename CombLambda>
+  //__attribute__((always_inline))
+  void sync(CombLambda&& combine) {
+    static_assert(std::is_invocable_r_v<void, CombLambda&, void*>);
     SpwnJob* jp = this;
     while (jp != nullptr) {
       jp->wait_or_execute();
-      SpwnJob* next = jp->next;
-      A* r = (A*) jp->result;
-      a = std::forward<CombLambda>(combine)(a, *r);
-      parlay::type_allocator<A>::destroy(r);
-      destroy(jp);
-      jp = next;
+      SpwnJob* old = jp;
+      std::forward<CombLambda>(combine)(jp->result);
+      jp = jp->next;
+      destroy(old);
     }
   }
 };
@@ -244,12 +244,8 @@ uint promotes(uint tokens, unw_cursor_t& cursor, unw_context_t& uc) noexcept {
     unw_get_reg(&cursor, UNW_REG_SP, &frame_sp);
     unw_get_reg(&cursor, UNW_REG_IP, &frame_ip);
     unw_get_reg(&cursor, UNW_X86_64_RBP, &frame_bp);
-    
-
-    // std::cout << "frame ip = " << (void*) frame_ip << ", frame bp = " << (void*) frame_bp << ", frame sp = " << (void*) frame_sp << std::endl;
 
     row = spork_table_lookup_ip(frame_ip);
-    // std::cout << "row = " << (void*) row << std::endl;
     if ((row != nullptr) && (row->num_sporks > 0)) break;
   }
 
@@ -285,7 +281,6 @@ std::atomic<bool> during_promotion = false;
 
 __attribute__((noinline))
 uint promotes_until_failure() noexcept {
-  // std::cout << "ad_hoc_spork_ip = " << ad_hoc_spork_ip << std::endl;
   set_colin_default();
 
   // make sure we don't execute two promotes_until_failure concurrently
@@ -326,22 +321,12 @@ uint try_consume_tokens() noexcept {
   }
 }
 
-// Acquires `new_tokens`, then promotes until failure
-// void acquire_heartbeat_tokens(uint new_tokens) noexcept {
-//   heartbeat_tokens.fetch_add(new_tokens);
-//   try_consume_tokens();
-// }
 
 //extern void __RTS_record_spork(const TokenPolicy tokenPolicy, volatile bool* flag, const SpwnJob4* spwn);
 static void __RTS_record_spork(const TokenPolicy tokenPolicy, VolSpwnJob* job, const void* spwn, void (*exec_spwn)(void*)) noexcept {}
 
-void dbgmsg(const void* ptr, uint64_t rbp) {
-  std::cout << "ptr = " << (void*) ptr << ", rbp = " << (void*) rbp << ", diff = " << (void*) (rbp - (uint64_t) ptr) << std::endl;
-}
-
 // x must be a pointer to something invocable
 // which returns a Result
-//template <typename SpwnLambda, typename Result>
 template <typename _Ret, typename _Fn, typename... _Args>
 _Ret execute_lambda(void* f, _Args... args) {
   static_assert(std::is_invocable_r_v<_Ret, _Fn&, _Args...>);
@@ -380,19 +365,6 @@ static void spork(BodyLambda&& body, PromLambda&& prom) {
   return;
 }
 
-// TODO: look into `clone` function from /usr/include/x86_64-linux-gnu/bits/sched.h
-
-// template<typename Lambda_t>
-// static void* fresh_lambda(Lambda_t& lam) {
-//   Lambda_t* ptr = (Lambda_t*) p_malloc(sizeof(Lambda_t));
-//   std::byte b [sizeof(Lambda_t)];
-//   for (unsigned int i = 0; i < sizeof(Lambda_t); i++) {
-//     *(ptr + i*sizeof(std::byte)) = *((uintptr_t) lam + i*sizeof(std::byte));
-//   }
-//   if (ptr) *ptr = lam;
-//   return (void*) ptr;
-// }
-
 template <typename LambdaL, typename LambdaR>
 __attribute__((always_inline))
 static void par(LambdaL&& lamL, LambdaR&& lamR) {
@@ -404,9 +376,7 @@ static void par(LambdaL&& lamL, LambdaR&& lamR) {
 
   spork(lamL, // TODO: should this be forwarded?
         [&] (uint tokens) {
-          // TODO: fresh lamR2, then free in execute_lambda itself
           jp = SpwnJob::create(lamRw, nullptr, tokens);
-          jp->enqueue();
           return false; // can do no more promotions here
         });
 
@@ -438,11 +408,20 @@ struct ReduceData {
   }
 };
 
+void waste_some_time() {
+  for (uint i = 0; i < 1000000; i++) {
+    if (i % 12345 == 678901241) [[likely]] {
+      // should never happen
+      std::cout << "waste_some_time i = " << i << std::endl;
+    }
+  }
+}
+
 template <typename A, typename BodyLambda, typename CombLambda>
 __attribute__((always_inline))
 A reduce(A z, CombLambda&& combine, BodyLambda&& body, uint range_start, uint range_end) {
-  static_assert(std::is_invocable_r_v<A, BodyLambda&, uint, A>);
-  static_assert(std::is_invocable_r_v<A, CombLambda&, A, A>);
+  static_assert(std::is_invocable_r_v<void, BodyLambda&, uint, A&>);
+  static_assert(std::is_invocable_r_v<void, CombLambda&, A&, A>);
   VolSpwnJob jp = nullptr;
   volatile uint j = range_end;
   uint i = range_start;
@@ -451,32 +430,35 @@ A reduce(A z, CombLambda&& combine, BodyLambda&& body, uint range_start, uint ra
 
   auto spwn = [&] (void* data) {
     ReduceData* rdata = (ReduceData*) data;
-    uint i = rdata->i;
-    uint j = rdata->j;
+    uint i2 = rdata->i;
+    uint j2 = rdata->j;
     ReduceData::destroy(rdata);
-    return (void*) AAllocator::create(reduce(z, combine, body, midpoint(i+1, j), j));
+    return (void*) AAllocator::create(reduce(z, combine, body, midpoint(i2+1, j2), j2));
   };
 
   spork(
     [&] () {
       while (i < j) {
-        a = std::forward<BodyLambda>(body)(i, a);
+        std::forward<BodyLambda&>(body)(i, a);
         i++;
       }
     },
     [&] (uint tokens) {
-      std::cout << "Promotion!" << std::endl;
       // Make sure to snapshot i and j so
       // their values aren't updated by body loop
+      if (i + 1 >= j) { return false; }
       ReduceData* data = ReduceData::create(i, j);
+      //std::flush(std::cout); std::cout << "Split at i = " << i << " and j = " << j << " with " << tokens << " tokens" << " with data = {" << data->i << ", " << data->j << "} and midpoint = " << midpoint(i+1, j) << std::endl; std::flush(std::cout);
       j = midpoint(i+1, j);
-      jp = SpwnJob::create(spwn, data, tokens);
-      jp->enqueue();
-      return j > i; // determine if more promotions are possible here
+      jp = SpwnJob::create(spwn, (void*) data, tokens, jp);
+      return j > i+1; // determine if more promotions are possible here
     });
 
   if (jp != nullptr) [[unlikely]] {
-    jp->syncUpdate(a, combine);
+    jp->sync([&] (void* b) {
+      std::forward<CombLambda>(combine)(a, *((A*) b));
+      AAllocator::destroy((A*) b);
+    });
   }
   return a;
 }
@@ -513,6 +495,7 @@ uint fib(uint n) {
 }
 
 void heartbeat_handler(int sig, siginfo_t* info, void* ucontext) {
+  // std::cout << "heartbeat!" << std::endl;
   int saved_errno = errno;
   //ucontext_t* ctx = (ucontext_t*) ucontext;
 
@@ -527,44 +510,58 @@ void heartbeat_handler(int sig, siginfo_t* info, void* ucontext) {
   
   errno = saved_errno;
 }
-int setup_handler() {
+
+timer_t heartbeat_timer;
+
+int start_heartbeats() noexcept {
+  // this might take a sec the first time it is called
+  spork::SpwnJob::get_current_scheduler();
+
   struct sigaction sa = {};
   sa.sa_sigaction = heartbeat_handler;
   sa.sa_flags = SA_SIGINFO;// | SA_RESTART;
-  //sigemptyset(&sa.sa_mask); // don't block extra signals during handler
+  
+  sigemptyset(&sa.sa_mask); // don't block extra signals during handler
+  sigaddset(&sa.sa_mask, SIGALRM); // block SIGALRM while in handler
+  
   sigaction(SIGALRM, &sa, nullptr);
 
-  timer_t tid;
   struct sigevent sev{};
   sev.sigev_notify = SIGEV_SIGNAL;
   sev.sigev_signo  = SIGALRM;
   
-  timer_create(CLOCK_MONOTONIC, &sev, &tid);
+  timer_create(CLOCK_MONOTONIC, &sev, &heartbeat_timer);
   
   struct itimerspec its{};
   its.it_value.tv_nsec    = HEARTBEAT_INTERVAL_US*1000;
   its.it_interval.tv_nsec = HEARTBEAT_INTERVAL_US*1000;
   
-  timer_settime(tid, 0, &its, nullptr);
+  timer_settime(heartbeat_timer, 0, &its, nullptr);
   return 0;
+}
+
+int stop_heartbeats() noexcept {
+  int r = timer_delete(heartbeat_timer);
+  return r;
 }
 } // namespace spork
 
 
 int main(int argc, char* argv[]) {
-  spork::SpwnJob::get_current_scheduler();
-  spork::setup_handler();
+  spork::start_heartbeats();
   
   // std::cout << parlay::spork::fib(40) << std::endl;
   // uint n = atoi(argv[1]);
-  uint n = 1000000;
-  unsigned long long total =
-    spork::reduce<unsigned long long>(
+  using num = double;//unsigned long long;
+  num total =
+    spork::reduce<num>(
       0,
-      [&] (unsigned long long a, unsigned long long b) { return a + b; },
-      [] (uint i, unsigned long long a) { std::cout << "i = " << i << std::endl; return (unsigned long long) i/10000 + a; },
-      0, n);
+      [] (num& a, num b) { /*std::cout << "Merge " << a << " and " << b << " = " << a + b << std::endl;*/ a += b; },
+      [] (uint i, num& a) { /*std::flush(std::cout); std::cout << "[" << std::this_thread::get_id() << "] " << "body i = " << i << ", a = " << a << std::endl; std::flush(std::cout); spork::waste_some_time();*/ a += (num) i; },
+      0, 1000000000);
   std::cout << total << std::endl;
+
+  spork::stop_heartbeats();
   // volatile int x = 10;
   // for (int i = 0; i < 100; i++) {
   // std::cout << "hello world inside loop" << std::endl;

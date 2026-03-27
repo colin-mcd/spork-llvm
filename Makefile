@@ -8,6 +8,13 @@ OPTIONS := -xc++ -stdlib=libc++ -std=c++17
 scheduler: scheduler.cpp
 	$(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) $< -o $@
 
+schedulerO1: scheduler.cpp
+	$(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) -O1 $< -o $@
+schedulerO2: scheduler.cpp
+	$(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) -O2 $< -o $@
+schedulerO3: scheduler.cpp
+	$(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) -O3 $< -o $@
+
 schedulerO1.s: scheduler.cpp
 	$(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -O1 -S $< -o $@
 schedulerO2.s: scheduler.cpp

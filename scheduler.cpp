@@ -33,13 +33,6 @@ enum TokenPolicy {
   TokenPolicyKeep
 };
 
-// #ifndef SPORK_PROMOTED
-// #define SPORK_IS_UNPR(x) (x == nullptr)
-// #define SPORK_IS_PROM(x) (x != nullptr)
-// #define SPORK_SET_PROM(x) (x = SPORK_PROMOTED)
-// #define SPORK_RESET(x) x = nullptr
-// #endif
-
 typedef uint spork_id_t;
 #define FRESH_SPORK_ID __COUNTER__
 
@@ -52,10 +45,10 @@ typedef uint spork_id_t;
  * I believe this would allow "perfect forwarding"?
  */
 
-static const uint TOKENS_PER_HEARTBEAT = 30;
+static const uint TOKENS_PER_HEARTBEAT = 32;
 static const uint HEARTBEAT_INTERVAL_US = 500;
 // I set this arbitrarily: consider tweaking
-static const uint MAX_HEARTBEAT_TOKENS = TOKENS_PER_HEARTBEAT*4;
+static const uint MAX_HEARTBEAT_TOKENS = TOKENS_PER_HEARTBEAT*1;
 thread_local volatile std::atomic_uint heartbeat_tokens = 0;
 thread_local volatile uint num_heartbeats = 0;
 
@@ -71,7 +64,6 @@ struct SpwnJob : WorkStealingJob {
     scheduler_t* current_scheduler = scheduler_t::get_current_scheduler();
     if (current_scheduler == nullptr) {
       static thread_local scheduler_t local_scheduler(internal::init_num_workers());
-      std::cout << "Initializing with n=" << internal::init_num_workers() << " workers" << std::endl;
       return local_scheduler;
     }
     return *current_scheduler;
@@ -137,20 +129,18 @@ struct SpwnJob : WorkStealingJob {
   // __attribute__((noinline))
   void execute() override {
     start_heartbeats();
-    // std::cout << "Stolen (" << num_heartbeats << " heartbeats)" << std::endl;
     heartbeat_tokens.fetch_add(num_heartbeat_tokens);
     result = spwn(data);
-    // std::cout << "Finished spwn (" << num_heartbeats << " heartbeats)" << std::endl;
     return;
   }
 
-  void execute_wo_tokens() {
+  void execute_fast_clone() {
     result = spwn(data);
   }
 
   void wait_or_execute() {
     if (try_dequeue()) { // unstolen
-      execute_wo_tokens();
+      execute_fast_clone();
     } else { // stolen
       wait();
     }
@@ -330,7 +320,10 @@ uint try_consume_tokens() noexcept {
   }
 }
 
-void heartbeat_handler(int sig, siginfo_t* info, void* ucontext) {
+// sa.sa_sigaction = heartbeat_handler;
+// sa.sa_flags = SA_SIGINFO
+//void heartbeat_handler(int sig, siginfo_t* info, void* ucontext) {
+void heartbeat_handler(int sig) {
   // std::cout << "heartbeat!" << std::endl;
   num_heartbeats++;
   int saved_errno = errno;
@@ -355,11 +348,12 @@ int start_heartbeats() noexcept {
   if (heartbeats_running) return 0;
   heartbeats_running = true;
   struct sigaction sa = {};
-  sa.sa_sigaction = heartbeat_handler;
-  sa.sa_flags = SA_SIGINFO;// | SA_RESTART;
+  //sa.sa_sigaction = heartbeat_handler;
+  //sa.sa_flags = SA_SIGINFO;// | SA_RESTART;
+  sa.sa_handler = heartbeat_handler;
   
-  sigemptyset(&sa.sa_mask); // don't block extra signals during handler
-  sigaddset(&sa.sa_mask, SIGALRM); // block SIGALRM while in handler
+  //sigemptyset(&sa.sa_mask); // don't block extra signals during handler
+  //sigaddset(&sa.sa_mask, SIGALRM); // block SIGALRM while in handler
   
   sigaction(SIGALRM, &sa, nullptr);
 
@@ -378,11 +372,11 @@ int start_heartbeats() noexcept {
   return 0;
 }
 
-int stop_heartbeats() noexcept {
-  int r = timer_delete(heartbeat_timer);
-  heartbeats_running = false;
-  return r;
-}
+// int stop_heartbeats() noexcept {
+//   int r = timer_delete(heartbeat_timer);
+//   heartbeats_running = false;
+//   return r;
+// }
 
 
 //extern void __RTS_record_spork(const TokenPolicy tokenPolicy, volatile bool* flag, const SpwnJob4* spwn);
@@ -420,7 +414,7 @@ static void spork(BodyLambda&& body, PromLambda&& prom) {
   // begin body
   begin_body:
   {
-  try_consume_tokens();
+  //try_consume_tokens();
   std::forward<BodyLambda>(body)();
   }
   end_body:
@@ -570,20 +564,20 @@ int main(int argc, char* argv[]) {
   // std::cout << parlay::spork::fib(40) << std::endl;
   // uint n = atoi(argv[1]);
   spork::num_heartbeats = 0;
-  using num = double;//unsigned long long;
+  using num = unsigned long long;
   auto start = std::chrono::steady_clock::now();
   num total =
     spork::reduce<num>(
       0,
-      [] (num& a, num b) { /*std::cout << "Merge " << a << " and " << b << " = " << a + b << std::endl;*/ a += b; },
-      [] (uint i, num& a) { /*std::flush(std::cout); std::cout << "[" << std::this_thread::get_id() << "] " << "body i = " << i << ", a = " << a << std::endl; std::flush(std::cout); spork::waste_some_time();*/ a += (num) i; },
+      [] (num& a, num b) { a += b; },
+      [] (uint i, num& a) { a += (num) i; },
       0, 1000000000);
   auto end = std::chrono::steady_clock::now();
   auto time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
   std::cout << total << " in " << time_ms << " ms (" << spork::num_heartbeats << " heartbeats)" << std::endl;
   }
 
-  spork::stop_heartbeats();
+  //spork::stop_heartbeats();
   // volatile int x = 10;
   // for (int i = 0; i < 100; i++) {
   // std::cout << "hello world inside loop" << std::endl;

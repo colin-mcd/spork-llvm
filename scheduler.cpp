@@ -9,10 +9,12 @@
 //#include <cstddef>
 //#include <cstdint>
 #include <atomic>
+#include <bits/types/time_t.h>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <ostream>
+#include <ratio>
 #include <signal.h>
 #include <libunwind.h>
 #include <sys/types.h>
@@ -53,10 +55,13 @@ typedef uint spork_id_t;
 static const uint TOKENS_PER_HEARTBEAT = 30;
 static const uint HEARTBEAT_INTERVAL_US = 500;
 // I set this arbitrarily: consider tweaking
-static const uint MAX_HEARTBEAT_TOKENS = TOKENS_PER_HEARTBEAT;//*4;
+static const uint MAX_HEARTBEAT_TOKENS = TOKENS_PER_HEARTBEAT*4;
 thread_local volatile std::atomic_uint heartbeat_tokens = 0;
+thread_local volatile uint num_heartbeats = 0;
 
 //auto x = std::this_thread::get_id();
+
+int start_heartbeats() noexcept;
 
 struct SpwnJob : WorkStealingJob {
 
@@ -66,6 +71,7 @@ struct SpwnJob : WorkStealingJob {
     scheduler_t* current_scheduler = scheduler_t::get_current_scheduler();
     if (current_scheduler == nullptr) {
       static thread_local scheduler_t local_scheduler(internal::init_num_workers());
+      std::cout << "Initializing with n=" << internal::init_num_workers() << " workers" << std::endl;
       return local_scheduler;
     }
     return *current_scheduler;
@@ -130,8 +136,11 @@ struct SpwnJob : WorkStealingJob {
 
   // __attribute__((noinline))
   void execute() override {
+    start_heartbeats();
+    // std::cout << "Stolen (" << num_heartbeats << " heartbeats)" << std::endl;
     heartbeat_tokens.fetch_add(num_heartbeat_tokens);
     result = spwn(data);
+    // std::cout << "Finished spwn (" << num_heartbeats << " heartbeats)" << std::endl;
     return;
   }
 
@@ -321,6 +330,60 @@ uint try_consume_tokens() noexcept {
   }
 }
 
+void heartbeat_handler(int sig, siginfo_t* info, void* ucontext) {
+  // std::cout << "heartbeat!" << std::endl;
+  num_heartbeats++;
+  int saved_errno = errno;
+  //ucontext_t* ctx = (ucontext_t*) ucontext;
+
+  uint tokens = heartbeat_tokens.exchange(0);
+  tokens += tokens + TOKENS_PER_HEARTBEAT;
+  if (tokens > MAX_HEARTBEAT_TOKENS) {
+    heartbeat_tokens.store(MAX_HEARTBEAT_TOKENS);
+  } else {
+    heartbeat_tokens.fetch_add(tokens);
+  }
+  promotes_until_failure();
+  
+  errno = saved_errno;
+}
+
+thread_local timer_t heartbeat_timer;
+thread_local bool heartbeats_running = false;
+
+int start_heartbeats() noexcept {
+  if (heartbeats_running) return 0;
+  heartbeats_running = true;
+  struct sigaction sa = {};
+  sa.sa_sigaction = heartbeat_handler;
+  sa.sa_flags = SA_SIGINFO;// | SA_RESTART;
+  
+  sigemptyset(&sa.sa_mask); // don't block extra signals during handler
+  sigaddset(&sa.sa_mask, SIGALRM); // block SIGALRM while in handler
+  
+  sigaction(SIGALRM, &sa, nullptr);
+
+  struct sigevent sev{};
+  sev.sigev_notify = SIGEV_THREAD_ID;
+  sev.sigev_signo  = SIGALRM;
+  sev._sigev_un._tid = gettid();
+  
+  timer_create(CLOCK_MONOTONIC, &sev, &heartbeat_timer);
+  
+  struct itimerspec its{};
+  its.it_value.tv_nsec    = HEARTBEAT_INTERVAL_US*1000;
+  its.it_interval.tv_nsec = HEARTBEAT_INTERVAL_US*1000;
+  
+  timer_settime(heartbeat_timer, 0, &its, nullptr);
+  return 0;
+}
+
+int stop_heartbeats() noexcept {
+  int r = timer_delete(heartbeat_timer);
+  heartbeats_running = false;
+  return r;
+}
+
 
 //extern void __RTS_record_spork(const TokenPolicy tokenPolicy, volatile bool* flag, const SpwnJob4* spwn);
 static void __RTS_record_spork(const TokenPolicy tokenPolicy, VolSpwnJob* job, const void* spwn, void (*exec_spwn)(void*)) noexcept {}
@@ -493,73 +556,32 @@ uint fib(uint n) {
     return l + r;
   }
 }
-
-void heartbeat_handler(int sig, siginfo_t* info, void* ucontext) {
-  // std::cout << "heartbeat!" << std::endl;
-  int saved_errno = errno;
-  //ucontext_t* ctx = (ucontext_t*) ucontext;
-
-  uint tokens = heartbeat_tokens.exchange(0);
-  tokens += tokens + TOKENS_PER_HEARTBEAT;
-  if (tokens > MAX_HEARTBEAT_TOKENS) {
-    heartbeat_tokens.store(MAX_HEARTBEAT_TOKENS);
-  } else {
-    heartbeat_tokens.fetch_add(tokens);
-  }
-  promotes_until_failure();
-  
-  errno = saved_errno;
-}
-
-timer_t heartbeat_timer;
-
-int start_heartbeats() noexcept {
-  // this might take a sec the first time it is called
-  spork::SpwnJob::get_current_scheduler();
-
-  struct sigaction sa = {};
-  sa.sa_sigaction = heartbeat_handler;
-  sa.sa_flags = SA_SIGINFO;// | SA_RESTART;
-  
-  sigemptyset(&sa.sa_mask); // don't block extra signals during handler
-  sigaddset(&sa.sa_mask, SIGALRM); // block SIGALRM while in handler
-  
-  sigaction(SIGALRM, &sa, nullptr);
-
-  struct sigevent sev{};
-  sev.sigev_notify = SIGEV_SIGNAL;
-  sev.sigev_signo  = SIGALRM;
-  
-  timer_create(CLOCK_MONOTONIC, &sev, &heartbeat_timer);
-  
-  struct itimerspec its{};
-  its.it_value.tv_nsec    = HEARTBEAT_INTERVAL_US*1000;
-  its.it_interval.tv_nsec = HEARTBEAT_INTERVAL_US*1000;
-  
-  timer_settime(heartbeat_timer, 0, &its, nullptr);
-  return 0;
-}
-
-int stop_heartbeats() noexcept {
-  int r = timer_delete(heartbeat_timer);
-  return r;
-}
 } // namespace spork
 
 
 int main(int argc, char* argv[]) {
+  // this might take a sec the first time it is called
+  spork::SpwnJob::get_current_scheduler();
+
   spork::start_heartbeats();
+  
+  for (uint r = 0; r < 10; r++) {
   
   // std::cout << parlay::spork::fib(40) << std::endl;
   // uint n = atoi(argv[1]);
+  spork::num_heartbeats = 0;
   using num = double;//unsigned long long;
+  auto start = std::chrono::steady_clock::now();
   num total =
     spork::reduce<num>(
       0,
       [] (num& a, num b) { /*std::cout << "Merge " << a << " and " << b << " = " << a + b << std::endl;*/ a += b; },
       [] (uint i, num& a) { /*std::flush(std::cout); std::cout << "[" << std::this_thread::get_id() << "] " << "body i = " << i << ", a = " << a << std::endl; std::flush(std::cout); spork::waste_some_time();*/ a += (num) i; },
       0, 1000000000);
-  std::cout << total << std::endl;
+  auto end = std::chrono::steady_clock::now();
+  auto time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+  std::cout << total << " in " << time_ms << " ms (" << spork::num_heartbeats << " heartbeats)" << std::endl;
+  }
 
   spork::stop_heartbeats();
   // volatile int x = 10;

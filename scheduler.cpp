@@ -4,10 +4,6 @@
 #include "parlay/scheduler.h"
 #include "parlay/alloc.h"
 
-//#include <atomic>
-//#include <csignal>
-//#include <cstddef>
-//#include <cstdint>
 #include <atomic>
 #include <bits/types/time_t.h>
 #include <cstddef>
@@ -23,6 +19,12 @@
 #include <iostream>
 #include <utility>
 
+#include <linux/perf_event.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+
+// TODO: consistent name casing (camel or snake)
+
 using namespace parlay;
 
 namespace spork {
@@ -36,25 +38,15 @@ enum TokenPolicy {
 typedef uint spork_id_t;
 #define FRESH_SPORK_ID __COUNTER__
 
-/*
- * IDEA:
- * using macros(?), make an (extensible?) enum of all lambda types
- * and store the specific instance value in the spork table.
- * Then, do_promote() splits on that value and instantiates
- * the spwn lambda pointer to the correct type.
- * I believe this would allow "perfect forwarding"?
- */
-
-static const uint TOKENS_PER_HEARTBEAT = 32;
-static const uint HEARTBEAT_INTERVAL_US = 500;
+static const uint TOKENS_PER_HEARTBEAT = 1;
+static const uint HEARTBEAT_INTERVAL_US = 16;
 // I set this arbitrarily: consider tweaking
 static const uint MAX_HEARTBEAT_TOKENS = TOKENS_PER_HEARTBEAT*1;
 thread_local volatile std::atomic_uint heartbeat_tokens = 0;
 thread_local volatile uint num_heartbeats = 0;
 
-//auto x = std::this_thread::get_id();
-
-int start_heartbeats() noexcept;
+void start_heartbeats() noexcept;
+void pause_heartbeats() noexcept;
 
 struct SpwnJob : WorkStealingJob {
 
@@ -73,30 +65,42 @@ struct SpwnJob : WorkStealingJob {
   std::function<void*(void* data)> spwn;
   void* data;
   uint num_heartbeat_tokens;
+  scheduler_t* sched;
   
   public:
   void* result;
   SpwnJob* next;
 
+  explicit SpwnJob() {}
+
   explicit SpwnJob(std::function<void*(void* data)> spwn,
                    void* data,
                    uint hbt,
-                   SpwnJob* next = nullptr) :
+                   SpwnJob* next = nullptr,
+                   scheduler_t* sched = nullptr) :
     WorkStealingJob(),
     spwn(spwn),
     data(data),
     num_heartbeat_tokens(hbt),
+    sched(sched ? sched : &get_current_scheduler()),
     result(nullptr),
-    next(next) {}
+    next(next) { }
 
   SpwnJob& operator=(const SpwnJob& other) {
     if (this == &other) return *this;
     spwn = other.spwn;
     data = other.data;
     num_heartbeat_tokens = other.num_heartbeat_tokens;
+    sched = other.sched;
     result = other.result;
     next = other.next;
     return *this;
+  }
+
+  // pretends a volatile SpwnJob is nonvolatile
+  __attribute__((always_inline))
+  SpwnJob* pretend_nonvolatile() volatile {
+    return (SpwnJob*) this;
   }
 
   using JobAllocator = parlay::type_allocator<SpwnJob>;
@@ -116,21 +120,29 @@ struct SpwnJob : WorkStealingJob {
     SpwnJob(other.spwn,
             other.data,
             other.num_heartbeat_tokens,
-            other.next) { result = other.result; }
+            other.next,
+            other.sched) { result = other.result; }
 
   void enqueue() {
-    get_current_scheduler().spawn(this);
+    // TODO: make sure queue doesn't overflow (max 1000, aborts if hit)
+    sched->spawn(this);
+  }
+
+  void enqueue() volatile {
+    // TODO: make sure queue doesn't overflow (max 1000, aborts if hit)
+    sched->spawn((SpwnJob*) this);
   }
 
   bool try_dequeue() {
-    return get_current_scheduler().get_own_job() != nullptr;
+    return sched->get_own_job() != nullptr;
   }
 
   // __attribute__((noinline))
   void execute() override {
-    start_heartbeats();
     heartbeat_tokens.fetch_add(num_heartbeat_tokens);
+    start_heartbeats();
     result = spwn(data);
+    pause_heartbeats();
     return;
   }
 
@@ -156,7 +168,7 @@ struct SpwnJob : WorkStealingJob {
       jp = next;
     }
   }
-  
+
   template<typename CombLambda>
   //__attribute__((always_inline))
   void sync(CombLambda&& combine) {
@@ -342,36 +354,44 @@ void heartbeat_handler(int sig) {
 }
 
 thread_local timer_t heartbeat_timer;
-thread_local bool heartbeats_running = false;
+thread_local bool heartbeats_initialized = false;
 
-int start_heartbeats() noexcept {
-  if (heartbeats_running) return 0;
-  heartbeats_running = true;
-  struct sigaction sa = {};
-  //sa.sa_sigaction = heartbeat_handler;
-  //sa.sa_flags = SA_SIGINFO;// | SA_RESTART;
-  sa.sa_handler = heartbeat_handler;
-  
-  //sigemptyset(&sa.sa_mask); // don't block extra signals during handler
-  //sigaddset(&sa.sa_mask, SIGALRM); // block SIGALRM while in handler
-  
-  sigaction(SIGALRM, &sa, nullptr);
+void start_heartbeats() noexcept {
+  if (!heartbeats_initialized) { // only first time
+    heartbeats_initialized = true;
 
-  struct sigevent sev{};
-  sev.sigev_notify = SIGEV_THREAD_ID;
-  sev.sigev_signo  = SIGALRM;
-  sev._sigev_un._tid = gettid();
+    struct sigaction sa = {};
+    //sa.sa_sigaction = heartbeat_handler;
+    //sa.sa_flags = SA_SIGINFO;// | SA_RESTART;
+    sa.sa_handler = heartbeat_handler;
+    
+    //sigemptyset(&sa.sa_mask); // don't block extra signals during handler
+    //sigaddset(&sa.sa_mask, SIGALRM); // block SIGALRM while in handler
+    
+    sigaction(SIGALRM, &sa, nullptr);
   
-  timer_create(CLOCK_MONOTONIC, &sev, &heartbeat_timer);
+    struct sigevent sev{};
+    sev.sigev_notify = SIGEV_THREAD_ID;
+    sev.sigev_signo  = SIGALRM;
+    sev._sigev_un._tid = gettid();
+    
+    timer_create(CLOCK_MONOTONIC, &sev, &heartbeat_timer);
+  }
   
+  // resume timer
   struct itimerspec its{};
   its.it_value.tv_nsec    = HEARTBEAT_INTERVAL_US*1000;
   its.it_interval.tv_nsec = HEARTBEAT_INTERVAL_US*1000;
   
   timer_settime(heartbeat_timer, 0, &its, nullptr);
-  return 0;
 }
 
+void pause_heartbeats() noexcept {
+  struct itimerspec zero{};
+  timer_settime(heartbeat_timer, 0, &zero, nullptr);
+}
+
+// TODO: need to do this for every thread
 // int stop_heartbeats() noexcept {
 //   int r = timer_delete(heartbeat_timer);
 //   heartbeats_running = false;
@@ -414,7 +434,7 @@ static void spork(BodyLambda&& body, PromLambda&& prom) {
   // begin body
   begin_body:
   {
-  //try_consume_tokens();
+  try_consume_tokens();
   std::forward<BodyLambda>(body)();
   }
   end_body:
@@ -427,20 +447,22 @@ __attribute__((always_inline))
 static void par(LambdaL&& lamL, LambdaR&& lamR) {
   static_assert(std::is_invocable_v<LambdaL&>);
   static_assert(std::is_invocable_v<LambdaR&>);
-  VolSpwnJob jp = nullptr;
+  volatile SpwnJob jp;
+  volatile bool unpromoted = true;
   // `lamR` wrapper
   auto lamRw = [&] (void* null_data) { std::forward<LambdaR>(lamR)(); return nullptr; };
 
   spork(lamL, // TODO: should this be forwarded?
         [&] (uint tokens) {
-          jp = SpwnJob::create(lamRw, nullptr, tokens);
+          unpromoted = false;
+          *jp.pretend_nonvolatile() = SpwnJob(lamRw, nullptr, tokens);
           return false; // can do no more promotions here
         });
 
-  if (jp == nullptr) [[likely]] {
+  if (unpromoted) [[likely]] {
     lamRw(nullptr);
   } else [[unlikely]] {
-    jp->sync();
+    jp.pretend_nonvolatile()->sync();
   }
 }
 
@@ -465,13 +487,91 @@ struct ReduceData {
   }
 };
 
-void waste_some_time() {
-  for (uint i = 0; i < 1000000; i++) {
-    if (i % 12345 == 678901241) [[likely]] {
-      // should never happen
-      std::cout << "waste_some_time i = " << i << std::endl;
+// void waste_some_time() {
+//   for (uint i = 0; i < 1000000; i++) {
+//     if (i % 12345 == 678901241) [[likely]] {
+//       // should never happen
+//       std::cout << "waste_some_time i = " << i << std::endl;
+//     }
+//   }
+// }
+
+// int setup_perf_interrupt(long long period_cycles) {
+//   struct perf_event_attr pe{};
+//   pe.type           = PERF_TYPE_HARDWARE;
+//   pe.config         = PERF_COUNT_HW_CPU_CYCLES;
+//   pe.sample_period  = period_cycles;
+//   pe.watermark      = 0;
+  
+//   // pid=0 targets the calling thread, cpu=-1 = any CPU
+//   int fd = syscall(SYS_perf_event_open, &pe, 0, -1, -1, 0);
+  
+//   // Route overflow to SIGIO on this thread
+//   fcntl(fd, F_SETFL, O_ASYNC);
+//   fcntl(fd, F_SETOWN, gettid());
+  
+//   ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
+//   return fd;
+// }
+
+template <typename A, typename BodyLambda, typename CombLambda>
+__attribute__((always_inline)) // TODO: investigate what this attribute actually does
+A reduceNoAlloc(A z, A a, CombLambda&& combine, BodyLambda&& body, uint range_start, uint range_end) {
+  static_assert(std::is_invocable_r_v<void, BodyLambda&, uint, A&>);
+  static_assert(std::is_invocable_r_v<void, CombLambda&, A&, A>);
+
+  // TODO: consolidate these local vars
+  volatile SpwnJob jpL, jpR;
+  volatile char promoted = 0; // 0 = unpromoted, 1 = R promoted, 2 = L and R promoted
+  volatile uint next_i, next_j;
+
+  volatile uint j = range_end;
+  uint i = range_start;
+
+  volatile A aL, aR;
+
+  auto spwn = [&] (void* isLeft) {
+    uint mid = midpoint(next_i, next_j);
+    if (isLeft) {
+      aL = reduceNoAlloc(z, z, combine, body, next_i, mid);
+    } else {
+      aR = reduceNoAlloc(z, z, combine, body, mid, next_j);
     }
+    return nullptr;
+  };
+ 
+  spork(
+    [&] () {
+      for (; i < j; i++) {
+        std::forward<BodyLambda&>(body)(i, a);
+      }
+    },
+    [&] (uint tokens) {
+      next_i = i;
+      next_i++;
+      next_j = j;
+      if (next_i >= next_j) { return false; }
+      promoted++;
+      j = next_i;
+      *jpR.pretend_nonvolatile() = SpwnJob(spwn, (void*) false, tokens);
+      // TODO: check if work stealing deque is full before enqueueing
+      jpR.enqueue();
+      if (next_i >= midpoint(next_i, next_j)) { return false; }
+      promoted++;
+      *jpL.pretend_nonvolatile() = SpwnJob(spwn, (void*) true, 0); // TODO: token policy??
+      jpL.enqueue();
+      return false;
+    });
+  
+  if (promoted) [[unlikely]] {
+    if (promoted > 1) [[unlikely]] {
+      jpL.pretend_nonvolatile()->wait_or_execute();
+      std::forward<CombLambda>(combine)(a, aL);
+    }
+    jpR.pretend_nonvolatile()->wait_or_execute();
+    std::forward<CombLambda>(combine)(a, aR);
   }
+  return a;
 }
 
 template <typename A, typename BodyLambda, typename CombLambda>
@@ -505,7 +605,6 @@ A reduce(A z, CombLambda&& combine, BodyLambda&& body, uint range_start, uint ra
       // their values aren't updated by body loop
       if (i + 1 >= j) { return false; }
       ReduceData* data = ReduceData::create(i, j);
-      //std::flush(std::cout); std::cout << "Split at i = " << i << " and j = " << j << " with " << tokens << " tokens" << " with data = {" << data->i << ", " << data->j << "} and midpoint = " << midpoint(i+1, j) << std::endl; std::flush(std::cout);
       j = midpoint(i+1, j);
       jp = SpwnJob::create(spwn, (void*) data, tokens, jp);
       return j > i+1; // determine if more promotions are possible here
@@ -555,7 +654,7 @@ uint fib(uint n) {
 
 int main(int argc, char* argv[]) {
   // this might take a sec the first time it is called
-  spork::SpwnJob::get_current_scheduler();
+  //spork::SpwnJob::get_current_scheduler();
 
   spork::start_heartbeats();
   
@@ -567,15 +666,18 @@ int main(int argc, char* argv[]) {
   using num = unsigned long long;
   auto start = std::chrono::steady_clock::now();
   num total =
-    spork::reduce<num>(
+    spork::reduceNoAlloc<num>(
+      0,
       0,
       [] (num& a, num b) { a += b; },
       [] (uint i, num& a) { a += (num) i; },
-      0, 1000000000);
+      0, 1000);
   auto end = std::chrono::steady_clock::now();
   auto time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
   std::cout << total << " in " << time_ms << " ms (" << spork::num_heartbeats << " heartbeats)" << std::endl;
   }
+
+  spork::pause_heartbeats();
 
   //spork::stop_heartbeats();
   // volatile int x = 10;

@@ -28,6 +28,7 @@
 //#include <fcntl.h>
 
 // TODO: consider a (libunwind) setjmp/longjmp based implementation
+// TODO: libunwind implementation broken for any (heterogenous) nested parallelism
 #define PROM_USE_LIBUNWIND 0
 
 // TODO: consistent name casing (camel or snake)
@@ -39,13 +40,14 @@ namespace spork {
 typedef uint spork_id_t;
 //#define FRESH_SPORK_ID __COUNTER__
 
-static constexpr uint TOKENS_PER_HEARTBEAT = 30;
-static constexpr uint HEARTBEAT_INTERVAL_US = 500;
+constexpr uint TOKENS_PER_HEARTBEAT = 240;
+constexpr uint HEARTBEAT_INTERVAL_US = 500;
 // I set this arbitrarily: consider tweaking
-static constexpr uint MAX_HEARTBEAT_TOKENS = TOKENS_PER_HEARTBEAT*1;
-thread_local volatile uint heartbeat_tokens = 0;
-thread_local volatile uint num_heartbeats = 0;
-thread_local volatile bool disable_heartbeats = false;
+constexpr uint MAX_HEARTBEAT_TOKENS = TOKENS_PER_HEARTBEAT*1;
+thread_local volatile uint heartbeat_tokens;
+thread_local volatile uint num_heartbeats;
+thread_local volatile uint missed_heartbeats;
+thread_local volatile bool disable_heartbeats;
 
 void start_heartbeats() noexcept;
 void pause_heartbeats() noexcept;
@@ -163,10 +165,9 @@ struct SpwnJob : WorkStealingJob {
     } else { // stolen
       // since we ALWAYS promote innermost-first,
       // all potential parallelism is fully promoted by now
-      bool heartbeats_disabled = disable_heartbeats;
-      disable_heartbeats = true;
+      pause_heartbeats();
       wait();
-      disable_heartbeats = heartbeats_disabled;
+      start_heartbeats();
     }
   }
 
@@ -335,7 +336,7 @@ struct SporkEntry {
   // NOTE: `this` *must* be the entry at `spork_stack_bot`
   ~SporkEntry();
 
-  void close();
+  // void close();
 
   void do_promotion();
   static void promote(); // TODO: noexcept?
@@ -358,16 +359,16 @@ SporkEntry::~SporkEntry() {
   spork_stack_bot = prev;
 }
 
-void SporkEntry::close() {
-  if (prev) {
-    prev->next = next;
-  }
-  if (this == spork_stack_bot) {
-    spork_stack_bot = prev;
-  } else {
-    next->prev = prev;
-  }
-}
+// void SporkEntry::close() {
+//   if (prev) {
+//     prev->next = next;
+//   }
+//   if (this == spork_stack_bot) {
+//     spork_stack_bot = prev;
+//   } else {
+//     next->prev = prev;
+//   }
+// }
 
 void SporkEntry::promote() {
   if (&spork_stack_top == spork_stack_bot) return;
@@ -426,6 +427,8 @@ void heartbeat_handler(int sig) {
 #else
     SporkEntry::promote();
 #endif
+  } else {
+    missed_heartbeats++;
   }
   errno = saved_errno;
 }
@@ -436,6 +439,10 @@ thread_local bool heartbeats_initialized = false;
 void start_heartbeats() noexcept {
   if (!heartbeats_initialized) { // only first time
     heartbeats_initialized = true;
+    heartbeat_tokens = 0;
+    num_heartbeats = 0;
+    missed_heartbeats = 0;
+    disable_heartbeats = false;
     
 #if !PROM_USE_LIBUNWIND
     //spork_stack_top;
@@ -496,16 +503,16 @@ _Ret execute_lambda(void* f, _Args... args) {
 template <typename PromLambda>
 static void manualProm(PromLambda&& prom, volatile bool& promotable_flag, volatile uint& num_promotions) {
   // save
-  bool heartbeats_disabled = disable_heartbeats;
+  bool before = disable_heartbeats;
   disable_heartbeats = true;
   // now check again to make sure a signal didn't eat all the tokens
-  if (heartbeat_tokens) {
+  while (heartbeat_tokens && promotable_flag) {
     num_promotions++;
     heartbeat_tokens--;
     promotable_flag = std::forward<PromLambda>(prom)();
   }
   // restore
-  disable_heartbeats = heartbeats_disabled;
+  disable_heartbeats = before;
 }
 
 // TODO: exception handling
@@ -817,6 +824,7 @@ int main(int argc, char* argv[]) {
 
   for (uint r = 0; r < WARMUP + NUM_TRIALS; r++) {
     spork::num_heartbeats = 0;
+    spork::missed_heartbeats = 0;
     
     auto start = std::chrono::steady_clock::now();
     num total =
@@ -829,7 +837,7 @@ int main(int argc, char* argv[]) {
       spork::fib(40);
     auto end = std::chrono::steady_clock::now();
     auto time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-    std::cout << total << " in " << time_ms << " ms (" << spork::num_heartbeats << " heartbeats)" << std::endl;
+    std::cout << total << " in " << time_ms << " ms (" << spork::num_heartbeats << " heartbeats, " << spork::missed_heartbeats << " missed)" << std::endl;
     if (r >= WARMUP) total_time += time_ms;
   }
   std::cout << "Average " << (total_time / NUM_TRIALS) << " ms" << std::endl;

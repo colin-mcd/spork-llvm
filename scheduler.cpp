@@ -26,6 +26,8 @@
 //#include <sys/ioctl.h>
 //#include <fcntl.h>
 
+#define PROM_USE_LIBUNWIND 0
+
 // TODO: consistent name casing (camel or snake)
 
 using namespace parlay;
@@ -192,7 +194,7 @@ typedef uint_fast8_t spork_slot_idx_t;
 
 typedef SpwnJob* volatile VolSpwnJob;
 
-typedef struct spork_entry_t {
+struct spork_entry_t {
   volatile bool* promotable_flag;
   volatile uint* num_promotions;
   void* prom;
@@ -206,14 +208,14 @@ typedef struct spork_entry_t {
       exec_prom
     };
   }
-} spork_entry_t;
+};
 
-typedef struct spork_row_t {
+struct spork_row_t {
   // number of sporks this code location is nested inside
   const spork_slot_idx_t num_sporks;
   // num_sporks-length array of (promoted, spwn) offsets
   const spork_entry_t* sporks;
-} spork_row_t;
+};
 
 volatile bool* ad_hoc_promotable_flag = nullptr;
 volatile uint* ad_hoc_num_promotions = nullptr;
@@ -244,6 +246,69 @@ spork_row_t* spork_table_lookup_ip(unw_word_t ip) {
   else return nullptr;
 }
 
+struct SporkEntry {
+  // WARNING: this may be a dangling pointer
+  SporkEntry* next;
+  SporkEntry* prev;
+  spork_entry_t* const entry;
+
+  SporkEntry(SporkEntry* next, SporkEntry* prev, spork_entry_t* entry) :
+    next(next), prev(prev), entry(entry) {}
+  
+  SporkEntry(spork_entry_t* entry);
+  
+  // NOTE: `this` *must* be the entry at `spork_stack_bot`
+  ~SporkEntry();
+
+  void close();
+
+  void do_promotion();
+  static void promote(); // TODO: noexcept?
+};
+
+volatile bool init_spork_entry_promotable_flag = false;
+volatile uint init_spork_entry_num_promotions = 0;
+thread_local spork_entry_t init_spork_e = {&init_spork_entry_promotable_flag, &init_spork_entry_num_promotions, nullptr, nullptr};
+thread_local SporkEntry init_spork_entry = {nullptr, nullptr, &init_spork_e};
+//thread_local SporkEntry* spork_stack_top = &init_spork_entry;
+thread_local SporkEntry* spork_stack_bot = &init_spork_entry;
+
+// TODO: remove nodes from spork table (linked list) when they are fully promoted
+// then, the slot at init->next must be promotable!
+SporkEntry::SporkEntry(spork_entry_t* entry)
+  : prev(spork_stack_bot), entry(entry) {
+  spork_stack_bot->next = this;
+  // now commit these changes to the spork stack, allowing promotions
+  spork_stack_bot = this;
+}
+
+// NOTE: `this` *must* be the entry at `spork_stack_bot`
+SporkEntry::~SporkEntry() {
+  spork_stack_bot = prev;
+}
+
+void SporkEntry::close() {
+  if (prev) {
+    prev->next = next;
+  }
+  if (this == spork_stack_bot) {
+    spork_stack_bot = prev;
+  } else {
+    next->prev = prev;
+  }
+}
+
+void SporkEntry::promote() {
+  SporkEntry* slot = &init_spork_entry;
+  while (slot != spork_stack_bot && heartbeat_tokens) {
+    if (*slot->entry->promotable_flag) {
+      slot->do_promotion();
+    } else {
+      slot = slot->next;
+    }
+  }
+}
+
 // TODO: make sure prom doesn't throw any exceptions
 void do_promotion(const spork_entry_t& slot) noexcept {
   heartbeat_tokens--;
@@ -253,7 +318,11 @@ void do_promotion(const spork_entry_t& slot) noexcept {
   *slot.promotable_flag = slot.exec_prom(slot.prom);
 }
 
-void promotes(unw_cursor_t& cursor, unw_context_t& uc) noexcept {
+void SporkEntry::do_promotion() {
+  spork::do_promotion(*this->entry);
+}
+
+void promote_h(unw_cursor_t& cursor, unw_context_t& uc) noexcept {
   if (heartbeat_tokens == 0) return;
   unw_word_t frame_ip, frame_sp, frame_bp;
   const spork_row_t* row;
@@ -286,7 +355,7 @@ void promotes(unw_cursor_t& cursor, unw_context_t& uc) noexcept {
       // try promoting above us first,
       // unless we already passed a promoted slot in this for loop
       if (!frame_has_promoted_slots) {
-        promotes(cursor, uc);
+        promote_h(cursor, uc);
       }
   
       if (heartbeat_tokens > 0) {
@@ -299,13 +368,13 @@ void promotes(unw_cursor_t& cursor, unw_context_t& uc) noexcept {
 }
 
 __attribute__((noinline))
-void promotes_until_failure() noexcept {
+void promote() noexcept {
   set_colin_default();
   unw_cursor_t cursor;
   unw_context_t uc;
   unw_getcontext(&uc);
   unw_init_local(&cursor, &uc);
-  promotes(cursor, uc);
+  promote_h(cursor, uc);
 }
 
 
@@ -326,15 +395,18 @@ void promotes_until_failure() noexcept {
 //   ucontext_t* ctx = (ucontext_t*) ucontext;
 void heartbeat_handler(int sig) {
   int saved_errno = errno;
-  if (disable_heartbeats) { return; }
-  num_heartbeats++;
-
-  heartbeat_tokens += TOKENS_PER_HEARTBEAT;
-  if (heartbeat_tokens > MAX_HEARTBEAT_TOKENS) {
-    heartbeat_tokens = MAX_HEARTBEAT_TOKENS;
+  if (!disable_heartbeats) {
+    num_heartbeats++;
+    heartbeat_tokens += TOKENS_PER_HEARTBEAT;
+    if (heartbeat_tokens > MAX_HEARTBEAT_TOKENS) {
+      heartbeat_tokens = MAX_HEARTBEAT_TOKENS;
+    }
+#if PROM_USE_LIBUNWIND
+    promote();
+#else
+    SporkEntry::promote();
+#endif
   }
-
-  promotes_until_failure();
   errno = saved_errno;
 }
 
@@ -416,6 +488,7 @@ static void spork2(volatile bool& promotable_flag, volatile uint& num_promotions
   static_assert(std::is_invocable_v<BodyLambda&&>);
   static_assert(std::is_invocable_r_v<bool, PromLambda&&>);
 
+#if PROM_USE_LIBUNWIND
   if (ad_hoc_promotable_flag == nullptr) {
     ad_hoc_promotable_flag = (volatile bool*) FRAME_OFFSET(&promotable_flag);
     ad_hoc_num_promotions = (volatile uint*) FRAME_OFFSET(&num_promotions);
@@ -424,10 +497,10 @@ static void spork2(volatile bool& promotable_flag, volatile uint& num_promotions
     ad_hoc_spork_ip_min = &&begin_body;
     ad_hoc_spork_ip_max = &&end_body;
   }
-
   // begin body
   begin_body:
   {
+    // SporkEntry sporke = SporkEntry(&en);
     if (heartbeat_tokens) [[unlikely]] {
       manualProm(prom, promotable_flag, num_promotions);
     }
@@ -436,6 +509,17 @@ static void spork2(volatile bool& promotable_flag, volatile uint& num_promotions
   end_body:
   __RTS_record_spork(ad_hoc_promotable_flag, ad_hoc_num_promotions, (void*) &prom, ad_hoc_exec_prom);
   // end body
+#else
+  spork_entry_t en =
+    {&promotable_flag, &num_promotions, &prom, execute_lambda<bool, PromLambda>};
+  {
+    SporkEntry sporke = SporkEntry(&en);
+    if (heartbeat_tokens) [[unlikely]] {
+      manualProm(prom, promotable_flag, num_promotions);
+    }
+    std::forward<BodyLambda>(body)();
+  }
+#endif
   return;
 }
 
@@ -718,7 +802,7 @@ int main(int argc, char* argv[]) {
         0,
         [] (num& a, num b) { a += b; },
         [&] (uint i, num& a) { a += data[i % n]; },
-        0, n*30);
+        0, n*50);
     auto end = std::chrono::steady_clock::now();
     auto time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
     std::cout << total << " in " << time_ms << " ms (" << spork::num_heartbeats << " heartbeats)" << std::endl;

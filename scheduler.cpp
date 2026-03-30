@@ -26,7 +26,7 @@
 //#include <sys/ioctl.h>
 //#include <fcntl.h>
 
-#define PROM_USE_LIBUNWIND 0
+#define PROM_USE_LIBUNWIND 1
 
 // TODO: consistent name casing (camel or snake)
 
@@ -217,6 +217,16 @@ struct spork_row_t {
   const spork_entry_t* sporks;
 };
 
+// TODO: make sure prom doesn't throw any exceptions
+void do_promotion(const spork_entry_t& slot) noexcept {
+  heartbeat_tokens--;
+  (*slot.num_promotions)++;
+  // run slot's prom function,
+  // then update if this spork is promotable any further
+  *slot.promotable_flag = slot.exec_prom(slot.prom);
+}
+
+#if PROM_USE_LIBUNWIND
 volatile bool* ad_hoc_promotable_flag = nullptr;
 volatile uint* ad_hoc_num_promotions = nullptr;
 void* ad_hoc_prom;
@@ -245,7 +255,61 @@ spork_row_t* spork_table_lookup_ip(unw_word_t ip) {
   if (ad_hoc_spork_ip_min <= _ip && _ip <= ad_hoc_spork_ip_max) return &colin_default_row;
   else return nullptr;
 }
+void promote_h(unw_cursor_t& cursor, unw_context_t& uc) noexcept {
+  if (heartbeat_tokens == 0) return;
+  unw_word_t frame_ip, frame_sp, frame_bp;
+  const spork_row_t* row;
 
+  // find first stack frame with sporks
+  while (unw_step(&cursor) > 0) {
+    // get stored register values for this stack frame
+    unw_get_reg(&cursor, UNW_REG_SP, &frame_sp);
+    unw_get_reg(&cursor, UNW_REG_IP, &frame_ip);
+    unw_get_reg(&cursor, UNW_X86_64_RBP, &frame_bp);
+
+    row = spork_table_lookup_ip(frame_ip);
+    if ((row != nullptr) && (row->num_sporks > 0)) break;
+  }
+
+  if (row == nullptr) return;
+
+  bool frame_has_promoted_slots = false;
+
+  // inspect each spork slot
+  for (spork_slot_idx_t slot_idx = 0;
+       slot_idx < row->num_sporks && heartbeat_tokens > 0;
+       slot_idx++) {
+    spork_entry_t slot = row->sporks[slot_idx].offset(frame_bp);
+  
+    frame_has_promoted_slots |= *slot.num_promotions > 0;
+    if (*slot.promotable_flag) {
+      // this slot is not yet promoted
+  
+      // try promoting above us first,
+      // unless we already passed a promoted slot in this for loop
+      if (!frame_has_promoted_slots) {
+        promote_h(cursor, uc);
+      }
+  
+      if (heartbeat_tokens > 0) {
+        do { do_promotion(slot); }
+        while (heartbeat_tokens > 0 && *slot.promotable_flag);
+        frame_has_promoted_slots = true;
+      }
+    }
+  }
+}
+
+__attribute__((noinline))
+void promote() noexcept {
+  set_colin_default();
+  unw_cursor_t cursor;
+  unw_context_t uc;
+  unw_getcontext(&uc);
+  unw_init_local(&cursor, &uc);
+  promote_h(cursor, uc);
+}
+#else
 struct SporkEntry {
   // WARNING: this may be a dangling pointer
   SporkEntry* next;
@@ -309,73 +373,10 @@ void SporkEntry::promote() {
   }
 }
 
-// TODO: make sure prom doesn't throw any exceptions
-void do_promotion(const spork_entry_t& slot) noexcept {
-  heartbeat_tokens--;
-  (*slot.num_promotions)++;
-  // run slot's prom function,
-  // then update if this spork is promotable any further
-  *slot.promotable_flag = slot.exec_prom(slot.prom);
-}
-
 void SporkEntry::do_promotion() {
   spork::do_promotion(*this->entry);
 }
-
-void promote_h(unw_cursor_t& cursor, unw_context_t& uc) noexcept {
-  if (heartbeat_tokens == 0) return;
-  unw_word_t frame_ip, frame_sp, frame_bp;
-  const spork_row_t* row;
-
-  // find first stack frame with sporks
-  while (unw_step(&cursor) > 0) {
-    // get stored register values for this stack frame
-    unw_get_reg(&cursor, UNW_REG_SP, &frame_sp);
-    unw_get_reg(&cursor, UNW_REG_IP, &frame_ip);
-    unw_get_reg(&cursor, UNW_X86_64_RBP, &frame_bp);
-
-    row = spork_table_lookup_ip(frame_ip);
-    if ((row != nullptr) && (row->num_sporks > 0)) break;
-  }
-
-  if (row == nullptr) return;
-
-  bool frame_has_promoted_slots = false;
-
-  // inspect each spork slot
-  for (spork_slot_idx_t slot_idx = 0;
-       slot_idx < row->num_sporks && heartbeat_tokens > 0;
-       slot_idx++) {
-    spork_entry_t slot = row->sporks[slot_idx].offset(frame_bp);
-  
-    frame_has_promoted_slots |= *slot.num_promotions > 0;
-    if (*slot.promotable_flag) {
-      // this slot is not yet promoted
-  
-      // try promoting above us first,
-      // unless we already passed a promoted slot in this for loop
-      if (!frame_has_promoted_slots) {
-        promote_h(cursor, uc);
-      }
-  
-      if (heartbeat_tokens > 0) {
-        do { do_promotion(slot); }
-        while (heartbeat_tokens > 0 && *slot.promotable_flag);
-        frame_has_promoted_slots = true;
-      }
-    }
-  }
-}
-
-__attribute__((noinline))
-void promote() noexcept {
-  set_colin_default();
-  unw_cursor_t cursor;
-  unw_context_t uc;
-  unw_getcontext(&uc);
-  unw_init_local(&cursor, &uc);
-  promote_h(cursor, uc);
-}
+#endif
 
 
 // Repeatedly tries to consume 1 heartbeat token until failure,

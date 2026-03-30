@@ -26,7 +26,8 @@
 //#include <sys/ioctl.h>
 //#include <fcntl.h>
 
-#define PROM_USE_LIBUNWIND 1
+// TODO: consider a (libunwind) setjmp/longjmp based implementation
+#define PROM_USE_LIBUNWIND 0
 
 // TODO: consistent name casing (camel or snake)
 
@@ -148,7 +149,6 @@ struct SpwnJob : WorkStealingJob {
     start_heartbeats();
     result = exec_spwn(spwn, data);
     pause_heartbeats();
-    return;
   }
 
   void execute_fast_clone() {
@@ -312,14 +312,19 @@ void promote() noexcept {
 #else
 struct SporkEntry {
   // WARNING: this may be a dangling pointer
-  SporkEntry* next;
-  SporkEntry* prev;
+  SporkEntry* volatile next;
+  SporkEntry* volatile prev;
   spork_entry_t* const entry;
 
   SporkEntry(SporkEntry* next, SporkEntry* prev, spork_entry_t* entry) :
     next(next), prev(prev), entry(entry) {}
   
   SporkEntry(spork_entry_t* entry);
+
+  SporkEntry(const SporkEntry& other) :
+    next(other.next), prev(other.prev), entry(other.entry) {}
+
+  SporkEntry() : next(nullptr), prev(nullptr), entry(nullptr) {}
   
   // NOTE: `this` *must* be the entry at `spork_stack_bot`
   ~SporkEntry();
@@ -330,18 +335,14 @@ struct SporkEntry {
   static void promote(); // TODO: noexcept?
 };
 
-volatile bool init_spork_entry_promotable_flag = false;
-volatile uint init_spork_entry_num_promotions = 0;
-thread_local spork_entry_t init_spork_e = {&init_spork_entry_promotable_flag, &init_spork_entry_num_promotions, nullptr, nullptr};
-thread_local SporkEntry init_spork_entry = {nullptr, nullptr, &init_spork_e};
-//thread_local SporkEntry* spork_stack_top = &init_spork_entry;
-thread_local SporkEntry* spork_stack_bot = &init_spork_entry;
+thread_local SporkEntry spork_stack_top;
+thread_local SporkEntry* volatile spork_stack_bot; // initialized to spork_stack_top
 
 // TODO: remove nodes from spork table (linked list) when they are fully promoted
 // then, the slot at init->next must be promotable!
 SporkEntry::SporkEntry(spork_entry_t* entry)
   : prev(spork_stack_bot), entry(entry) {
-  spork_stack_bot->next = this;
+  prev->next = this;
   // now commit these changes to the spork stack, allowing promotions
   spork_stack_bot = this;
 }
@@ -363,10 +364,16 @@ void SporkEntry::close() {
 }
 
 void SporkEntry::promote() {
-  SporkEntry* slot = &init_spork_entry;
-  while (slot != spork_stack_bot && heartbeat_tokens) {
+  if (&spork_stack_top == spork_stack_bot) return;
+  SporkEntry* slot = spork_stack_top.next;
+  while (heartbeat_tokens) {
     if (*slot->entry->promotable_flag) {
+      // if this is not the bottom slot,
+      // we can skip it next time we search
+      if (slot != spork_stack_bot) slot->prev->next = slot->next;
       slot->do_promotion();
+    } else if (slot == spork_stack_bot) {
+      break;
     } else {
       slot = slot->next;
     }
@@ -374,6 +381,7 @@ void SporkEntry::promote() {
 }
 
 void SporkEntry::do_promotion() {
+  
   spork::do_promotion(*this->entry);
 }
 #endif
@@ -417,6 +425,11 @@ thread_local bool heartbeats_initialized = false;
 void start_heartbeats() noexcept {
   if (!heartbeats_initialized) { // only first time
     heartbeats_initialized = true;
+    
+#if !PROM_USE_LIBUNWIND
+    //spork_stack_top;
+    spork_stack_bot = &spork_stack_top;
+#endif
 
     struct sigaction sa = {};
     //sa.sa_sigaction = heartbeat_handler;
@@ -471,6 +484,8 @@ _Ret execute_lambda(void* f, _Args... args) {
 
 template <typename PromLambda>
 static void manualProm(PromLambda&& prom, volatile bool& promotable_flag, volatile uint& num_promotions) {
+  // save
+  bool heartbeats_disabled = disable_heartbeats;
   disable_heartbeats = true;
   // now check again to make sure a signal didn't eat all the tokens
   if (heartbeat_tokens) {
@@ -478,16 +493,18 @@ static void manualProm(PromLambda&& prom, volatile bool& promotable_flag, volati
     heartbeat_tokens--;
     promotable_flag = std::forward<PromLambda>(prom)();
   }
-  disable_heartbeats = false;
+  // restore
+  disable_heartbeats = heartbeats_disabled;
 }
 
 // TODO: exception handling
-template <typename BodyLambda, typename PromLambda>
+template <typename BodyLambda, typename PromLambda, typename AfterLambda>
 __attribute__((always_inline))
 static void spork2(volatile bool& promotable_flag, volatile uint& num_promotions,
-                   BodyLambda&& body, PromLambda&& prom) {
+                   BodyLambda&& body, PromLambda&& prom, AfterLambda&& after) {
   static_assert(std::is_invocable_v<BodyLambda&&>);
   static_assert(std::is_invocable_r_v<bool, PromLambda&&>);
+  static_assert(std::is_invocable_v<AfterLambda&&>);
 
 #if PROM_USE_LIBUNWIND
   if (ad_hoc_promotable_flag == nullptr) {
@@ -498,10 +515,8 @@ static void spork2(volatile bool& promotable_flag, volatile uint& num_promotions
     ad_hoc_spork_ip_min = &&begin_body;
     ad_hoc_spork_ip_max = &&end_body;
   }
-  // begin body
   begin_body:
   {
-    // SporkEntry sporke = SporkEntry(&en);
     if (heartbeat_tokens) [[unlikely]] {
       manualProm(prom, promotable_flag, num_promotions);
     }
@@ -509,7 +524,7 @@ static void spork2(volatile bool& promotable_flag, volatile uint& num_promotions
   }
   end_body:
   __RTS_record_spork(ad_hoc_promotable_flag, ad_hoc_num_promotions, (void*) &prom, ad_hoc_exec_prom);
-  // end body
+  std::forward<AfterLambda>(after)();
 #else
   spork_entry_t en =
     {&promotable_flag, &num_promotions, &prom, execute_lambda<bool, PromLambda>};
@@ -520,16 +535,18 @@ static void spork2(volatile bool& promotable_flag, volatile uint& num_promotions
     }
     std::forward<BodyLambda>(body)();
   }
+  std::forward<AfterLambda>(after)();
+  (void) en;
 #endif
   return;
 }
 
-template <typename BodyLambda, typename PromLambda>
+template <typename BodyLambda, typename PromLambda, typename AfterLambda>
 __attribute__((always_inline))
-static void spork(BodyLambda&& body, PromLambda&& prom) {
+static void spork(BodyLambda&& body, PromLambda&& prom, AfterLambda&& after) {
   volatile bool promotable_flag = true;
   volatile uint num_promotions = 0;
-  spork2(promotable_flag, num_promotions, std::forward<BodyLambda>(body), std::forward<PromLambda>(prom));
+  spork2(promotable_flag, num_promotions, std::forward<BodyLambda>(body), std::forward<PromLambda>(prom), std::forward<AfterLambda>(after));
 }
 
 template <typename LambdaL, typename LambdaR>
@@ -552,13 +569,14 @@ static void par(LambdaL&& lamL, LambdaR&& lamR) {
         SpwnJob(execute_lambda<void*, decltype(lamRw), void*>,
                 &lamRw, nullptr, heartbeat_tokens >> 1);
       return false; // can do no more promotions here
+    },
+    [&] () {
+      if (promotable) [[likely]] { // unpromoted
+        lamRw(nullptr);
+      } else [[unlikely]] { // promoted
+        jp.pretend_nonvolatile()->sync();
+      }
     });
-
-  if (promotable) [[likely]] { // unpromoted
-    lamRw(nullptr);
-  } else [[unlikely]] { // promoted
-    jp.pretend_nonvolatile()->sync();
-  }
 }
 
 __attribute__((always_inline))
@@ -632,9 +650,11 @@ A reduceSeq(A z, A a, CombLambda&& combine, BodyLambda&& body, uint range_start,
   
 // };
 
+// TODO: ideally, we just reserve enough space for spwn without initializing it,
+// then have the prom lambda write to spwn
 template <typename A, typename BodyLambda, typename CombLambda>
 __attribute__((always_inline)) // TODO: investigate what this attribute actually does
-A reduceNoAlloc(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, uint range_end) {
+A reduce(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, uint range_end) {
   static_assert(std::is_invocable_r_v<void, BodyLambda&, uint, A&>);
   static_assert(std::is_invocable_r_v<void, CombLambda&, A&, A>);
 
@@ -651,9 +671,9 @@ A reduceNoAlloc(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, uint 
     [&] (void* isLeft) {
       uint mid = midpoint(next_i, next_j);
       if (isLeft) {
-        aL = reduceNoAlloc(z, z, combine, body, next_i, mid);
+        aL = reduce(z, z, combine, body, next_i, mid);
       } else {
-        aR = reduceNoAlloc(z, z, combine, body, mid, next_j);
+        aR = reduce(z, z, combine, body, mid, next_j);
       }
       return nullptr;
     };
@@ -667,24 +687,26 @@ A reduceNoAlloc(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, uint 
       }
     },
     [&] () {
-      if (i >= j) { return false; }
+      if (i >= j) { num_promotions--; return false; }
       next_i = i;
       next_i++;
       next_j = j;
       j = next_i;
       *jpR.pretend_nonvolatile() =
-        SpwnJob(execute_lambda<void*, decltype(spwn), void*>,
+        SpwnJob(&execute_lambda<void*, decltype(spwn), void*>,
                 &spwn, (void*) false, (heartbeat_tokens + 1) >> 1);
       // TODO: check if work stealing deque is full before enqueueing
       jpR.enqueue();
       if (next_i >= midpoint(next_i, next_j)) { return false; }
       *jpL.pretend_nonvolatile() =
-        SpwnJob(execute_lambda<void*, decltype(spwn), void*>,
+        SpwnJob(&execute_lambda<void*, decltype(spwn), void*>,
                 &spwn, (void*) true, heartbeat_tokens);
       jpL.enqueue();
       return false;
+    },
+    [&] () {
+      
     });
-  
   if (num_promotions) [[unlikely]] {
     if (next_i < midpoint(next_i, next_j)) [[likely]] {
       jpL.pretend_nonvolatile()->wait_or_execute();
@@ -699,7 +721,7 @@ A reduceNoAlloc(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, uint 
 
 template <typename A, typename BodyLambda, typename CombLambda>
 __attribute__((always_inline))
-A reduce(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, uint range_end) {
+A reduceAlloc(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, uint range_end) {
   static_assert(std::is_invocable_r_v<void, BodyLambda&, uint, A&>);
   static_assert(std::is_invocable_r_v<void, CombLambda&, A&, A>);
   VolSpwnJob jp = nullptr;
@@ -712,7 +734,7 @@ A reduce(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, uint range_e
       uint i2 = rdata->i;
       uint j2 = rdata->j;
       ReduceData::destroy(rdata);
-      return (void*) AAllocator::create(reduce(z, z, combine, body, midpoint(i2+1, j2), j2));
+      return (void*) AAllocator::create(reduceAlloc(z, z, combine, body, midpoint(i2+1, j2), j2));
     });
 
   spork(
@@ -730,14 +752,15 @@ A reduce(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, uint range_e
       jp = SpwnJob::create(execute_lambda<void*, decltype(spwn), void*>,
                            &spwn, (void*) data, heartbeat_tokens >> 1, jp);
       return j > i+1; // determine if more promotions are possible here
+    },
+    [&] () {
+      if (jp != nullptr) [[unlikely]] {
+        jp->sync([&] (void* b) {
+          std::forward<CombLambda>(combine)(a, *((A*) b));
+          AAllocator::destroy((A*) b);
+        });
+      }
     });
-
-  if (jp != nullptr) [[unlikely]] {
-    jp->sync([&] (void* b) {
-      std::forward<CombLambda>(combine)(a, *((A*) b));
-      AAllocator::destroy((A*) b);
-    });
-  }
   return a;
 }
 
@@ -798,7 +821,7 @@ int main(int argc, char* argv[]) {
     
     auto start = std::chrono::steady_clock::now();
     num total =
-      spork::reduceNoAlloc<num>(
+      spork::reduce<num>(
         0,
         0,
         [] (num& a, num b) { a += b; },

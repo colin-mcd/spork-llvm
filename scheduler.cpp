@@ -368,10 +368,10 @@ void SporkEntry::promote() {
   SporkEntry* slot = spork_stack_top.next;
   while (heartbeat_tokens) {
     if (*slot->entry->promotable_flag) {
-      // if this is not the bottom slot,
-      // we can skip it next time we search
-      if (slot != spork_stack_bot) slot->prev->next = slot->next;
       slot->do_promotion();
+      // if this is not the bottom slot and can no longer be promoted,
+      // we can skip it next time we search
+      if (slot != spork_stack_bot && !*slot->entry->promotable_flag) slot->prev->next = slot->next;
     } else if (slot == spork_stack_bot) {
       break;
     } else {
@@ -498,13 +498,12 @@ static void manualProm(PromLambda&& prom, volatile bool& promotable_flag, volati
 }
 
 // TODO: exception handling
-template <typename BodyLambda, typename PromLambda, typename AfterLambda>
+template <typename BodyLambda, typename PromLambda>
 __attribute__((always_inline))
 static void spork2(volatile bool& promotable_flag, volatile uint& num_promotions,
-                   BodyLambda&& body, PromLambda&& prom, AfterLambda&& after) {
+                   BodyLambda&& body, PromLambda&& prom) {
   static_assert(std::is_invocable_v<BodyLambda&&>);
   static_assert(std::is_invocable_r_v<bool, PromLambda&&>);
-  static_assert(std::is_invocable_v<AfterLambda&&>);
 
 #if PROM_USE_LIBUNWIND
   if (ad_hoc_promotable_flag == nullptr) {
@@ -524,7 +523,6 @@ static void spork2(volatile bool& promotable_flag, volatile uint& num_promotions
   }
   end_body:
   __RTS_record_spork(ad_hoc_promotable_flag, ad_hoc_num_promotions, (void*) &prom, ad_hoc_exec_prom);
-  std::forward<AfterLambda>(after)();
 #else
   spork_entry_t en =
     {&promotable_flag, &num_promotions, &prom, execute_lambda<bool, PromLambda>};
@@ -535,18 +533,17 @@ static void spork2(volatile bool& promotable_flag, volatile uint& num_promotions
     }
     std::forward<BodyLambda>(body)();
   }
-  std::forward<AfterLambda>(after)();
-  (void) en;
+  (void) en; // TODO: can we remove this line?
 #endif
   return;
 }
 
-template <typename BodyLambda, typename PromLambda, typename AfterLambda>
+template <typename BodyLambda, typename PromLambda>
 __attribute__((always_inline))
-static void spork(BodyLambda&& body, PromLambda&& prom, AfterLambda&& after) {
+static void spork(BodyLambda&& body, PromLambda&& prom) {
   volatile bool promotable_flag = true;
   volatile uint num_promotions = 0;
-  spork2(promotable_flag, num_promotions, std::forward<BodyLambda>(body), std::forward<PromLambda>(prom), std::forward<AfterLambda>(after));
+  spork2(promotable_flag, num_promotions, std::forward<BodyLambda>(body), std::forward<PromLambda>(prom));
 }
 
 template <typename LambdaL, typename LambdaR>
@@ -569,14 +566,13 @@ static void par(LambdaL&& lamL, LambdaR&& lamR) {
         SpwnJob(execute_lambda<void*, decltype(lamRw), void*>,
                 &lamRw, nullptr, heartbeat_tokens >> 1);
       return false; // can do no more promotions here
-    },
-    [&] () {
-      if (promotable) [[likely]] { // unpromoted
-        lamRw(nullptr);
-      } else [[unlikely]] { // promoted
-        jp.pretend_nonvolatile()->sync();
-      }
     });
+
+  if (promotable) [[likely]] { // unpromoted
+    lamRw(nullptr);
+  } else [[unlikely]] { // promoted
+    jp.pretend_nonvolatile()->sync();
+  }
 }
 
 __attribute__((always_inline))
@@ -703,9 +699,6 @@ A reduce(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, uint range_e
                 &spwn, (void*) true, heartbeat_tokens);
       jpL.enqueue();
       return false;
-    },
-    [&] () {
-      
     });
   if (num_promotions) [[unlikely]] {
     if (next_i < midpoint(next_i, next_j)) [[likely]] {
@@ -752,15 +745,14 @@ A reduceAlloc(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, uint ra
       jp = SpwnJob::create(execute_lambda<void*, decltype(spwn), void*>,
                            &spwn, (void*) data, heartbeat_tokens >> 1, jp);
       return j > i+1; // determine if more promotions are possible here
-    },
-    [&] () {
-      if (jp != nullptr) [[unlikely]] {
-        jp->sync([&] (void* b) {
-          std::forward<CombLambda>(combine)(a, *((A*) b));
-          AAllocator::destroy((A*) b);
-        });
-      }
     });
+
+  if (jp != nullptr) [[unlikely]] {
+    jp->sync([&] (void* b) {
+      std::forward<CombLambda>(combine)(a, *((A*) b));
+      AAllocator::destroy((A*) b);
+    });
+  }
   return a;
 }
 

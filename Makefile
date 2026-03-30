@@ -39,4 +39,4 @@ scheduler.opt.ll: scheduler.ll
 
 .PHONY: clean
 clean:
-	rm scheduler scheduler.ll scheduler.opt.ll scheduler.i schedulerO1.s schedulerO2.s schedulerO3.s
+	rm scheduler schedulerO1 schedulerO2 schedulerO3 scheduler.ll scheduler.opt.ll scheduler.i schedulerO1.s schedulerO2.s schedulerO3.s

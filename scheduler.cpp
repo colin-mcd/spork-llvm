@@ -6,6 +6,7 @@
 
 #include <libunwind.h>
 #include <type_traits>
+#include <utility>
 
 //#include <atomic>
 //#include <atomic>
@@ -30,39 +31,48 @@
 // TODO: consider a (libunwind) setjmp/longjmp based implementation
 // TODO: libunwind implementation broken for any (heterogenous) nested parallelism
 #define PROM_USE_LIBUNWIND 0
+#define RECORD_HEARTBEAT_STATS 0
 
 // TODO: consistent name casing (camel or snake)
+// TODO: consider adaptive heartbeat timer intervals
+// TODO: look into if loop unrolling is why reduce is slower than reduceSeq
 
-using namespace parlay;
+//using namespace parlay;
 
 namespace spork {
 
 typedef uint spork_id_t;
 //#define FRESH_SPORK_ID __COUNTER__
 
-constexpr uint TOKENS_PER_HEARTBEAT = 240;
+constexpr uint TOKENS_PER_HEARTBEAT = 30;
 constexpr uint HEARTBEAT_INTERVAL_US = 500;
 // I set this arbitrarily: consider tweaking
 constexpr uint MAX_HEARTBEAT_TOKENS = TOKENS_PER_HEARTBEAT*1;
-thread_local volatile uint heartbeat_tokens;
-thread_local volatile uint num_heartbeats;
-thread_local volatile uint missed_heartbeats;
-thread_local volatile bool disable_heartbeats;
+constinit thread_local volatile uint heartbeat_tokens = 0;
+constinit thread_local volatile bool disable_heartbeats = false;
 
 void start_heartbeats() noexcept;
 void pause_heartbeats() noexcept;
 
-struct SpwnJob : WorkStealingJob {
+struct SpwnJob : parlay::WorkStealingJob {
 
   using scheduler_t = parlay::scheduler<SpwnJob>;
 
-  static scheduler_t& get_current_scheduler(){
+  static scheduler_t& get_current_scheduler() {
     scheduler_t* current_scheduler = scheduler_t::get_current_scheduler();
     if (current_scheduler == nullptr) {
-      static thread_local scheduler_t local_scheduler(internal::init_num_workers());
+      static thread_local scheduler_t local_scheduler(parlay::internal::init_num_workers());
       return local_scheduler;
     }
     return *current_scheduler;
+  }
+
+  static uint worker_id() {
+    return get_current_scheduler().worker_id();
+  }
+
+  static uint num_workers() {
+    return get_current_scheduler().num_workers();
   }
 
   private:
@@ -70,7 +80,7 @@ struct SpwnJob : WorkStealingJob {
   void* spwn;
   void* data;
   uint num_heartbeat_tokens;
-  scheduler_t* sched;
+  //scheduler_t* sched;
   
   public:
   void* result;
@@ -78,30 +88,45 @@ struct SpwnJob : WorkStealingJob {
 
   explicit SpwnJob() {}
 
-  explicit SpwnJob(void* (*exec_spwn)(void* spwn, void* data),
-                   void* spwn,
-                   void* data,
-                   uint hbt = 0,
-                   SpwnJob* next = nullptr,
-                   scheduler_t* sched = nullptr) :
-    WorkStealingJob(),
-    exec_spwn(exec_spwn),
-    spwn(spwn),
-    data(data),
-    num_heartbeat_tokens(hbt),
-    sched(sched ? sched : &get_current_scheduler()),
-    result(nullptr),
-    next(next) { heartbeat_tokens -= hbt; }
+  explicit SpwnJob(void* (*_exec_spwn)(void* spwn, void* data),
+                   void* _spwn,
+                   void* _data,
+                   uint _hbt = 0,
+                   SpwnJob* _next = nullptr, 
+                   // scheduler_t* _sched = nullptr,
+                   void* _result = nullptr) :
+      WorkStealingJob(),
+      exec_spwn(_exec_spwn),
+      spwn(_spwn),
+      data(_data),
+      num_heartbeat_tokens(_hbt),
+      // sched(_sched),
+      result(_result),
+      next(_next) {
+    // if (sched == nullptr) {
+    //   sched = &get_current_scheduler();
+    // }
+    heartbeat_tokens = heartbeat_tokens - _hbt;
+  }
 
-  SpwnJob& operator=(const SpwnJob& other) {
-    if (this == &other) return *this;
-    exec_spwn = other.exec_spwn;
-    spwn = other.spwn;
-    data = other.data;
-    num_heartbeat_tokens = other.num_heartbeat_tokens;
-    sched = other.sched;
-    result = other.result;
-    next = other.next;
+  SpwnJob& operator=(const SpwnJob& other) = delete;
+  SpwnJob& operator=(SpwnJob&& other) noexcept {
+    if (this != &other) {
+      exec_spwn = std::exchange(other.exec_spwn, nullptr);
+      spwn = std::exchange(other.spwn, nullptr);
+      data = std::exchange(other.data, nullptr);
+      num_heartbeat_tokens = std::exchange(other.num_heartbeat_tokens, 0);
+      // sched = std::exchange(other.sched, nullptr);
+      result = std::exchange(other.result, nullptr);
+      next = std::exchange(other.next, nullptr);
+      // exec_spwn = other.exec_spwn;
+      // spwn = other.spwn;
+      // data = other.data;
+      // num_heartbeat_tokens = other.num_heartbeat_tokens;
+      // sched = other.sched;
+      // result = other.result;
+      // next = other.next;
+    }
     return *this;
   }
 
@@ -125,25 +150,23 @@ struct SpwnJob : WorkStealingJob {
   }
 
   SpwnJob(SpwnJob&& other) :
-    SpwnJob(other.exec_spwn,
-            other.spwn,
-            other.data,
-            other.num_heartbeat_tokens,
-            other.next,
-            other.sched) { result = other.result; }
+    SpwnJob(std::exchange(other.exec_spwn, nullptr),
+            std::exchange(other.spwn, nullptr),
+            std::exchange(other.data, nullptr),
+            std::exchange(other.num_heartbeat_tokens, 0),
+            std::exchange(other.next, nullptr),
+            // std::exchange(other.sched, nullptr),
+            std::exchange(other.result, nullptr)) {}
 
   void enqueue() {
     // TODO: make sure queue doesn't overflow (max 1000, aborts if hit)
-    sched->spawn(this);
-  }
-
-  void enqueue() volatile {
-    // TODO: make sure queue doesn't overflow (max 1000, aborts if hit)
-    sched->spawn((SpwnJob*) this);
+    //sched->spawn(this);
+    get_current_scheduler().spawn(this);
   }
 
   bool try_dequeue() {
-    return sched->get_own_job() != nullptr;
+    //return sched->get_own_job() != nullptr;
+    return get_current_scheduler().get_own_job() != nullptr;
   }
 
   // __attribute__((noinline))
@@ -155,7 +178,7 @@ struct SpwnJob : WorkStealingJob {
   }
 
   void execute_fast_clone() {
-    heartbeat_tokens += num_heartbeat_tokens;
+    heartbeat_tokens = heartbeat_tokens + num_heartbeat_tokens;
     result = exec_spwn(spwn, data);
   }
 
@@ -165,6 +188,7 @@ struct SpwnJob : WorkStealingJob {
     } else { // stolen
       // since we ALWAYS promote innermost-first,
       // all potential parallelism is fully promoted by now
+      // thus, no reason to get heartbeats while waiting
       pause_heartbeats();
       wait();
       start_heartbeats();
@@ -226,8 +250,8 @@ struct spork_row_t {
 
 // TODO: make sure prom doesn't throw any exceptions
 void do_promotion(const spork_entry_t& slot) noexcept {
-  heartbeat_tokens--;
-  (*slot.num_promotions)++;
+  heartbeat_tokens = heartbeat_tokens - 1;
+  *slot.num_promotions = *slot.num_promotions + 1;
   // run slot's prom function,
   // then update if this spork is promotable any further
   *slot.promotable_flag = slot.exec_prom(slot.prom);
@@ -318,20 +342,29 @@ void promote() noexcept {
 }
 #else
 struct SporkEntry {
-  // WARNING: this may be a dangling pointer
+  // WARNING: `next` may be a dangling pointer
   SporkEntry* volatile next;
   SporkEntry* volatile prev;
   spork_entry_t* const entry;
 
-  SporkEntry(SporkEntry* next, SporkEntry* prev, spork_entry_t* entry) :
+  explicit SporkEntry(SporkEntry* next, SporkEntry* prev, spork_entry_t* entry) :
     next(next), prev(prev), entry(entry) {}
   
-  SporkEntry(spork_entry_t* entry);
+  explicit SporkEntry(spork_entry_t* entry);
 
-  SporkEntry(const SporkEntry& other) :
+  explicit SporkEntry(const SporkEntry& other) :
     next(other.next), prev(other.prev), entry(other.entry) {}
 
-  SporkEntry() : next(nullptr), prev(nullptr), entry(nullptr) {}
+  explicit SporkEntry() : next(nullptr), prev(nullptr), entry(nullptr) {}
+
+  // SporkEntry& operator=(SporkEntry&& other) {
+  //   if (this != &other) {
+  //     next = std::exchange(other.next, nullptr);
+  //     prev = std::exchange(other.prev, nullptr);
+  //     entry = std::exchange(other.entry, nullptr);
+  //   }
+  //   return *this;
+  // }
   
   // NOTE: `this` *must* be the entry at `spork_stack_bot`
   ~SporkEntry();
@@ -345,8 +378,11 @@ struct SporkEntry {
 thread_local SporkEntry spork_stack_top;
 thread_local SporkEntry* volatile spork_stack_bot; // initialized to spork_stack_top
 
-// TODO: remove nodes from spork table (linked list) when they are fully promoted
-// then, the slot at init->next must be promotable!
+// The constructor and destructor for `SporkEntry` may
+// change `spork_stack_bot`, but the signal handler may not.
+// If we try to change `spork_stack_bot` in the signal handler,
+// it can cause issues because it is a (nonatomic) thread_local variable,
+// and therefore a write may not be compiled to a single instruction.
 SporkEntry::SporkEntry(spork_entry_t* entry)
   : prev(spork_stack_bot), entry(entry) {
   prev->next = this;
@@ -359,41 +395,33 @@ SporkEntry::~SporkEntry() {
   spork_stack_bot = prev;
 }
 
-// void SporkEntry::close() {
-//   if (prev) {
-//     prev->next = next;
-//   }
-//   if (this == spork_stack_bot) {
-//     spork_stack_bot = prev;
-//   } else {
-//     next->prev = prev;
-//   }
-// }
-
 void SporkEntry::promote() {
   if (&spork_stack_top == spork_stack_bot) return;
   SporkEntry* slot = spork_stack_top.next;
   while (heartbeat_tokens) {
     if (*slot->entry->promotable_flag) {
       slot->do_promotion();
-      // if this is not the bottom slot and can no longer be promoted,
+      // if this slot can no longer be promoted,
       // we can skip it next time we search
-      // TODO: this optimization seems to break something... fix it
-      // if (slot != spork_stack_bot && !*slot->entry->promotable_flag) {
-      //   slot->prev->next = slot->next;
-      //   slot->next->prev = slot->prev;
-      //   slot = slot->next;
+      // if (!(*(slot->entry->promotable_flag))) {
+      //   if (slot != spork_stack_bot) {
+      //     slot = slot->next;
+      //     spork_stack_top.next = slot;
+      //   } else {
+      //     slot->prev = &spork_stack_top;
+      //   }
       // }
     } else if (slot == spork_stack_bot) {
+      //slot->prev = &spork_stack_top;
       break;
     } else {
       slot = slot->next;
+      //spork_stack_top.next = slot;
     }
   }
 }
 
 void SporkEntry::do_promotion() {
-  
   spork::do_promotion(*this->entry);
 }
 #endif
@@ -410,6 +438,35 @@ void SporkEntry::do_promotion() {
 //   }
 // }
 
+
+#if RECORD_HEARTBEAT_STATS
+volatile uint* num_heartbeats = nullptr;
+volatile uint* missed_heartbeats = nullptr;
+
+void init_heartbeat_stats() {
+  static bool initialized = false;
+  if (!initialized) {
+    initialized = true;
+    uint nw = 8; //internal::init_num_workers();
+    num_heartbeats = new uint[nw];
+    missed_heartbeats = new uint[nw];
+    for (uint wi = 0; wi < nw; wi++) {
+      num_heartbeats[wi] = 0;
+      missed_heartbeats[wi] = 0;
+    }
+    std::cout << "Initialized num_heartbeats nw=" << nw << std::endl;
+  }
+}
+
+void reset_heartbeat_stats() {
+  uint nw = SpwnJob::num_workers();
+  for (uint wi = 0; wi < nw; wi++) {
+    num_heartbeats[wi] = 0;
+    missed_heartbeats[wi] = 0;
+  }
+}
+#endif
+
 // sa.sa_sigaction = heartbeat_handler;
 // sa.sa_flags = SA_SIGINFO
 // void heartbeat_handler(int sig, siginfo_t* info, void* ucontext) {
@@ -417,8 +474,10 @@ void SporkEntry::do_promotion() {
 void heartbeat_handler(int sig) {
   int saved_errno = errno;
   if (!disable_heartbeats) {
-    num_heartbeats++;
-    heartbeat_tokens += TOKENS_PER_HEARTBEAT;
+#if RECORD_HEARTBEAT_STATS
+    num_heartbeats[spork::SpwnJob::worker_id()]++;
+#endif
+    heartbeat_tokens = heartbeat_tokens + TOKENS_PER_HEARTBEAT;
     if (heartbeat_tokens > MAX_HEARTBEAT_TOKENS) {
       heartbeat_tokens = MAX_HEARTBEAT_TOKENS;
     }
@@ -428,24 +487,36 @@ void heartbeat_handler(int sig) {
     SporkEntry::promote();
 #endif
   } else {
-    missed_heartbeats++;
+#if RECORD_HEARTBEAT_STATS
+    missed_heartbeats[spork::SpwnJob::worker_id()]++;
+#endif
   }
   errno = saved_errno;
 }
 
-thread_local timer_t heartbeat_timer;
-thread_local bool heartbeats_initialized = false;
+constinit thread_local timer_t heartbeat_timer;
+constinit itimerspec heartbeat_its_zero = {};
+constinit itimerspec heartbeat_its = {};
 
 void start_heartbeats() noexcept {
-  if (!heartbeats_initialized) { // only first time
-    heartbeats_initialized = true;
-    heartbeat_tokens = 0;
-    num_heartbeats = 0;
-    missed_heartbeats = 0;
-    disable_heartbeats = false;
+  static thread_local bool thread_initialized = false;
+  static bool global_initialized = false;
+  if (!global_initialized) {
+    global_initialized = true;
+    //heartbeat_its_zero = {};
+
+    //heartbeat_its = {};
+    heartbeat_its.it_value.tv_nsec    = HEARTBEAT_INTERVAL_US*1000;
+    heartbeat_its.it_interval.tv_nsec = HEARTBEAT_INTERVAL_US*1000;
+  }
+  if (!thread_initialized) { // only first time
+    thread_initialized = true;
+    //heartbeat_tokens = 0;
+    //disable_heartbeats = false;
     
 #if !PROM_USE_LIBUNWIND
-    //spork_stack_top;
+    spork_stack_top.next = nullptr;
+    spork_stack_top.prev = nullptr;
     spork_stack_bot = &spork_stack_top;
 #endif
 
@@ -468,16 +539,11 @@ void start_heartbeats() noexcept {
   }
   
   // resume timer
-  struct itimerspec its{};
-  its.it_value.tv_nsec    = HEARTBEAT_INTERVAL_US*1000;
-  its.it_interval.tv_nsec = HEARTBEAT_INTERVAL_US*1000;
-  
-  timer_settime(heartbeat_timer, 0, &its, nullptr);
+  timer_settime(heartbeat_timer, 0, &heartbeat_its, nullptr);
 }
 
 void pause_heartbeats() noexcept {
-  struct itimerspec zero{};
-  timer_settime(heartbeat_timer, 0, &zero, nullptr);
+  timer_settime(heartbeat_timer, 0, &heartbeat_its_zero, nullptr);
 }
 
 // TODO: need to do this for every thread
@@ -507,9 +573,10 @@ static void manualProm(PromLambda&& prom, volatile bool& promotable_flag, volati
   disable_heartbeats = true;
   // now check again to make sure a signal didn't eat all the tokens
   while (heartbeat_tokens && promotable_flag) {
-    num_promotions++;
-    heartbeat_tokens--;
+    num_promotions = num_promotions + 1;
+    heartbeat_tokens = heartbeat_tokens - 1;
     promotable_flag = std::forward<PromLambda>(prom)();
+    //spork_stack_top.next = spork_stack_bot;
   }
   // restore
   disable_heartbeats = before;
@@ -583,7 +650,7 @@ static void par(LambdaL&& lamL, LambdaR&& lamR) {
       *jp.pretend_nonvolatile() =
         SpwnJob(execute_lambda<void*, decltype(lamRw), void*>,
                 &lamRw, nullptr, heartbeat_tokens >> 1);
-      jp.enqueue();
+      jp.pretend_nonvolatile()->enqueue();
       return false; // can do no more promotions here
     });
 
@@ -595,7 +662,7 @@ static void par(LambdaL&& lamL, LambdaR&& lamR) {
 }
 
 __attribute__((always_inline))
-static const uint midpoint(uint i, uint j) noexcept {
+constexpr static const uint midpoint(uint i, uint j) noexcept {
   return i + ((j - i) >> 1);
 }
 
@@ -667,7 +734,7 @@ A reduceSeq(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, uint j) {
 // then have the prom lambda write to spwn
 template <typename A, typename BodyLambda, typename CombLambda>
 __attribute__((always_inline)) // TODO: investigate what this attribute actually does
-A reduce(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, volatile uint j) {
+A reduce(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, uint _j) {
   static_assert(std::is_invocable_r_v<void, BodyLambda&, uint, A&>);
   static_assert(std::is_invocable_r_v<void, CombLambda&, A&, A>);
 
@@ -677,6 +744,7 @@ A reduce(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, volatile uin
   volatile SpwnJob jpL, jpR;
   volatile uint next_i, next_j;
   volatile A aL, aR;
+  volatile uint j = _j;
 
   auto spwn =
     [&] (void* isLeft) {
@@ -698,21 +766,20 @@ A reduce(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, volatile uin
       }
     },
     [&] () {
-      if (i >= j) { num_promotions--; return false; }
-      next_i = i;
-      next_i++;
+      if (i >= j) { num_promotions = num_promotions - 1; return false; }
+      next_i = i + 1;
       next_j = j;
       j = next_i;
       *jpR.pretend_nonvolatile() =
         SpwnJob(&execute_lambda<void*, decltype(spwn), void*>,
                 &spwn, (void*) false, (heartbeat_tokens + 1) >> 1);
       // TODO: check if work stealing deque is full before enqueueing
-      jpR.enqueue();
+      jpR.pretend_nonvolatile()->enqueue();
       if (next_i >= midpoint(next_i, next_j)) { return false; }
       *jpL.pretend_nonvolatile() =
         SpwnJob(&execute_lambda<void*, decltype(spwn), void*>,
                 &spwn, (void*) true, heartbeat_tokens);
-      jpL.enqueue();
+      jpL.pretend_nonvolatile()->enqueue();
       return false;
     });
   if (num_promotions) [[unlikely]] {
@@ -729,11 +796,13 @@ A reduce(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, volatile uin
 
 template <typename A, typename BodyLambda, typename CombLambda>
 __attribute__((always_inline))
-A reduceAlloc(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, volatile uint j) {
+A reduceAlloc(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, uint _j) {
   static_assert(std::is_invocable_r_v<void, BodyLambda&, uint, A&>);
   static_assert(std::is_invocable_r_v<void, CombLambda&, A&, A>);
   VolSpwnJob jp = nullptr;
   using AAllocator = parlay::type_allocator<A>;
+
+  volatile uint j = _j;
 
   auto spwn =
     ([&] (void* data) {
@@ -788,7 +857,6 @@ uint fib2(uint n) {
   }
 }
 
-__attribute__((noinline))
 uint fib(uint n) {
   // std::cout << "Fib called! n = " << n << std::endl;
   if (n <= 1) {
@@ -802,6 +870,14 @@ uint fib(uint n) {
 }
 } // namespace spork
 
+void print_uint_arr(const uint* arr, uint len) {
+  std::cout << "[";
+  if (arr && len) {
+    std::cout << arr[0];
+    for (uint i = 1; i < len; i++) std::cout << ", " << arr[i];
+  }
+  std::cout << "]";
+}
 
 int main(int argc, char* argv[]) {
   // this might take a sec the first time it is called
@@ -813,18 +889,23 @@ int main(int argc, char* argv[]) {
   for (uint i = 0; i < n; i++) {
     data[i] = 1 + (i % 5);
   }
+
+  spork::SpwnJob::get_current_scheduler();
+#if RECORD_HEARTBEAT_STATS
+  spork::init_heartbeat_stats();
+#endif
   
   using num = unsigned long long;
-
-  spork::start_heartbeats();
   
   auto total_time = 0;
   constexpr uint WARMUP = 10;
   constexpr uint NUM_TRIALS = 30;
 
   for (uint r = 0; r < WARMUP + NUM_TRIALS; r++) {
-    spork::num_heartbeats = 0;
-    spork::missed_heartbeats = 0;
+#if RECORD_HEARTBEAT_STATS
+    spork::reset_heartbeat_stats();
+#endif
+    spork::start_heartbeats();
     
     auto start = std::chrono::steady_clock::now();
     num total =
@@ -836,8 +917,19 @@ int main(int argc, char* argv[]) {
       //   0, n*50);
       spork::fib(40);
     auto end = std::chrono::steady_clock::now();
+
+    spork::pause_heartbeats();
+    
     auto time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-    std::cout << total << " in " << time_ms << " ms (" << spork::num_heartbeats << " heartbeats, " << spork::missed_heartbeats << " missed)" << std::endl;
+    std::cout << total << " in " << time_ms << " ms";
+#if RECORD_HEARTBEAT_STATS
+    std::cout <" (";
+    print_uint_arr((uint*) spork::num_heartbeats, spork::SpwnJob::num_workers());
+    std::cout << " heartbeats, ";
+    print_uint_arr((uint*) spork::missed_heartbeats, spork::SpwnJob::num_workers());
+    std::cout << " missed)";
+#endif
+    std::cout << std::endl;
     if (r >= WARMUP) total_time += time_ms;
   }
   std::cout << "Average " << (total_time / NUM_TRIALS) << " ms" << std::endl;

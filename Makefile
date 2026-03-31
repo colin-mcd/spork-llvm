@@ -3,7 +3,7 @@ OPTLLVM := ~/code/llvm-project/build/bin/opt
 INCLUDE := -I./parlaylib/include/ -I/usr/include/libunwind/
 DBGFLAG := -ggdb
 LIBRARY := -lunwind -lpthread
-OPTIONS := -xc++ -stdlib=libc++ -std=c++17
+OPTIONS := -xc++ -stdlib=libc++ -std=c++20
 
 scheduler: scheduler.cpp
 	$(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) $< -o $@

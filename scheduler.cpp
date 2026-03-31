@@ -355,28 +355,20 @@ struct SporkEntry {
   explicit SporkEntry(const SporkEntry& other) :
     next(other.next), prev(other.prev), entry(other.entry) {}
 
-  explicit SporkEntry() : next(nullptr), prev(nullptr), entry(nullptr) {}
+  // explicit SporkEntry(SporkEntry&& other) :
+  //   next(other.next), prev(other.prev), entry(other.entry) {}
 
-  // SporkEntry& operator=(SporkEntry&& other) {
-  //   if (this != &other) {
-  //     next = std::exchange(other.next, nullptr);
-  //     prev = std::exchange(other.prev, nullptr);
-  //     entry = std::exchange(other.entry, nullptr);
-  //   }
-  //   return *this;
-  // }
+  constexpr explicit SporkEntry() : next(nullptr), prev(nullptr), entry(nullptr) {}
   
   // NOTE: `this` *must* be the entry at `spork_stack_bot`
   ~SporkEntry();
-
-  // void close();
 
   void do_promotion();
   static void promote(); // TODO: noexcept?
 };
 
-thread_local SporkEntry spork_stack_top;
-thread_local SporkEntry* volatile spork_stack_bot; // initialized to spork_stack_top
+constinit thread_local SporkEntry spork_stack_top;
+constinit thread_local SporkEntry* volatile spork_stack_bot;
 
 // The constructor and destructor for `SporkEntry` may
 // change `spork_stack_bot`, but the signal handler may not.
@@ -496,19 +488,17 @@ void heartbeat_handler(int sig) {
 
 constinit thread_local timer_t heartbeat_timer;
 constinit itimerspec heartbeat_its_zero = {};
-constinit itimerspec heartbeat_its = {};
+
+constexpr itimerspec init_heartbeat_its() {
+  itimerspec its = {};
+  its.it_value   .tv_nsec = HEARTBEAT_INTERVAL_US * 1000;
+  its.it_interval.tv_nsec = HEARTBEAT_INTERVAL_US * 1000;
+  return its;
+}
+constinit itimerspec heartbeat_its = init_heartbeat_its();
 
 void start_heartbeats() noexcept {
-  static thread_local bool thread_initialized = false;
-  static bool global_initialized = false;
-  if (!global_initialized) {
-    global_initialized = true;
-    //heartbeat_its_zero = {};
-
-    //heartbeat_its = {};
-    heartbeat_its.it_value.tv_nsec    = HEARTBEAT_INTERVAL_US*1000;
-    heartbeat_its.it_interval.tv_nsec = HEARTBEAT_INTERVAL_US*1000;
-  }
+  constinit static thread_local bool thread_initialized = false;
   if (!thread_initialized) { // only first time
     thread_initialized = true;
     //heartbeat_tokens = 0;
@@ -612,7 +602,7 @@ static void spork2(volatile bool& promotable_flag, volatile uint& num_promotions
   spork_entry_t en =
     {&promotable_flag, &num_promotions, &prom, execute_lambda<bool, PromLambda>};
   {
-    SporkEntry sporke = SporkEntry(&en);
+    SporkEntry sporke(&en);
     if (heartbeat_tokens) [[unlikely]] {
       manualProm(prom, promotable_flag, num_promotions);
     }

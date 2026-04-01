@@ -5,8 +5,8 @@
 #include "parlay/alloc.h"
 
 #include <libunwind.h>
-#include <type_traits>
-#include <utility>
+//#include <type_traits>
+//#include <utility>
 
 //#include <atomic>
 //#include <atomic>
@@ -132,7 +132,7 @@ struct SpwnJob : parlay::WorkStealingJob {
 
   // pretends a volatile SpwnJob is nonvolatile
   __attribute__((always_inline))
-  SpwnJob* pretend_nonvolatile() volatile {
+  SpwnJob* pretend_nonvolatile() volatile noexcept {
     return (SpwnJob*) this;
   }
 
@@ -358,7 +358,7 @@ struct SporkEntry {
   // explicit SporkEntry(SporkEntry&& other) :
   //   next(other.next), prev(other.prev), entry(other.entry) {}
 
-  constexpr explicit SporkEntry() : next(nullptr), prev(nullptr), entry(nullptr) {}
+  consteval explicit SporkEntry() : next(nullptr), prev(nullptr), entry(nullptr) {}
   
   // NOTE: `this` *must* be the entry at `spork_stack_bot`
   ~SporkEntry();
@@ -384,6 +384,7 @@ SporkEntry::SporkEntry(spork_entry_t* entry)
 
 // NOTE: `this` *must* be the entry at `spork_stack_bot`
 SporkEntry::~SporkEntry() {
+  // TODO idea: just disable heartbeats for this, and also constructor above
   spork_stack_bot = prev;
 }
 
@@ -395,6 +396,7 @@ void SporkEntry::promote() {
       slot->do_promotion();
       // if this slot can no longer be promoted,
       // we can skip it next time we search
+      // TODO: fix this below
       // if (!(*(slot->entry->promotable_flag))) {
       //   if (slot != spork_stack_bot) {
       //     slot = slot->next;
@@ -489,7 +491,7 @@ void heartbeat_handler(int sig) {
 constinit thread_local timer_t heartbeat_timer;
 constinit itimerspec heartbeat_its_zero = {};
 
-constexpr itimerspec init_heartbeat_its() {
+consteval itimerspec init_heartbeat_its() {
   itimerspec its = {};
   its.it_value   .tv_nsec = HEARTBEAT_INTERVAL_US * 1000;
   its.it_interval.tv_nsec = HEARTBEAT_INTERVAL_US * 1000;
@@ -505,8 +507,6 @@ void start_heartbeats() noexcept {
     //disable_heartbeats = false;
     
 #if !PROM_USE_LIBUNWIND
-    spork_stack_top.next = nullptr;
-    spork_stack_top.prev = nullptr;
     spork_stack_bot = &spork_stack_top;
 #endif
 

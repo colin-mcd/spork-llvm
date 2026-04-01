@@ -1,28 +1,7 @@
-//#include "parlay/internal/work_stealing_deque.h"
-//#include "parlay/internal/work_stealing_job.h"
 #include "parlay/parallel.h"
-//#include "parlay/scheduler.h"
 #include "parlay/alloc.h"
 
 #include <libunwind.h>
-//#include <type_traits>
-//#include <utility>
-
-//#include <atomic>
-//#include <atomic>
-//#include <bits/types/time_t.h>
-//#include <cstddef>
-//#include <cstdint>
-//#include <cstdlib>
-//#include <csignal>
-//#include <ostream>
-//#include <ratio>
-//#include <signal.h>
-//#include <sys/types.h>
-//#include <thread>
-//#include <time.h>
-//#include <iostream>
-//#include <utility>
 
 //#include <linux/perf_event.h>
 //#include <sys/ioctl.h>

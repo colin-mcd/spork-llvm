@@ -4,6 +4,7 @@ INCLUDE := -I./parlaylib/include/ -I/usr/include/libunwind/
 DBGFLAG := -ggdb
 LIBRARY := -lunwind -lpthread
 OPTIONS := -xc++ -stdlib=libc++ -std=c++20
+LLVMOPT := -fpass-plugin=./pass/build/RtsSporkPass.so
 
 scheduler: scheduler.cpp
 	$(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) $< -o $@
@@ -36,6 +37,12 @@ scheduler.ll: scheduler.cpp
 
 scheduler.opt.ll: scheduler.ll
 	$(OPTLLVM) -S -O3 $< -o $@
+
+pass/build/RtsSporkPass.so: pass/RtsSporkPass.cpp pass/rts_spork_table.h
+	$(MAKE) -C pass/build
+
+llvmtest: scheduler.cpp pass/build/RtsSporkPass.so
+	$(CLANGPP) $(INCLUDE) $(OPTIONS) $(LIBRARY) $(DBGFLAG) $(LLVMOPT) $< -o $@
 
 .PHONY: clean
 clean:

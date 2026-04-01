@@ -9,7 +9,7 @@
 
 // TODO: consider a (libunwind) setjmp/longjmp based implementation
 // TODO: libunwind implementation broken for any (heterogenous) nested parallelism
-#define PROM_USE_LIBUNWIND 0
+#define PROM_USE_LIBUNWIND 1
 #define RECORD_HEARTBEAT_STATS 0
 
 // TODO: consistent name casing (camel or snake)
@@ -59,35 +59,38 @@ struct SpwnJob : parlay::WorkStealingJob {
   void* spwn;
   void* data;
   uint num_heartbeat_tokens;
-  //scheduler_t* sched;
   
   public:
   void* result;
   SpwnJob* next;
 
-  explicit SpwnJob() {}
+  explicit SpwnJob() noexcept {}
 
   explicit SpwnJob(void* (*_exec_spwn)(void* spwn, void* data),
                    void* _spwn,
                    void* _data,
                    uint _hbt = 0,
                    SpwnJob* _next = nullptr, 
-                   // scheduler_t* _sched = nullptr,
-                   void* _result = nullptr) :
+                   void* _result = nullptr) noexcept :
       WorkStealingJob(),
       exec_spwn(_exec_spwn),
       spwn(_spwn),
       data(_data),
       num_heartbeat_tokens(_hbt),
-      // sched(_sched),
       result(_result),
       next(_next) {
-    // if (sched == nullptr) {
-    //   sched = &get_current_scheduler();
-    // }
     heartbeat_tokens = heartbeat_tokens - _hbt;
   }
 
+  // SpwnJob(SpwnJob&& other) noexcept = {
+  //   exec_spwn = std::forward<void*(*)(void*, void*)>(other.exec_spwn);
+  //   spwn = std::forward<void*>(other.spwn);
+  //   data = std::forward<void*>(other.data);
+  //   num_heartbeat_tokens = std::forward<uint>(other.num_heartbeat_tokens);
+  //   result = std::forward<void*>(other.result);
+  //   next = std::forward<SpwnJob*>(other.next);
+  //   return *this;
+  // }
   SpwnJob& operator=(const SpwnJob& other) = delete;
   SpwnJob& operator=(SpwnJob&& other) noexcept {
     if (this != &other) {
@@ -95,16 +98,8 @@ struct SpwnJob : parlay::WorkStealingJob {
       spwn = std::exchange(other.spwn, nullptr);
       data = std::exchange(other.data, nullptr);
       num_heartbeat_tokens = std::exchange(other.num_heartbeat_tokens, 0);
-      // sched = std::exchange(other.sched, nullptr);
       result = std::exchange(other.result, nullptr);
       next = std::exchange(other.next, nullptr);
-      // exec_spwn = other.exec_spwn;
-      // spwn = other.spwn;
-      // data = other.data;
-      // num_heartbeat_tokens = other.num_heartbeat_tokens;
-      // sched = other.sched;
-      // result = other.result;
-      // next = other.next;
     }
     return *this;
   }
@@ -134,7 +129,6 @@ struct SpwnJob : parlay::WorkStealingJob {
             std::exchange(other.data, nullptr),
             std::exchange(other.num_heartbeat_tokens, 0),
             std::exchange(other.next, nullptr),
-            // std::exchange(other.sched, nullptr),
             std::exchange(other.result, nullptr)) {}
 
   void enqueue() {
@@ -237,12 +231,12 @@ void do_promotion(const spork_entry_t& slot) noexcept {
 }
 
 #if PROM_USE_LIBUNWIND
-volatile bool* ad_hoc_promotable_flag = nullptr;
-volatile uint* ad_hoc_num_promotions = nullptr;
-void* ad_hoc_prom;
-bool (*ad_hoc_exec_prom)(void*);
-void* ad_hoc_spork_ip_min = nullptr;
-void* ad_hoc_spork_ip_max = nullptr;
+constinit volatile bool* ad_hoc_promotable_flag = nullptr;
+constinit volatile uint* ad_hoc_num_promotions = nullptr;
+constinit void* ad_hoc_prom;
+constinit bool (*ad_hoc_exec_prom)(void*);
+constinit void* ad_hoc_spork_ip_min = nullptr;
+constinit void* ad_hoc_spork_ip_max = nullptr;
 
 static void __RTS_record_spork
   (volatile bool* promotable_flag,
@@ -250,8 +244,8 @@ static void __RTS_record_spork
    void* prom,
    bool (*exec_prom)(void*)) noexcept {}
 
-spork_entry_t colin_default;
-spork_row_t colin_default_row = {1, &colin_default};
+constinit spork_entry_t colin_default = {};
+constinit spork_row_t colin_default_row = {1, &colin_default};
 void set_colin_default() {
   colin_default = {
     ad_hoc_promotable_flag,
@@ -427,7 +421,6 @@ void init_heartbeat_stats() {
       num_heartbeats[wi] = 0;
       missed_heartbeats[wi] = 0;
     }
-    std::cout << "Initialized num_heartbeats nw=" << nw << std::endl;
   }
 }
 
@@ -553,7 +546,7 @@ static void manualProm(PromLambda&& prom, volatile bool& promotable_flag, volati
 
 // TODO: exception handling
 template <typename BodyLambda, typename PromLambda>
-__attribute__((always_inline))
+//__attribute__((always_inline))
 static void spork2(volatile bool& promotable_flag, volatile uint& num_promotions,
                    BodyLambda&& body, PromLambda&& prom) {
   static_assert(std::is_invocable_v<BodyLambda&&>);
@@ -602,6 +595,15 @@ static void spork(BodyLambda&& body, PromLambda&& prom) {
 
 template <typename LambdaL, typename LambdaR>
 __attribute__((always_inline))
+static void parSeq(LambdaL&& lamL, LambdaR&& lamR) {
+  static_assert(std::is_invocable_v<LambdaL&>);
+  static_assert(std::is_invocable_v<LambdaR&>);
+  std::forward<LambdaL>(lamL)();
+  std::forward<LambdaR>(lamR)();
+}
+
+template <typename LambdaL, typename LambdaR>
+//__attribute__((always_inline))
 static void par(LambdaL&& lamL, LambdaR&& lamR) {
   static_assert(std::is_invocable_v<LambdaL&>);
   static_assert(std::is_invocable_v<LambdaR&>);
@@ -808,26 +810,18 @@ A reduceAlloc(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, uint _j
   return a;
 }
 
-__attribute__((noinline))
-uint fib3(uint n) {
-  return (n <= 1) ? n : fib3(n - 1) + fib3(n - 2);
-}
-
-__attribute__((noinline))
-uint fib2(uint n) {
-  // std::cout << "Fib2 called! n = " << n << std::endl;
+uint fibSeq(uint n) {
   if (n <= 1) {
     return n;
   } else {
     uint l, r;
-    par([&] () {l = fib2(n - 1);},
-        [&] () {r = fib2(n - 2);});
+    parSeq([&] () {l = fibSeq(n - 1);},
+           [&] () {r = fibSeq(n - 2);});
     return l + r;
   }
 }
 
 uint fib(uint n) {
-  // std::cout << "Fib called! n = " << n << std::endl;
   if (n <= 1) {
     return n;
   } else {
@@ -878,13 +872,13 @@ int main(int argc, char* argv[]) {
     
     auto start = std::chrono::steady_clock::now();
     num total =
-      // spork::reduce<num>(
-      //   0,
-      //   0,
-      //   [] (num& a, num b) { a += b; },
-      //   [&] (uint i, num& a) { a += data[i % n]; },
-      //   0, n*50);
-      spork::fib(40);
+      spork::reduceAlloc<num>(
+        0,
+        0,
+        [] (num& a, num b) { a += b; },
+        [&] (uint i, num& a) { a += data[i % n]; },
+        0, n*50);
+      // spork::fib(40);
     auto end = std::chrono::steady_clock::now();
 
     spork::pause_heartbeats();

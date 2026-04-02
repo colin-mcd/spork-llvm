@@ -2,6 +2,7 @@
 #include "parlay/alloc.h"
 
 #include <libunwind.h>
+#include <sys/cdefs.h>
 
 //#include <linux/perf_event.h>
 //#include <sys/ioctl.h>
@@ -9,7 +10,7 @@
 
 // TODO: consider a (libunwind) setjmp/longjmp based implementation
 // TODO: libunwind implementation broken for any (heterogenous) nested parallelism
-#define PROM_USE_LIBUNWIND 1
+#define PROM_USE_LIBUNWIND 0
 #define RECORD_HEARTBEAT_STATS 0
 
 // TODO: consistent name casing (camel or snake)
@@ -238,11 +239,13 @@ constinit bool (*ad_hoc_exec_prom)(void*);
 constinit void* ad_hoc_spork_ip_min = nullptr;
 constinit void* ad_hoc_spork_ip_max = nullptr;
 
-static void __RTS_record_spork
-  (volatile bool* promotable_flag,
-   volatile uint* num_promotions,
+extern void __RECORD_SPORK
+  (void* promotable_flag,
+   void* num_promotions,
    void* prom,
-   bool (*exec_prom)(void*)) noexcept {}
+   void* exec_prom,
+   void* beg,
+   void* end) noexcept {};
 
 constinit spork_entry_t colin_default = {};
 constinit spork_row_t colin_default_row = {1, &colin_default};
@@ -524,6 +527,12 @@ _Ret execute_lambda(void* f, _Args... args) {
   return (*_f)(args...);
 }
 
+template <typename _Fn, _Fn&& f>
+void execute_lambda2() {
+  static_assert(std::is_invocable_r_v<void, _Fn&>);
+  return f();
+}
+
 #ifndef FRAME_OFFSET
 #define FRAME_OFFSET(x) ((uintptr_t) __builtin_frame_address(0) - (uintptr_t) (x))
 #endif
@@ -563,20 +572,33 @@ static void spork2(volatile bool& promotable_flag, volatile uint& num_promotions
   }
   begin_body:
   {
+    // __attribute__((annotate("spork_range", (void*) execute_lambda<bool, PromLambda>)))
+    //   void* thisspork[3] = {(void*) &promotable_flag,
+    //                         (void*) &num_promotions,
+    //                         (void*) &prom};
     if (heartbeat_tokens) [[unlikely]] {
       manualProm(prom, promotable_flag, num_promotions);
     }
     std::forward<BodyLambda>(body)();
   }
   end_body:
-  __RTS_record_spork(ad_hoc_promotable_flag, ad_hoc_num_promotions, (void*) &prom, ad_hoc_exec_prom);
+  // __RECORD_SPORK(ad_hoc_promotable_flag, ad_hoc_num_promotions, (void*) &prom, ad_hoc_exec_prom);
+  // TODO: check if using these labels is too brittle;
+  // could some optimization passes move blocks into/out of the begin-end range?
+  __RECORD_SPORK((void*) &promotable_flag,
+                 (void*) &num_promotions,
+                 (void*) &prom,
+                 (void*) &execute_lambda<bool, PromLambda>,
+                 &&begin_body,
+                 &&end_body);
 #else
   spork_entry_t en =
     {&promotable_flag, &num_promotions, &prom, execute_lambda<bool, PromLambda>};
   {
+    decltype(prom)& another = prom;
     SporkEntry sporke(&en);
     if (heartbeat_tokens) [[unlikely]] {
-      manualProm(prom, promotable_flag, num_promotions);
+      manualProm(another, promotable_flag, num_promotions);
     }
     std::forward<BodyLambda>(body)();
   }
@@ -741,6 +763,9 @@ A reduce(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, uint _j) {
       next_i = i + 1;
       next_j = j;
       j = next_i;
+      // *jpR.pretend_nonvolatile() =
+      //   SpwnJob(&execute_lambda2<decltype(spwn), spwn>,
+      //           &spwn, (void*) false, (heartbeat_tokens + 1) >> 1);
       *jpR.pretend_nonvolatile() =
         SpwnJob(&execute_lambda<void*, decltype(spwn), void*>,
                 &spwn, (void*) false, (heartbeat_tokens + 1) >> 1);
@@ -872,7 +897,7 @@ int main(int argc, char* argv[]) {
     
     auto start = std::chrono::steady_clock::now();
     num total =
-      spork::reduceAlloc<num>(
+      spork::reduce<num>(
         0,
         0,
         [] (num& a, num b) { a += b; },

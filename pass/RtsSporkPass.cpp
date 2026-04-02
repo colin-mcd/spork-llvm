@@ -3,11 +3,13 @@
  *
  * Two-phase LLVM pass that finds all calls to:
  *
- *   static void __RTS_record_spork(
- *       volatile bool*  promotable_flag,   // arg 0 – local var address
- *       volatile uint*  num_promotions,    // arg 1 – local var address
- *       void*           prom,              // arg 2 – local var address
- *       bool (*exec_prom)(void*)           // arg 3 – local var address
+ *   extern void __RECORD_SPORK(
+ *     void* promotable_flag,  // arg 0: local var address
+ *     void* num_promotions,   // arg 1: local var address
+ *     void* prom,             // arg 2: local var address
+ *     void* exec_prom,        // arg 3: global var address (constant)
+ *     void* beg,              // arg 4: label address (constant)
+ *     void* end               // arg 5: label address (constant)
  *   ) noexcept;
  *
  * and builds a static, global table that maps each call-site (identified by
@@ -18,7 +20,7 @@
  * work is split across two passes:
  *
  *   Phase 1 – RtsSporkIRPass  (ModulePass / FunctionPass at IR level)
- *     • Finds every call to __RTS_record_spork.
+ *     • Finds every call to __RECORD_SPORK.
  *     • Traces each pointer argument back to its AllocaInst.
  *     • Assigns a unique call-site ID (stored as !rts_spork_id metadata on
  *       the CallInst, and as !rts_spork_slot metadata on every referenced
@@ -50,6 +52,8 @@
  * rts_spork_table.h (see companion header).
  */
 
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
@@ -67,10 +71,12 @@
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/CodeGen/TargetFrameLowering.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Target/TargetOptions.h"
 
 #include <cstdint>
 #include <vector>
@@ -78,133 +84,196 @@
 
 #define DEBUG_TYPE "rts-spork"
 
+// TODO: multiple modules (maybe something for the linker?)
+
 using namespace llvm;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Constants / names shared between both phases
-// ─────────────────────────────────────────────────────────────────────────────
+// number of fields to be stored in a spork info slot
+static constexpr unsigned kNumRelativeSporkArgs = 3;
+static constexpr unsigned kNumConstantSporkArgs = 3;
+// name of extern function call to look for
+static constexpr char kTargetFnName[] = "__RECORD_SPORK";
+// emitted spork table name
+static constexpr char kTableName[] = "__rts_spork_table";
+// emitted spork table size name
+static constexpr char kTableSizeName[] = "__rts_spork_table_size";
+// on CallInst
+static constexpr char kMDSiteId[] = "rts_spork_id";
+// on AllocaInst
+static constexpr char kMDSlotIdx[] = "rts_spork_slot";
 
-static constexpr unsigned kNumSporkArgs  = 4;
-static constexpr char kTargetFnName[]    = "__RTS_record_spork";
-static constexpr char kTableName[]       = "__rts_spork_table";
-static constexpr char kTableSizeName[]   = "__rts_spork_table_size";
-static constexpr char kMDSiteId[]        = "rts_spork_id";   // on CallInst
-static constexpr char kMDSlotIdx[]       = "rts_spork_slot"; // on AllocaInst
+/* Helpers */
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Strip pointer casts / GEPs with zero offset to find the underlying alloca.
-/// Returns nullptr if we cannot prove the value originates from a local alloca.
-static AllocaInst *resolveToAlloca(Value *V) {
-  // Peel casts / zero-index GEPs iteratively.
-  while (V) {
-    if (AllocaInst *AI = dyn_cast<AllocaInst>(V))
-      return AI;
-    if (BitCastInst *BC = dyn_cast<BitCastInst>(V)) {
-      V = BC->getOperand(0);
-      continue;
+// Determines if all indices of GEP are zero (i.e. no actual displacement).
+static bool GEPAllZero(GetElementPtrInst *GEP) {
+  for (Use &Idx : GEP->indices()) {
+    ConstantInt *CI = dyn_cast<ConstantInt>(Idx);
+    if (CI == nullptr || !CI->isZero()) {
+      return false;
     }
-    if (AddrSpaceCastInst *AC = dyn_cast<AddrSpaceCastInst>(V)) {
-      V = AC->getOperand(0);
-      continue;
-    }
-    if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(V)) {
-      // Only follow if all indices are zero (i.e. no actual displacement).
-      bool allZero = true;
-      for (Use &Idx : GEP->indices()) {
-        if (ConstantInt *CI = dyn_cast<ConstantInt>(Idx)) {
-          if (!CI->isZero()) { allZero = false; break; }
-        } else {
-          allZero = false; break;
-        }
-      }
-      if (allZero) { V = GEP->getPointerOperand(); continue; }
-      // Non-zero GEP: still the same alloca, just offset within it.
-      // We can still recover the alloca for frame-offset purposes.
-      V = GEP->getPointerOperand();
-      continue;
-    }
-    // PHI / select: too complex – give up.
-    break;
   }
+  return true;
+}
+
+// Strip pointer casts / GEPs with zero offset to find the underlying alloca.
+// Returns nullptr if we cannot prove the value originates from a local alloca.
+static Value *resolveToAllocaOrConstant(Value *V) {
+  if (AllocaInst *AI = dyn_cast<AllocaInst>(V)) {
+    return AI;
+  } else if (Constant *C = dyn_cast<Constant>(V)) {
+    return C;
+  } else if (BitCastInst *BC = dyn_cast<BitCastInst>(V)) {
+    return resolveToAllocaOrConstant(BC->getOperand(0));
+  } else if (AddrSpaceCastInst *AC = dyn_cast<AddrSpaceCastInst>(V)) {
+    return resolveToAllocaOrConstant(AC->getOperand(0));
+  } else if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(V)) {
+    // Only follow if all indices are zero (i.e. no actual displacement).
+    if (GEPAllZero(GEP)) return resolveToAllocaOrConstant(GEP->getPointerOperand());
+  }
+  // anything else: give up
   return nullptr;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Phase 1 – IR-level Module Pass
-// ─────────────────────────────────────────────────────────────────────────────
+/* Phase 1 - IR-level Module Pass */
 
 struct RtsSporkIRPass : public PassInfoMixin<RtsSporkIRPass> {
+
+  struct SporkInfo {
+    CallInst *CI;
+    uint64_t id;
+    AllocaInst *allocas[kNumRelativeSporkArgs];
+    Constant *constants[kNumConstantSporkArgs];
+  };
+  
+  using SporkNest = std::vector<SporkInfo*>;
+
+  void tryRecordSporkInfo(const Instruction* I, std::vector<SporkInfo>& sporks, const Function& F) {
+    CallInst *CI = dyn_cast<CallInst>(&I);
+    if (!CI) return;
+
+    Function *Callee = CI->getCalledFunction();
+    if (!Callee || Callee->getName() != kTargetFnName) return;
+
+    if (CI->arg_size() != kNumRelativeSporkArgs + kNumConstantSporkArgs) {
+      errs() << "[spork] WARNING: call to " << kTargetFnName
+             << " has only " << CI->arg_size() << " args, skipping.\n";
+      return;
+    }
+
+    SporkInfo si;
+    for (unsigned a = 0; a < kNumRelativeSporkArgs; ++a) {
+      si.allocas[a] = dyn_cast<AllocaInst>(resolveToAllocaOrConstant(CI->getArgOperand(a)));
+      if (!si.allocas[a]) {
+        errs() << "[spork] WARNING: arg " << a << " of call at " << F.getName()
+               << " could not be resolved to an alloca, skipping.\n";
+        return;
+      }
+    }
+    for (unsigned a = 0; a < kNumConstantSporkArgs; ++a) {
+      Value* arg = CI->getArgOperand(kNumRelativeSporkArgs + a);
+      Value* resolved = resolveToAllocaOrConstant(arg);
+      si.constants[a] = dyn_cast<Constant>(resolved);
+      if (!si.allocas[a]) {
+        errs() << "[spork] WARNING: arg " << kNumRelativeSporkArgs + a
+               << " of call at " << F.getName() << " could not be resolved to a constant, skipping.\n";
+        return;
+      }
+    }
+    si.CI = CI;
+    si.id = (uint64_t) sporks.size();
+    sporks.push_back(si);
+  }
+
+  // Populates `sites` with the SporkInfo corresponding
+  // to each `kTargetFnName` function call in a module
+  void populateSporkInfo(const Module &M, std::vector<SporkInfo> &sites) {
+    for (const Function &F : M)
+      for (const BasicBlock &B : F)
+        for (const Instruction &I : B)
+          tryRecordSporkInfo(&I, sites, F);
+  }
+
+  void populateSporkNest(Module &M, const std::vector<SporkInfo> &sites) {
+    GlobalVariable *GA = M.getNamedGlobal("llvm.global.annotations");
+    if (!GA) return;
+
+    ConstantArray *CA = dyn_cast<ConstantArray>(GA->getOperand(0));
+    for (unsigned i = 0; i < CA->getNumOperands(); ++i) {
+      auto *CS = dyn_cast<ConstantStruct>(CA->getOperand(i));
+
+      // Operand 1 = annotation string
+      Constant *AnnoPtr = CS->getOperand(1);
+      GlobalVariable *AnnoGV = cast<GlobalVariable>(cast<ConstantExpr>(AnnoPtr)->getOperand(0));
+      ConstantDataArray *AnnoData = cast<ConstantDataArray>(AnnoGV->getInitializer());
+
+      std::string AnnoStr = AnnoData->getAsCString().str();
+
+      if (AnnoStr == "spork_range") {
+        // Operand 0 = annotated entity
+        Value *Annotated = CS->getOperand(0);
+
+        // Instruction *I = dyn_cast<Instruction>(Annotated);
+        // if (I == nullptr) continue;
+        
+        AllocaInst *AI = dyn_cast<AllocaInst>(Annotated);
+        if (AI == nullptr) continue;
+        BasicBlock *b = AI->getParent();
+
+        // Operands 2 and 3 = file and line
+
+        // Operand 4 = extra args (your labels)
+        Value *Extra = CS->getOperand(4);
+
+        // You'll need to peel this apart depending on how Clang encoded it
+      }
+    }
+    // for (Function &F : M) {
+    //   for (BasicBlock &B : F) {
+    //     for (Instruction &I : B) {
+    //       MDNode* meta = I.getMetadata("spork_range");
+    //       for (auto mo = meta->op_begin(); mo < meta->op_end(); mo++) {
+    //         Metadata *md = mo->get();
+    //         md->
+    //       }
+    //       if (AllocaInst *AI = dyn_cast<AllocaInst>(&I)) {
+            
+    //       }
+    //     }
+    //   }
+    // }
+  }
 
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
     LLVMContext &Ctx = M.getContext();
 
-    // Collect all calls to __RTS_record_spork across the whole module.
-    struct SiteInfo {
-      CallInst      *CI;
-      AllocaInst    *allocas[kNumSporkArgs]; // may be nullptr if unresolvable
-      uint64_t       id;
-    };
-    std::vector<SiteInfo> sites;
-
-    for (Function &F : M) {
-      for (BasicBlock &BB : F) {
-        for (Instruction &I : BB) {
-          CallInst *CI = dyn_cast<CallInst>(&I);
-          if (!CI) continue;
-
-          Function *Callee = CI->getCalledFunction();
-          if (!Callee || Callee->getName() != kTargetFnName) continue;
-
-          if (CI->arg_size() < kNumSporkArgs) {
-            errs() << "[RtsSpork] WARNING: call to " << kTargetFnName
-                   << " has only " << CI->arg_size() << " args, skipping.\n";
-            continue;
-          }
-
-          SiteInfo si;
-          si.CI = CI;
-          si.id = (uint64_t)sites.size();
-
-          for (unsigned a = 0; a < kNumSporkArgs; ++a) {
-            Value *Arg = CI->getArgOperand(a);
-            si.allocas[a] = resolveToAlloca(Arg);
-            if (!si.allocas[a]) {
-              errs() << "[RtsSpork] WARNING: arg " << a
-                     << " of call at " << F.getName()
-                     << " could not be resolved to an alloca. "
-                        "Offset will be INT64_MIN.\n";
-            }
-          }
-          sites.push_back(si);
-        }
-      }
-    }
+    // Collect all calls to __RECORD_SPORK across the module
+    std::vector<SporkInfo> sites;
+    populateSporkInfo(M, sites);
+    // Now remove those calls
+    for (SporkInfo si : sites) si.CI->removeFromParent();
 
     if (sites.empty()) {
-      LLVM_DEBUG(dbgs() << "[RtsSpork] No calls found.\n");
+      LLVM_DEBUG(dbgs() << "[spork] No calls found.\n");
       return PreservedAnalyses::all();
     }
 
     uint64_t N = sites.size();
-    LLVM_DEBUG(dbgs() << "[RtsSpork] Found " << N << " call site(s).\n");
+    LLVM_DEBUG(dbgs() << "[spork] Found " << N << " call site(s).\n");
 
-    // ── Build the global table type ──────────────────────────────────────────
+    // -- Build the global table type ------------------------------------------
     //
     //   struct RtsSporkSite {
-    //       int64_t offsets[4];   // one per argument
+    //       int64_t offsets[kNumRelativeSporkArgs + kNumConstantSporkArgs];   // one per argument
     //   };
     //   RtsSporkSite __rts_spork_table[N];       // zero-initialised for now
     //   uint64_t     __rts_spork_table_size = N;
     //
-    Type *I64Ty  = Type::getInt64Ty(Ctx);
-    Type *I64x4  = ArrayType::get(I64Ty, kNumSporkArgs);
+    Type *I64Ty = Type::getInt64Ty(Ctx);
+    Type *I64Array = ArrayType::get(I64Ty, kNumRelativeSporkArgs + kNumConstantSporkArgs);
 
     // The site struct: { int64_t offsets[4]; }
     StructType *SiteTy = StructType::create(
-        Ctx, {I64x4}, "struct.RtsSporkSite", /*isPacked=*/false);
+        Ctx, {I64Array}, "struct.RtsSporkSite", /*isPacked=*/false);
 
     // The table array
     ArrayType *TableTy = ArrayType::get(SiteTy, N);
@@ -231,7 +300,7 @@ struct RtsSporkIRPass : public PassInfoMixin<RtsSporkIRPass> {
         kTableSizeName);
     GSize->setAlignment(Align(8));
 
-    // ── Annotate each call site with metadata ────────────────────────────────
+    // -- Annotate each call site with metadata --------------------------------
     //
     // !rts_spork_id  = !{ i64 <site_id> }   attached to the CallInst
     // !rts_spork_slot = !{ i64 <site_id>, i64 <arg_index> }  on each AllocaInst
@@ -242,7 +311,7 @@ struct RtsSporkIRPass : public PassInfoMixin<RtsSporkIRPass> {
     unsigned MDSiteIdKind  = Ctx.getMDKindID(kMDSiteId);
     unsigned MDSlotIdxKind = Ctx.getMDKindID(kMDSlotIdx);
 
-    for (SiteInfo &si : sites) {
+    for (SporkInfo &si : sites) {
       // Tag the call instruction.
       MDNode *CallMD = MDNode::get(
           Ctx,
@@ -252,17 +321,20 @@ struct RtsSporkIRPass : public PassInfoMixin<RtsSporkIRPass> {
       // Tag each alloca (may be shared across args – use arg index to
       // disambiguate in the machine pass).
       for (unsigned a = 0; a < kNumSporkArgs; ++a) {
-        if (!si.allocas[a]) continue;
+        if (!si.args[a]) continue;
         MDNode *SlotMD = MDNode::get(
             Ctx,
             {ConstantAsMetadata::get(ConstantInt::get(I64Ty, si.id)),
              ConstantAsMetadata::get(ConstantInt::get(I64Ty, a))});
         // Append (don't overwrite) – an alloca may appear in multiple sites.
-        si.allocas[a]->setMetadata(MDSlotIdxKind, SlotMD);
+        Value *arga = si.args[a];
+        if (AllocaInst *AI = dyn_cast<AllocaInst>(arga)) {
+          AI->setMetadata(MDSlotIdxKind, SlotMD);
+        }
       }
     }
 
-    // ── Emit a __attribute__((constructor)) filler function ──────────────────
+    // -- Emit a __attribute__((constructor)) filler function ------------------
     //
     // At IR level we don't yet know the real offsets (the backend hasn't run).
     // We therefore emit a *placeholder* constructor whose body is filled in by
@@ -290,7 +362,7 @@ struct RtsSporkIRPass : public PassInfoMixin<RtsSporkIRPass> {
     Constant *Sentinel = ConstantInt::get(I64Ty, INT64_MIN);
     Type     *I32Ty    = Type::getInt32Ty(Ctx);
 
-    for (SiteInfo &si : sites) {
+    for (SporkInfo &si : sites) {
       for (unsigned a = 0; a < kNumSporkArgs; ++a) {
         // GEP into __rts_spork_table[si.id].offsets[a]
         Value *Slot = Builder.CreateInBoundsGEP(
@@ -354,9 +426,9 @@ private:
   }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // Phase 2 – MachineFunctionPass
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 //
 // Runs after register allocation, when MachineFrameInfo has final slot offsets.
 // For each function that contains annotated AllocaInsts:
@@ -449,7 +521,7 @@ struct RtsSporkMachinePass : public MachineFunctionPass {
     Module *M = const_cast<Module *>(F.getParent());
     GlobalVariable *GTable = M->getGlobalVariable(kTableName);
     if (!GTable) {
-      errs() << "[RtsSpork] ERROR: global table not found – did IR pass run?\n";
+      errs() << "[spork] ERROR: global table not found – did IR pass run?\n";
       return false;
     }
 
@@ -480,7 +552,7 @@ struct RtsSporkMachinePass : public MachineFunctionPass {
       if (se.siteId >= N) continue;
       auto it = AllocaToFI.find(se.AI);
       if (it == AllocaToFI.end()) {
-        errs() << "[RtsSpork] WARNING: no FrameIndex for alloca in "
+        errs() << "[spork] WARNING: no FrameIndex for alloca in "
                << F.getName() << " (site " << se.siteId << " arg "
                << se.argIdx << ")\n";
         continue;
@@ -499,7 +571,7 @@ struct RtsSporkMachinePass : public MachineFunctionPass {
       rawSites[se.siteId].off[se.argIdx] = byteOffset;
       changed = true;
 
-      LLVM_DEBUG(dbgs() << "[RtsSpork] site=" << se.siteId
+      LLVM_DEBUG(dbgs() << "[spork] site=" << se.siteId
                         << " arg=" << se.argIdx
                         << " FI=" << FI
                         << " offset=" << byteOffset << "\n");
@@ -538,9 +610,9 @@ static RegisterPass<RtsSporkMachinePass> RegMP(
     /*CFGOnly=*/false,
     /*isAnalysis=*/false);
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 // New-PM plugin registration (clang -fpass-plugin=...)
-// ─────────────────────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------------
 
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
 llvmGetPassPluginInfo() {

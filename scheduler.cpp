@@ -1,8 +1,10 @@
 #include "parlay/parallel.h"
 #include "parlay/alloc.h"
 
+#include <atomic>
 #include <libunwind.h>
 #include <sys/cdefs.h>
+#include <type_traits>
 
 //#include <linux/perf_event.h>
 //#include <sys/ioctl.h>
@@ -70,7 +72,7 @@ struct SpwnJob : parlay::WorkStealingJob {
   explicit SpwnJob(void* (*_exec_spwn)(void* spwn, void* data),
                    void* _spwn,
                    void* _data,
-                   uint _hbt = 0,
+                   uint _hbt,
                    SpwnJob* _next = nullptr, 
                    void* _result = nullptr) noexcept :
       WorkStealingJob(),
@@ -79,22 +81,13 @@ struct SpwnJob : parlay::WorkStealingJob {
       data(_data),
       num_heartbeat_tokens(_hbt),
       result(_result),
-      next(_next) {
-    heartbeat_tokens = heartbeat_tokens - _hbt;
-  }
+      next(_next) {}
 
-  // SpwnJob(SpwnJob&& other) noexcept = {
-  //   exec_spwn = std::forward<void*(*)(void*, void*)>(other.exec_spwn);
-  //   spwn = std::forward<void*>(other.spwn);
-  //   data = std::forward<void*>(other.data);
-  //   num_heartbeat_tokens = std::forward<uint>(other.num_heartbeat_tokens);
-  //   result = std::forward<void*>(other.result);
-  //   next = std::forward<SpwnJob*>(other.next);
-  //   return *this;
-  // }
   SpwnJob& operator=(const SpwnJob& other) = delete;
   SpwnJob& operator=(SpwnJob&& other) noexcept {
     if (this != &other) {
+      // done = other.done.exchange(false);
+      done = false;
       exec_spwn = std::exchange(other.exec_spwn, nullptr);
       spwn = std::exchange(other.spwn, nullptr);
       data = std::exchange(other.data, nullptr);
@@ -107,8 +100,12 @@ struct SpwnJob : parlay::WorkStealingJob {
 
   // pretends a volatile SpwnJob is nonvolatile
   __attribute__((always_inline))
-  SpwnJob* pretend_nonvolatile() volatile noexcept {
-    return (SpwnJob*) this;
+  SpwnJob& pretend_nonvolatile() volatile noexcept {
+    return (SpwnJob&) *this;
+  }
+  
+  void consume_these_hbt() noexcept {
+    heartbeat_tokens = heartbeat_tokens - num_heartbeat_tokens;
   }
 
   using JobAllocator = parlay::type_allocator<SpwnJob>;
@@ -527,12 +524,6 @@ _Ret execute_lambda(void* f, _Args... args) {
   return (*_f)(args...);
 }
 
-template <typename _Fn, _Fn&& f>
-void execute_lambda2() {
-  static_assert(std::is_invocable_r_v<void, _Fn&>);
-  return f();
-}
-
 #ifndef FRAME_OFFSET
 #define FRAME_OFFSET(x) ((uintptr_t) __builtin_frame_address(0) - (uintptr_t) (x))
 #endif
@@ -556,7 +547,7 @@ static void manualProm(PromLambda&& prom, volatile bool& promotable_flag, volati
 // TODO: exception handling
 template <typename BodyLambda, typename PromLambda>
 //__attribute__((always_inline))
-static void spork2(volatile bool& promotable_flag, volatile uint& num_promotions,
+static void spork(volatile bool& promotable_flag, volatile uint& num_promotions,
                    BodyLambda&& body, PromLambda&& prom) {
   static_assert(std::is_invocable_v<BodyLambda&&>);
   static_assert(std::is_invocable_r_v<bool, PromLambda&&>);
@@ -595,24 +586,15 @@ static void spork2(volatile bool& promotable_flag, volatile uint& num_promotions
   spork_entry_t en =
     {&promotable_flag, &num_promotions, &prom, execute_lambda<bool, PromLambda>};
   {
-    decltype(prom)& another = prom;
     SporkEntry sporke(&en);
     if (heartbeat_tokens) [[unlikely]] {
-      manualProm(another, promotable_flag, num_promotions);
+      manualProm(prom, promotable_flag, num_promotions);
     }
     std::forward<BodyLambda>(body)();
   }
   (void) en; // TODO: can we remove this line?
 #endif
   return;
-}
-
-template <typename BodyLambda, typename PromLambda>
-__attribute__((always_inline))
-static void spork(BodyLambda&& body, PromLambda&& prom) {
-  volatile bool promotable_flag = true;
-  volatile uint num_promotions = 0;
-  spork2(promotable_flag, num_promotions, std::forward<BodyLambda>(body), std::forward<PromLambda>(prom));
 }
 
 template <typename LambdaL, typename LambdaR>
@@ -626,31 +608,32 @@ static void parSeq(LambdaL&& lamL, LambdaR&& lamR) {
 
 template <typename LambdaL, typename LambdaR>
 //__attribute__((always_inline))
-static void par(LambdaL&& lamL, LambdaR&& lamR) {
+static void par(const LambdaL&& lamL, LambdaR&& lamR) {
   static_assert(std::is_invocable_v<LambdaL&>);
   static_assert(std::is_invocable_v<LambdaR&>);
-  volatile SpwnJob jp;
+  
   volatile bool promotable = true;
   volatile uint num_promotions = 0;
-  // `lamR` wrapper
+  volatile SpwnJob jp;
   auto lamRw = [&] (void* null_data) { std::forward<LambdaR>(lamR)(); return nullptr; };
 
-  spork2(
+  spork(
     promotable,
     num_promotions,
-    std::forward<LambdaL>(lamL), // TODO: should this be forwarded?
+    std::forward<const LambdaL>(lamL), // TODO: should this be forwarded?
     [&] () {
-      *jp.pretend_nonvolatile() =
+      jp.pretend_nonvolatile() =
         SpwnJob(execute_lambda<void*, decltype(lamRw), void*>,
                 &lamRw, nullptr, heartbeat_tokens >> 1);
-      jp.pretend_nonvolatile()->enqueue();
+      jp.pretend_nonvolatile().consume_these_hbt();
+      jp.pretend_nonvolatile().enqueue();
       return false; // can do no more promotions here
     });
 
   if (promotable) [[likely]] { // unpromoted
     lamRw(nullptr);
   } else [[unlikely]] { // promoted
-    jp.pretend_nonvolatile()->wait_or_execute();
+    jp.pretend_nonvolatile().wait_or_execute();
   }
 }
 
@@ -713,81 +696,153 @@ A reduceSeq(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, uint j) {
   return a;
 }
 
-// template <typename A>
-// struct VolReduceData {
-//   volatile SpwnJob jpL, jpR;
-//   volatile bool promotable = false;
-//   volatile uint num_promotions = 0;
-//   volatile uint next_i, next_j;
-//   volatile A aL, aR;
-  
-// };
+template <typename A>
+struct ParforData {
+  bool promotable;
+  uint num_promotions;
+  SpwnJob jpL, jpR;
+  uint next_i, next_j;
+  A aL, aR;
+
+  ParforData() noexcept : promotable(true), num_promotions(0) {}
+
+  ParforData<A>& pretend_nonvolatile() volatile noexcept {
+    return *this;
+  }
+};
+
+template <>
+struct ParforData<void> {
+  bool promotable;
+  uint num_promotions;
+  SpwnJob jpL, jpR;
+  uint next_i, next_j;
+
+  ParforData() noexcept : promotable(true), num_promotions(0) {}
+
+  ParforData<void>& pretend_nonvolatile() volatile noexcept {
+    return (ParforData<void>&) *this;
+  }
+};
 
 // TODO: ideally, we just reserve enough space for spwn without initializing it,
 // then have the prom lambda write to spwn
 template <typename A, typename BodyLambda, typename CombLambda>
 __attribute__((always_inline)) // TODO: investigate what this attribute actually does
-A reduce(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, uint _j) {
+A parfor(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, uint _j) {
   static_assert(std::is_invocable_r_v<void, BodyLambda&, uint, A&>);
   static_assert(std::is_invocable_r_v<void, CombLambda&, A&, A>);
 
-  // TODO: consolidate these local vars
-  volatile bool promotable = true;
-  volatile uint num_promotions = 0;
-  volatile SpwnJob jpL, jpR;
-  volatile uint next_i, next_j;
-  volatile A aL, aR;
+  volatile ParforData<A> vpd;
   volatile uint j = _j;
 
   auto spwn =
     [&] (void* isLeft) {
-      uint mid = midpoint(next_i, next_j);
-      if (isLeft) {
-        aL = reduce(z, z, combine, body, next_i, mid);
-      } else {
-        aR = reduce(z, z, combine, body, mid, next_j);
-      }
+      uint mid = midpoint(vpd.next_i, vpd.next_j);
+      A& aLR = isLeft ? vpd.aL : vpd.aR;
+      uint ni = isLeft ? vpd.next_i : mid;
+      uint nj = isLeft ? mid : vpd.next_j;
+      aLR = parfor(z, z, combine, body, ni, nj);
       return nullptr;
     };
  
-  spork2(
-    promotable,
-    num_promotions,
+  spork(
+    vpd.promotable,
+    vpd.num_promotions,
     [&] () {
       for (; i < j; i++) {
         std::forward<BodyLambda>(body)(i, a);
       }
     },
     [&] () {
-      if (i >= j) { num_promotions = num_promotions - 1; return false; }
-      next_i = i + 1;
-      next_j = j;
-      j = next_i;
-      // *jpR.pretend_nonvolatile() =
-      //   SpwnJob(&execute_lambda2<decltype(spwn), spwn>,
-      //           &spwn, (void*) false, (heartbeat_tokens + 1) >> 1);
-      *jpR.pretend_nonvolatile() =
+      ParforData<A>& pd = vpd.pretend_nonvolatile();
+      if (i >= j) { pd.num_promotions--; return false; }
+      pd.next_i = i + 1;
+      pd.next_j = j;
+      j = pd.next_i;
+      pd.jpR =
         SpwnJob(&execute_lambda<void*, decltype(spwn), void*>,
                 &spwn, (void*) false, (heartbeat_tokens + 1) >> 1);
+      pd.jpR.consume_these_hbt();
       // TODO: check if work stealing deque is full before enqueueing
-      jpR.pretend_nonvolatile()->enqueue();
-      if (next_i >= midpoint(next_i, next_j)) { return false; }
-      *jpL.pretend_nonvolatile() =
+      pd.jpR.enqueue();
+      if (pd.next_i >= midpoint(pd.next_i, pd.next_j)) { return false; }
+      pd.jpL =
         SpwnJob(&execute_lambda<void*, decltype(spwn), void*>,
                 &spwn, (void*) true, heartbeat_tokens);
-      jpL.pretend_nonvolatile()->enqueue();
+      pd.jpL.consume_these_hbt();
+      pd.jpL.enqueue();
       return false;
     });
-  if (num_promotions) [[unlikely]] {
-    if (next_i < midpoint(next_i, next_j)) [[likely]] {
-      jpL.pretend_nonvolatile()->wait_or_execute();
-      std::forward<CombLambda>(combine)(a, aL);
+  if (vpd.num_promotions) [[unlikely]] {
+    ParforData<A>& rd = vpd.pretend_nonvolatile();
+    if (rd.next_i < midpoint(rd.next_i, rd.next_j)) [[likely]] {
+      rd.jpL.wait_or_execute();
+      std::forward<CombLambda>(combine)(a, rd.aL);
     }
-    jpR.pretend_nonvolatile()->wait_or_execute();
-    std::forward<CombLambda>(combine)(a, aR);
+    rd.jpR.wait_or_execute();
+    std::forward<CombLambda>(combine)(a, rd.aR);
   }
   //std::cout << i << " " << j << " " << next_i << " " << next_j << std::endl;
   return a;
+}
+
+template <typename BodyLambda>
+__attribute__((always_inline)) // TODO: investigate what this attribute actually does
+void parfor(BodyLambda&& body, uint i, uint _j) {
+  static_assert(std::is_invocable_r_v<void, BodyLambda&, uint>);
+
+  //static_assert(std::is_trivially_constructible<ParforData<void>>());
+
+  volatile ParforData<void> vpd;
+  volatile uint j = _j;
+
+  auto spwn =
+    [&] (void* isLeft) {
+      uint mid = midpoint(vpd.next_i, vpd.next_j);
+      if (isLeft) {
+        parfor(body, vpd.next_i, mid);
+      } else {
+        parfor(body, mid, vpd.next_j);
+      }
+      return nullptr;
+    };
+ 
+  spork(
+    vpd.promotable,
+    vpd.num_promotions,
+    [&] () {
+      for (; i < j; i++) {
+        std::forward<BodyLambda>(body)(i);
+      }
+    },
+    [&] () {
+      // vpd is nonvolatile inside signal handler
+      ParforData<void>& pd = vpd.pretend_nonvolatile();
+      if (i >= j) { pd.num_promotions--; return false; }
+      pd.next_i = i + 1;
+      pd.next_j = j;
+      j = pd.next_i;
+      pd.jpR =
+        SpwnJob(&execute_lambda<void*, decltype(spwn), void*>,
+                &spwn, (void*) false, (heartbeat_tokens + 1) >> 1);
+      // TODO: check if work stealing deque is full before enqueueing
+      pd.jpR.consume_these_hbt();
+      pd.jpR.enqueue();
+      if (pd.next_i >= midpoint(pd.next_i, pd.next_j)) { return false; }
+      pd.jpL =
+        SpwnJob(&execute_lambda<void*, decltype(spwn), void*>,
+                &spwn, (void*) true, heartbeat_tokens);
+      pd.jpL.consume_these_hbt();
+      pd.jpL.enqueue();
+      return false;
+    });
+  if (vpd.num_promotions) [[unlikely]] {
+    if (vpd.next_i < midpoint(vpd.next_i, vpd.next_j)) [[likely]] {
+      vpd.jpL.pretend_nonvolatile().wait_or_execute();
+    }
+    vpd.jpR.pretend_nonvolatile().wait_or_execute();
+  }
 }
 
 template <typename A, typename BodyLambda, typename CombLambda>
@@ -809,7 +864,12 @@ A reduceAlloc(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, uint _j
       return (void*) AAllocator::create(reduceAlloc(z, z, combine, body, midpoint(i2+1, j2), j2));
     });
 
+  volatile bool promotable_flag = true;
+  volatile uint num_promotions = 0;
+
   spork(
+    promotable_flag,
+    num_promotions,
     [&] () {
       for (; i < j; i++) {
         std::forward<BodyLambda&>(body)(i, a);
@@ -823,6 +883,7 @@ A reduceAlloc(A z, A a, CombLambda&& combine, BodyLambda&& body, uint i, uint _j
       j = midpoint(i+1, j);
       jp = SpwnJob::create(execute_lambda<void*, decltype(spwn), void*>,
                            &spwn, (void*) data, heartbeat_tokens >> 1, jp);
+      jp->consume_these_hbt();
       return j > i+1; // determine if more promotions are possible here
     });
 
@@ -867,6 +928,35 @@ void print_uint_arr(const uint* arr, uint len) {
   std::cout << "]";
 }
 
+template <typename F>
+__attribute__((always_inline))
+void p4(size_t s, size_t e, F&& f) {
+  //parlay::parallel_for(s, e, std::forward<F>(f), 1);
+  spork::parfor(std::forward<F>(f), s, e);
+}
+
+// template<typename A, typename Body, typename Combine>
+// auto parlayreduce(A z, const Body&& body, const Combine&& binop, uint i, uint j) {
+//   static_assert(std::is_invocable_r_v<void, Body&, uint, A&>);
+//   static_assert(std::is_invocable_r_v<void, Combine&, A&, A>);
+//   long n = j - i;
+//   long block_size = 100;
+//   if (n == 0) return z;
+//   if (n <= block_size) {
+//     A a = z;
+//     for (; i < j; i++)
+//       a = std::forward<Body>(body)(a, i);
+//     return a;
+//   }
+
+//   A L, R;
+//   parlay::par_do([&] {L = reduce(z, body, binop, i, i + ((j - i) >> 1));},
+//                  [&] {R = reduce(z, body, binop, i + ((j - i) >> 1), j);});
+//   std::forward<Combine>(binop)(L,R);
+//   return L;
+// }
+
+
 int main(int argc, char* argv[]) {
   // this might take a sec the first time it is called
   //spork::SpwnJob::get_current_scheduler();
@@ -896,20 +986,30 @@ int main(int argc, char* argv[]) {
     spork::start_heartbeats();
     
     auto start = std::chrono::steady_clock::now();
+    //parlay::parallel_for(0, n, [&] (uint i) { irregular_body(data, i, n); });
+    // p4(0, n, [&] (uint i) {
+    //   volatile char x = 0;
+    //   if (i < 10) {
+    //     p4(0, 10000000, [&] (uint j) { x = x + i*j; });
+    //   }
+    //   data[i] = x;
+    // });
+    // parlay::parallel_for(0, n*50, [&] (uint i) { data[i % n] = 5; });
+    // spork::parfor([&] (uint i) { data[i % n] = 5; }, 0, n*50);
     num total =
-      spork::reduce<num>(
-        0,
-        0,
-        [] (num& a, num b) { a += b; },
-        [&] (uint i, num& a) { a += data[i % n]; },
-        0, n*50);
-      // spork::fib(40);
+    //   spork::reduce<num>(
+    //     0,
+    //     0,
+    //     [] (num& a, num b) { a += b; },
+    //     [&] (uint i, num& a) { a += data[i % n]; },
+    //     0, n*50);
+      spork::fib(40);
     auto end = std::chrono::steady_clock::now();
 
     spork::pause_heartbeats();
     
     auto time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-    std::cout << total << " in " << time_ms << " ms";
+    std::cout << /*(uint) data[n - 1]*/ total << " in " << time_ms << " ms";
 #if RECORD_HEARTBEAT_STATS
     std::cout <" (";
     print_uint_arr((uint*) spork::num_heartbeats, spork::SpwnJob::num_workers());

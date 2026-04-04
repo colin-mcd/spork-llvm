@@ -4,14 +4,18 @@
 #include "parlay/monoid.h"
 
 #include <atomic>
-//#include <sys/cdefs.h>
+#include <libunwind.h>
+#include <sys/cdefs.h>
 #include <type_traits>
 
 //#include <linux/perf_event.h>
 //#include <sys/ioctl.h>
 //#include <fcntl.h>
 
-#define RECORD_HEARTBEAT_STATS 1
+// TODO: consider a (libunwind) setjmp/longjmp based implementation
+// TODO: libunwind implementation broken for any (heterogenous) nested parallelism
+#define PROM_USE_LIBUNWIND 0
+#define RECORD_HEARTBEAT_STATS 0
 
 // TODO: consistent name casing (camel or snake)
 // TODO: consider adaptive heartbeat timer intervals
@@ -120,7 +124,120 @@ struct WorkStealingJob {
   uint hbt; // heartbeat tokens
 };
 
+typedef uint_fast8_t spork_slot_idx_t;
+
+struct spork_entry_t {
+  volatile bool* promotable_flag;
+  void* prom;
+  bool (*exec_prom)(void* prom);
+  
+  spork_entry_t offset(unw_word_t bp) const noexcept {
+    return {
+      (volatile bool*) (bp - (unw_word_t) promotable_flag),
+      (void*) (bp - (unw_word_t) prom),
+      exec_prom
+    };
+  }
+};
+
+struct spork_row_t {
+  // number of sporks this code location is nested inside
+  const spork_slot_idx_t num_sporks;
+  // num_sporks-length array of (promoted, spwn) offsets
+  const spork_entry_t* sporks;
+};
+
 // TODO: make sure prom doesn't throw any exceptions
+void do_promotion(const spork_entry_t& slot) noexcept {
+  heartbeat_tokens = heartbeat_tokens - 1;
+  // run slot's prom function,
+  // then update if this spork is promotable any further
+  *slot.promotable_flag = slot.exec_prom(slot.prom);
+}
+
+#if PROM_USE_LIBUNWIND
+constinit volatile bool* ad_hoc_promotable_flag = nullptr;
+constinit void* ad_hoc_prom;
+constinit bool (*ad_hoc_exec_prom)(void*);
+constinit void* ad_hoc_spork_ip_min = nullptr;
+constinit void* ad_hoc_spork_ip_max = nullptr;
+
+extern void __RECORD_SPORK
+  (void* promotable_flag,
+   void* prom,
+   void* exec_prom,
+   void* beg,
+   void* end) noexcept {};
+
+constinit spork_entry_t colin_default = {};
+constinit spork_row_t colin_default_row = {1, &colin_default};
+void set_colin_default() {
+  colin_default = {
+    ad_hoc_promotable_flag,
+    ad_hoc_prom,
+    ad_hoc_exec_prom
+  };
+}
+spork_row_t* spork_table_lookup_ip(unw_word_t ip) {
+  void* _ip = (void*) ip;
+  if (ad_hoc_spork_ip_min <= _ip && _ip <= ad_hoc_spork_ip_max) return &colin_default_row;
+  else return nullptr;
+}
+void promote_h(unw_cursor_t& cursor, unw_context_t& uc) noexcept {
+  if (heartbeat_tokens == 0) return;
+  unw_word_t frame_ip, frame_sp, frame_bp;
+  const spork_row_t* row;
+
+  // find first stack frame with sporks
+  while (unw_step(&cursor) > 0) {
+    // get stored register values for this stack frame
+    unw_get_reg(&cursor, UNW_REG_SP, &frame_sp);
+    unw_get_reg(&cursor, UNW_REG_IP, &frame_ip);
+    unw_get_reg(&cursor, UNW_X86_64_RBP, &frame_bp);
+
+    row = spork_table_lookup_ip(frame_ip);
+    if ((row != nullptr) && (row->num_sporks > 0)) break;
+  }
+
+  if (row == nullptr) return;
+
+  bool frame_has_promoted_slots = false;
+
+  // inspect each spork slot
+  for (spork_slot_idx_t slot_idx = 0;
+       slot_idx < row->num_sporks && heartbeat_tokens > 0;
+       slot_idx++) {
+    spork_entry_t slot = row->sporks[slot_idx].offset(frame_bp);
+  
+    frame_has_promoted_slots |= !*slot.promotable_flag;
+    if (*slot.promotable_flag) {
+      // this slot is not yet promoted
+  
+      // try promoting above us first,
+      // unless we already passed a promoted slot in this for loop
+      if (!frame_has_promoted_slots) {
+        promote_h(cursor, uc);
+      }
+  
+      if (heartbeat_tokens > 0) {
+        do { do_promotion(slot); }
+        while (heartbeat_tokens > 0 && *slot.promotable_flag);
+        frame_has_promoted_slots = true;
+      }
+    }
+  }
+}
+
+__attribute__((noinline))
+void promote() noexcept {
+  set_colin_default();
+  unw_cursor_t cursor;
+  unw_context_t uc;
+  unw_getcontext(&uc);
+  unw_init_local(&cursor, &uc);
+  promote_h(cursor, uc);
+}
+#else
 struct PromFn {
   virtual bool operator()() = 0;
 };
@@ -160,10 +277,7 @@ struct SporkSlot {
 
   // TODO: casting from const to non-const might cause issues?
   // not sure bc theoretically it shouldn't change the promfn
-  void promote() {
-    heartbeat_tokens = heartbeat_tokens - 1;
-    *prom_flag = (*((PromFn*) promfn))();
-  }
+  void promote() { *prom_flag = (*((PromFn*) promfn))(); }
   bool promotable() volatile { return *prom_flag; }
   static void promote_top();
 };
@@ -216,6 +330,20 @@ void SporkSlot::promote_top() {
     }
   }
 }
+#endif
+
+
+// Repeatedly tries to consume 1 heartbeat token until failure,
+// returning number of times this was successful
+// __attribute__((always_inline))
+// void try_consume_tokens() noexcept {
+//   if (heartbeat_tokens) [[unlikely]] {
+//     //promotes_until_failure();
+//     manual_heartbeat = true;
+//     std::raise(SIGALRM);
+//   }
+// }
+
 
 #if RECORD_HEARTBEAT_STATS
 volatile uint* num_heartbeats = nullptr;
@@ -225,7 +353,7 @@ void init_heartbeat_stats() {
   static bool initialized = false;
   if (!initialized) {
     initialized = true;
-    uint nw = parlay::internal::init_num_workers();
+    uint nw = 8; //internal::init_num_workers();
     num_heartbeats = new uint[nw];
     missed_heartbeats = new uint[nw];
     for (uint wi = 0; wi < nw; wi++) {
@@ -236,7 +364,7 @@ void init_heartbeat_stats() {
 }
 
 void reset_heartbeat_stats() {
-  uint nw = WorkStealingJob::num_workers();
+  uint nw = SpwnJob::num_workers();
   for (uint wi = 0; wi < nw; wi++) {
     num_heartbeats[wi] = 0;
     missed_heartbeats[wi] = 0;
@@ -252,18 +380,20 @@ void heartbeat_handler(int sig) {
   int saved_errno = errno;
   if (!disable_heartbeats) {
 #if RECORD_HEARTBEAT_STATS
-    volatile uint& hbs = num_heartbeats[spork::WorkStealingJob::worker_id()];
-    hbs = hbs + 1;
+    num_heartbeats[spork::SpwnJob::worker_id()]++;
 #endif
     heartbeat_tokens = heartbeat_tokens + TOKENS_PER_HEARTBEAT;
     if (heartbeat_tokens > MAX_HEARTBEAT_TOKENS) {
       heartbeat_tokens = MAX_HEARTBEAT_TOKENS;
     }
+#if PROM_USE_LIBUNWIND
+    promote();
+#else
     SporkSlot::promote_top();
+#endif
   } else {
 #if RECORD_HEARTBEAT_STATS
-    volatile uint& mhbs = missed_heartbeats[spork::WorkStealingJob::worker_id()];
-    mhbs = mhbs + 1;
+    missed_heartbeats[spork::SpwnJob::worker_id()]++;
 #endif
   }
   errno = saved_errno;
@@ -287,7 +417,9 @@ void start_heartbeats() noexcept {
     //heartbeat_tokens = 0;
     //disable_heartbeats = false;
     
+#if !PROM_USE_LIBUNWIND
     spork_stack_bot = &spork_stack_top;
+#endif
 
     struct sigaction sa = {};
     //sa.sa_sigaction = heartbeat_handler;
@@ -315,6 +447,13 @@ void pause_heartbeats() noexcept {
   timer_settime(heartbeat_timer, 0, &heartbeat_its_zero, nullptr);
 }
 
+// TODO: need to do this for every thread
+// int stop_heartbeats() noexcept {
+//   int r = timer_delete(heartbeat_timer);
+//   heartbeats_running = false;
+//   return r;
+// }
+
 // x must be a pointer to something invocable
 // which returns a Result
 template <typename _Ret, typename _Fn, typename... _Args>
@@ -331,6 +470,10 @@ void execute_lambda2(void* f, _Args... args) {
   (*_f)(args...);
 }
 
+#ifndef FRAME_OFFSET
+#define FRAME_OFFSET(x) ((uintptr_t) __builtin_frame_address(0) - (uintptr_t) (x))
+#endif
+
 template <typename PromLambda>
 static void manualProm(PromLambda&& prom, volatile bool& promotable_flag) {
   // save
@@ -345,6 +488,55 @@ static void manualProm(PromLambda&& prom, volatile bool& promotable_flag) {
   // restore
   disable_heartbeats = before;
 }
+
+// // TODO: exception handling
+// template <typename BodyLambda, typename PromLambda>
+// //__attribute__((always_inline))
+// static void spork(volatile bool& promotable_flag, BodyLambda&& body, PromLambda&& prom) {
+//   static_assert(std::is_invocable_v<BodyLambda&&>);
+//   static_assert(std::is_invocable_r_v<bool, PromLambda&&>);
+
+// #if PROM_USE_LIBUNWIND
+//   if (ad_hoc_promotable_flag == nullptr) {
+//     ad_hoc_promotable_flag = (volatile bool*) FRAME_OFFSET(&promotable_flag);
+//     ad_hoc_prom = (void*) FRAME_OFFSET(&prom);
+//     ad_hoc_exec_prom = &execute_lambda<bool, PromLambda>;
+//     ad_hoc_spork_ip_min = &&begin_body;
+//     ad_hoc_spork_ip_max = &&end_body;
+//   }
+//   begin_body:
+//   {
+//     // __attribute__((annotate("spork_range", (void*) execute_lambda<bool, PromLambda>)))
+//     //   void* thisspork[3] = {(void*) &promotable_flag,
+//     //                         (void*) &prom};
+//     if (heartbeat_tokens) [[unlikely]] {
+//       manualProm(prom, promotable_flag);
+//     }
+//     std::forward<BodyLambda>(body)();
+//   }
+//   end_body:
+//   // __RECORD_SPORK(ad_hoc_promotable_flag, (void*) &prom, ad_hoc_exec_prom);
+//   // TODO: check if using these labels is too brittle;
+//   // could some optimization passes move blocks into/out of the begin-end range?
+//   __RECORD_SPORK((void*) &promotable_flag,
+//                  (void*) &prom,
+//                  (void*) &execute_lambda<bool, PromLambda>,
+//                  &&begin_body,
+//                  &&end_body);
+// #else
+//   spork_entry_t en =
+//     {&promotable_flag, &prom, execute_lambda<bool, PromLambda>};
+//   {
+//     SporkEntry sporke(&en);
+//     if (heartbeat_tokens) [[unlikely]] {
+//       manualProm(prom, promotable_flag);
+//     }
+//     std::forward<BodyLambda>(body)();
+//   }
+//   (void) en; // TODO: can we remove this line?
+// #endif
+//   return;
+// }
 
 // TODO: exception handling
 template <typename BodyLambda, typename PromLambda>
@@ -624,16 +816,6 @@ void print_uint_arr(const uint* arr, uint len) {
   std::cout << "]";
 }
 
-void print_uint_avg(const uint* arr, uint len) {
-  if (arr && len) {
-    uint total = 0;
-    for (uint i = 0; i < len; i++) total += arr[i];
-    std::cout << (total / len) << " avg";
-  } else {
-    std::cout << "NaN avg";
-  }
-}
-
 template <typename F>
 __attribute__((always_inline))
 void p4(size_t s, size_t e, F&& f) {
@@ -722,11 +904,11 @@ int main(int argc, char* argv[]) {
     auto time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
     std::cout << /*(uint) data[n - 1]*/ total << " in " << time_ms << " ms";
 #if RECORD_HEARTBEAT_STATS
-    std::cout <<" (";
-    print_uint_avg((uint*) spork::num_heartbeats, spork::WorkStealingJob::num_workers());
+    std::cout <" (";
+    print_uint_arr((uint*) spork::num_heartbeats, spork::SpwnJob::num_workers());
     std::cout << " heartbeats, ";
-    print_uint_avg((uint*) spork::missed_heartbeats, spork::WorkStealingJob::num_workers());
-    std::cout << " missed during eager proms)";
+    print_uint_arr((uint*) spork::missed_heartbeats, spork::SpwnJob::num_workers());
+    std::cout << " missed)";
 #endif
     std::cout << std::endl;
     if (r >= WARMUP) total_time += time_ms;

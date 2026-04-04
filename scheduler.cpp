@@ -534,26 +534,26 @@ static void parSeq(LambdaL&& lamL, LambdaR&& lamR) {
 
 template <typename LambdaL, typename LambdaR>
 //__attribute__((always_inline))
-static void par(LambdaL&& lamL, LambdaR&& lamR) {
-  static_assert(std::is_invocable_v<LambdaL&>);
-  static_assert(std::is_invocable_v<LambdaR&>);
+static void par(const LambdaL&& lamL, const LambdaR&& lamR) {
+  static_assert(std::is_invocable_v<const LambdaL&>);
+  static_assert(std::is_invocable_v<const LambdaR&>);
   
   struct SpwnJob : WorkStealingJob {
-    LambdaR&& lamR;
+    const LambdaR&& lamR;
     void run() override {
-      std::forward<LambdaR>(lamR)();
+      std::forward<const LambdaR>(lamR)();
     }
     
-    SpwnJob(LambdaR&& lamR) : WorkStealingJob(), lamR(std::forward<LambdaR>(lamR)) {}
-    SpwnJob(SpwnJob&& other) : WorkStealingJob(std::forward<SpwnJob>(other)), lamR(std::forward<LambdaR>(other.lamR)) {}
+    SpwnJob(const LambdaR&& lamR) : WorkStealingJob(), lamR(std::forward<const LambdaR>(lamR)) {}
+    SpwnJob(SpwnJob&& other) : WorkStealingJob(std::forward<SpwnJob>(other)), lamR(std::forward<const LambdaR>(other.lamR)) {}
   };
   
   volatile bool promotable = true;
-  volatile SpwnJob jp(std::forward<LambdaR>(lamR));
+  volatile SpwnJob jp(std::forward<const LambdaR>(lamR));
 
   spork(
     promotable,
-    std::forward<LambdaL>(lamL), // TODO: should this be forwarded?
+    std::forward<const LambdaL>(lamL), // TODO: should this be forwarded?
     [&] () {
       SpwnJob& jpnv = *((SpwnJob*) &jp);
       //jpnv.done = false;
@@ -565,7 +565,7 @@ static void par(LambdaL&& lamL, LambdaR&& lamR) {
     });
 
   if (promotable) [[likely]] { // unpromoted
-    std::forward<LambdaR>(jp.lamR)();
+    std::forward<const LambdaR>(jp.lamR)();
   } else [[unlikely]] { // promoted
     SpwnJob& jpnv = *((SpwnJob*) &jp);
     jpnv.sync();
@@ -852,11 +852,11 @@ int main(int argc, char* argv[]) {
     // parlay::parallel_for(0, n*50, [&] (uint i) { data[i % n] = 5; });
     // spork::parfor([&] (uint i) { data[i % n] = 5; }, 0, n*50);
     num total =
-      spork::parfor(
-        parlay::plus<num>(),
-        [&] (uint i, num& a) { a += data[i % n]; },
-        0, n*50);
-      // spork::fib(40);
+      // spork::parfor(
+      //   parlay::plus<num>(),
+      //   [&] (uint i, num& a) { a += data[i % n]; },
+      //   0, n*50);
+      spork::fib(40);
     auto end = std::chrono::steady_clock::now();
 
     spork::pause_heartbeats();

@@ -560,7 +560,7 @@ void parfor(const BodyLambda&& body, uint i, uint _j) {
       l.enqueue();
     });
   if (!promotable) [[unlikely]] {
-    if (l.i < l.j) [[likely]] l.sync();
+    if (l.i < l.j) [[unlikely]] l.sync();
     if (r.i < r.j) [[likely]] r.sync();
   }
 }
@@ -569,10 +569,11 @@ uint fibSeq(uint n) {
   if (n <= 1) {
     return n;
   } else {
-    uint l, r;
-    parSeq([&, n] () {l = fibSeq(n - 1);},
-           [&, n] () {r = fibSeq(n - 2);});
-    return l + r;
+    return fibSeq(n-1) + fibSeq(n-2);
+    // uint l, r;
+    // parSeq([&, n] () {l = fibSeq(n - 1);},
+    //        [&, n] () {r = fibSeq(n - 2);});
+    // return l + r;
   }
 }
 
@@ -648,9 +649,6 @@ void p4(size_t s, size_t e, F&& f) {
 
 
 int main(int argc, char* argv[]) {
-  // this might take a sec the first time it is called
-  //spork::SpwnJob::get_current_scheduler();
-
   //size_t n = atoi(argv[1]);
   constexpr uint n = 8000000;
   char data[n];
@@ -658,6 +656,7 @@ int main(int argc, char* argv[]) {
     data[i] = 1 + (i % 5);
   }
 
+  // this might take a sec the first time it is called
   spork::WorkStealingJob::get_current_scheduler();
 #if RECORD_HEARTBEAT_STATS
   spork::init_heartbeat_stats();
@@ -698,7 +697,7 @@ int main(int argc, char* argv[]) {
       //   parlay::plus<num>(),
       //   [&] (uint i, num& a) { a += data[i % n]; },
       //   0, n*50);
-      spork::fibParlay(40);
+      spork::fibSeq(40);
     auto end = std::chrono::steady_clock::now();
 
     spork::pause_heartbeats();

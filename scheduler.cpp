@@ -604,19 +604,19 @@ constexpr static const uint midpoint(uint i, uint j) noexcept {
 //   return fd;
 // }
 
-// template <typename A, typename BodyLambda, typename CombLambda>
-// __attribute__((always_inline)) // TODO: investigate what this attribute actually does
-// A parforSeq(const BinaryOp&& binop, const BodyLambda&& body, uint i, uint j) {
-//   static_assert(std::is_invocable_r_v<void, BodyLambda&, uint, A&>);
-//   static_assert(std::is_invocable_r_v<void, CombLambda&, A&, A>);
-//   for (; i < j; i++) {
-//     std::forward<BodyLambda>(body)(i, a);
-//   }
-//   return a;
-// }
+template <typename BodyLambda, typename BinaryOp>
+__attribute__((always_inline)) // TODO: investigate what this attribute actually does
+parlay::monoid_value_type_t<BinaryOp> parforSeq(const BinaryOp&& binop, const BodyLambda&& body, uint i, uint j) {
+  using A = parlay::monoid_value_type_t<BinaryOp>;
+  static_assert(std::is_invocable_r_v<void, BodyLambda&, uint, A&>);
+  static_assert(parlay::is_monoid_v<BinaryOp>);
 
-// TODO: ideally, we just reserve enough space for spwn without initializing it,
-// then have the prom lambda write to spwn
+  A a = binop.identity;
+  for (; i < j; i++)
+    std::forward<const BodyLambda>(body)(i, a);
+  return a;
+}
+
 template <typename BodyLambda, typename BinaryOp>
 __attribute__((always_inline)) // TODO: investigate what this attribute actually does
 parlay::monoid_value_type_t<BinaryOp> parfor(const BinaryOp&& binop, const BodyLambda&& body, uint i, uint _j) {
@@ -764,6 +764,13 @@ int main(int argc, char* argv[]) {
 #endif
   
   using num = unsigned long long;
+
+  // num total = 0;
+  // volatile uint j = n*50;
+  // for (uint i = 0; i < j; i++) {
+  //   total += data[i % n];
+  // }
+  // std::cout << total << std::endl;
   
   auto total_time = 0;
   constexpr uint WARMUP = 10;

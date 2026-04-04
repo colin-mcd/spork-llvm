@@ -74,18 +74,18 @@ struct WorkStealingJob {
     get_current_scheduler().spawn(this);
   }
 
-  bool try_dequeue() {
+  static bool try_dequeue() {
     return get_current_scheduler().get_own_job() != nullptr;
   }
 
-  void fast_clone() {
-    heartbeat_tokens = heartbeat_tokens + hbt;
+  void fast_clone(bool reclaim_tokens) {
+    if (reclaim_tokens) heartbeat_tokens = heartbeat_tokens + hbt;
     run();
   }
 
-  void sync() {
+  void sync(bool reclaim_tokens) {
     if (try_dequeue()) { // unstolen
-      fast_clone();
+      fast_clone(reclaim_tokens);
     } else { // stolen
       // since we ALWAYS promote innermost-first,
       // all potential parallelism is fully promoted by now
@@ -115,49 +115,47 @@ struct WorkStealingJob {
 
 // TODO: make sure prom doesn't throw any exceptions
 struct PromFn {
-  virtual bool operator()() = 0;
+  virtual void operator()() = 0;
 };
 
 struct SporkSlot {
   // TODO: consider making `prom_flag` not a pointer,
   // storing `spork`'s `volatile bool promotable_flag` inside this struct
   // TODO: otherwise, we can probably view this as nonvolatile from this struct
-  volatile bool* const prom_flag;
-  const PromFn* const promfn;
+  volatile bool promoted;
+  const PromFn* promfn;
   SporkSlot* volatile next;
   SporkSlot* volatile prev;
 
-  explicit SporkSlot(volatile bool* _prom_flag, const PromFn* _promfn);
-  explicit SporkSlot(volatile bool* _prom_flag, const PromFn* _promfn,
-                     SporkSlot* _next, SporkSlot* _prev) :
-    prom_flag(_prom_flag),
+  explicit SporkSlot(const PromFn* _promfn);
+  explicit SporkSlot(const PromFn* _promfn, SporkSlot* _next, SporkSlot* _prev) :
+    promoted(false),
     promfn(_promfn),
     next(_next),
     prev(_prev) {}
   explicit SporkSlot(const SporkSlot& other) :
-    prom_flag(other.prom_flag),
+    promoted(other.promoted),
     promfn(other.promfn),
     next(other.next),
     prev(other.prev) {}
   explicit SporkSlot(SporkSlot&& other) :
-    prom_flag(std::forward<volatile bool* const>(other.prom_flag)),
+    promoted(other.promoted),
     promfn(std::forward<const PromFn* const>(other.promfn)),
     next(std::forward<SporkSlot* volatile>(other.next)),
     prev(std::forward<SporkSlot* volatile>(other.prev)) {};
   // sentinel spork slot for `spork_stack_top`
   consteval explicit SporkSlot() :
-    prom_flag(nullptr), promfn(nullptr), next(nullptr), prev(nullptr) {}
+    promoted(true), promfn(nullptr), next(nullptr), prev(nullptr) {}
 
   // NOTE: `this` *must* be the slot at `spork_stack_bot`
-  ~SporkSlot();
+  bool close();
 
-  // TODO: casting from const to non-const might cause issues?
-  // not sure bc theoretically it shouldn't change the promfn
   void promote() {
+    //assert(promotable);
     heartbeat_tokens = heartbeat_tokens - 1;
-    *prom_flag = (*((PromFn*) promfn))();
+    promoted = true;
+    (*((PromFn*) promfn))();
   }
-  bool promotable() volatile { return *prom_flag; }
   static void promote_top();
 };
 
@@ -169,25 +167,26 @@ constinit thread_local SporkSlot* volatile spork_stack_bot;
 // If we try to change `spork_stack_bot` in the signal handler,
 // it can cause issues because it is a (nonatomic) thread_local variable,
 // and therefore a write may not be compiled to a single instruction.
-SporkSlot::SporkSlot(volatile bool* _promotable, const PromFn* _promfn)
-  : prom_flag(_promotable), promfn(_promfn), prev(spork_stack_bot) {
+SporkSlot::SporkSlot(const PromFn* _promfn)
+  : promoted(false), promfn(_promfn), prev(spork_stack_bot) {
   prev->next = this;
   // now commit these changes to the spork stack, allowing promotions
   spork_stack_bot = this;
 }
 
 // NOTE: `this` *must* be the slot at `spork_stack_bot`
-SporkSlot::~SporkSlot() {
+bool SporkSlot::close() {
   // TODO idea: just disable heartbeats for this and also constructor above,
   // then perhaps we can remove promoted slots from the spork stack?
   spork_stack_bot = prev;
+  return promoted;
 }
 
 void SporkSlot::promote_top() {
   if (&spork_stack_top == spork_stack_bot) return;
   SporkSlot* slot = spork_stack_top.next;
   while (heartbeat_tokens) {
-    if (slot->promotable()) {
+    if (!slot->promoted) {
       slot->promote();
       // if this slot can no longer be promoted,
       // we can skip it next time we search
@@ -306,14 +305,15 @@ void pause_heartbeats() noexcept {
 }
 
 template <typename PromLambda>
-void manualProm(const PromLambda&& prom, volatile bool& promotable_flag) {
+void manualProm(const PromLambda&& prom, volatile bool& promoted) {
   // save
   bool before = disable_heartbeats;
   disable_heartbeats = true;
   // now check again to make sure a signal didn't eat all the tokens
-  while (heartbeat_tokens && promotable_flag) {
+  while (heartbeat_tokens && !promoted) {
     heartbeat_tokens = heartbeat_tokens - 1;
-    promotable_flag = std::forward<const PromLambda>(prom)();
+    promoted = true;
+    std::forward<const PromLambda>(prom)();
     //spork_stack_top.next = spork_stack_bot;
   }
   // restore
@@ -323,27 +323,26 @@ void manualProm(const PromLambda&& prom, volatile bool& promotable_flag) {
 // TODO: exception handling
 template <typename BodyLambda, typename PromLambda>
 //__attribute__((always_inline))
-void spork(volatile bool& promotable_flag, const BodyLambda&& body, const PromLambda&& prom) {
+bool spork(const BodyLambda&& body, const PromLambda&& prom) {
   static_assert(std::is_invocable_v<BodyLambda&&>);
-  static_assert(std::is_invocable_r_v<bool, PromLambda&&>);
+  static_assert(std::is_invocable_v<PromLambda&&>);
 
   struct PromSpork : PromFn {
     const PromLambda&& prom;
     PromSpork(const PromLambda&& _prom) :
       prom(std::forward<const PromLambda>(_prom)) {}
-    bool operator()() override {
-      return std::forward<const PromLambda>(prom)();
+    void operator()() override {
+      std::forward<const PromLambda>(prom)();
     }
   };
   const PromSpork promfn(std::forward<const PromLambda>(prom));
 
-  {
-    SporkSlot slot(&promotable_flag, &promfn);
-    if (heartbeat_tokens) [[unlikely]] {
-      manualProm(std::forward<const PromLambda>(prom), promotable_flag);
-    }
-    std::forward<const BodyLambda>(body)();
+  SporkSlot slot(&promfn);
+  if (heartbeat_tokens) [[unlikely]] {
+    manualProm(std::forward<const PromLambda>(prom), slot.promoted);
   }
+  std::forward<const BodyLambda>(body)();
+  return slot.close();
 }
 
 template <typename LambdaL, typename LambdaR>
@@ -371,11 +370,9 @@ void par(const LambdaL&& lamL, const LambdaR&& lamR) {
     SpwnJob(SpwnJob&& other) : WorkStealingJob(std::forward<SpwnJob>(other)), lamR(std::forward<const LambdaR>(other.lamR)) {}
   };
   
-  volatile bool promotable = true;
   volatile SpwnJob jp(std::forward<const LambdaR>(lamR));
 
-  spork(
-    promotable,
+  bool promoted = spork(
     std::forward<const LambdaL>(lamL),
     [&] () {
       SpwnJob& jpnv = *((SpwnJob*) &jp);
@@ -383,14 +380,12 @@ void par(const LambdaL&& lamL, const LambdaR&& lamR) {
       jpnv.hbt = heartbeat_tokens >> 1;
       jpnv.consume_these_hbt();
       jpnv.enqueue();
-      return false; // can do no more promotions here
     });
 
-  if (promotable) [[likely]] { // unpromoted
+  if (promoted) [[unlikely]] { // promoted
+    ((SpwnJob*) &jp)->sync(false);
+  } else [[likely]] { // unpromoted
     std::forward<const LambdaR>(jp.lamR)();
-  } else [[unlikely]] { // promoted
-    SpwnJob& jpnv = *((SpwnJob*) &jp);
-    jpnv.sync();
   }
 }
 
@@ -427,8 +422,8 @@ constexpr static const uint midpoint(uint i, uint j) noexcept {
 // }
 
 template <typename BodyLambda, typename BinaryOp>
-__attribute__((always_inline)) // TODO: investigate what this attribute actually does
-parlay::monoid_value_type_t<BinaryOp> parforSeq(const BinaryOp&& binop, const BodyLambda&& body, uint i, uint j) {
+__attribute__((always_inline))
+parlay::monoid_value_type_t<BinaryOp> seqfor(const BinaryOp&& binop, const BodyLambda&& body, uint i, uint j) {
   using A = parlay::monoid_value_type_t<BinaryOp>;
   static_assert(std::is_invocable_r_v<void, BodyLambda&, uint, A&>);
   static_assert(parlay::is_monoid_v<BinaryOp>);
@@ -437,6 +432,14 @@ parlay::monoid_value_type_t<BinaryOp> parforSeq(const BinaryOp&& binop, const Bo
   for (; i < j; i++)
     std::forward<const BodyLambda>(body)(i, a);
   return a;
+}
+
+template <typename BodyLambda>
+__attribute__((always_inline))
+void seqfor(const BodyLambda&& body, uint i, uint j) {
+  static_assert(std::is_invocable_r_v<void, BodyLambda&, uint>);
+  for (; i < j; i++)
+    std::forward<const BodyLambda>(body)(i);
 }
 
 template <typename BodyLambda, typename BinaryOp>
@@ -459,12 +462,10 @@ parlay::monoid_value_type_t<BinaryOp> parfor(const BinaryOp&& binop, const BodyL
 
   SpwnJob l(std::forward<const BinaryOp>(binop), std::forward<const BodyLambda>(body));
   SpwnJob r(std::forward<const BinaryOp>(binop), std::forward<const BodyLambda>(body));
-  volatile bool promotable = true;
   volatile uint j = _j;
   A a = binop.identity;
 
-  spork(
-    promotable,
+  bool promoted = spork(
     [&] () {
       for (; i < j; i++) {
         std::forward<const BodyLambda>(body)(i, a);
@@ -473,7 +474,7 @@ parlay::monoid_value_type_t<BinaryOp> parfor(const BinaryOp&& binop, const BodyL
     [&] () {
       uint _i = i + 1;
       uint _j = j;
-      if (_i >= _j) { r.i = r.j = 0; l.i = l.j = 0; return false; }
+      if (_i >= _j) { r.i = r.j = 0; l.i = l.j = 0; return; }
       uint mid = midpoint(_i, _j);
       j = _i;
 
@@ -486,22 +487,21 @@ parlay::monoid_value_type_t<BinaryOp> parfor(const BinaryOp&& binop, const BodyL
 
       // TODO: check if work stealing deque is full before enqueueing
 
-      if (_i >= mid) { l.i = l.j = 0; return false; }
+      if (_i >= mid) { l.i = l.j = 0; return; }
       l.done.store(false, std::memory_order_relaxed);
       l.hbt = heartbeat_tokens;
       l.i = _i;
       l.j = mid;
       l.consume_these_hbt();
       l.enqueue();
-      return false;
     });
-  if (!promotable) [[unlikely]] {
+  if (promoted) [[unlikely]] {
     if (l.i < l.j) [[likely]] {
-      l.sync();
+      l.sync(true);
       a = binop(a, l.a);
     }
     if (r.i < r.j) [[likely]] {
-      r.sync();
+      r.sync(false);
       a = binop(a, r.a);
     }
   }
@@ -538,7 +538,7 @@ void parfor(const BodyLambda&& body, uint i, uint _j) {
     [&] () {
       uint _i = i + 1;
       uint _j = j;
-      if (_i >= _j) { r.i = r.j = 0; l.i = l.j = 0; return false; }
+      if (_i >= _j) { r.i = r.j = 0; l.i = l.j = 0; return; }
       uint mid = midpoint(_i, _j);
       j = _i;
 
@@ -551,14 +551,13 @@ void parfor(const BodyLambda&& body, uint i, uint _j) {
 
       // TODO: check if work stealing deque is full before enqueueing
 
-      if (_i >= mid) { l.i = l.j = 0; return false; }
+      if (_i >= mid) { l.i = l.j = 0; return; }
       l.done.store(false, std::memory_order_relaxed);
       l.hbt = heartbeat_tokens;
       l.i = _i;
       l.j = mid;
       l.consume_these_hbt();
       l.enqueue();
-      return false;
     });
   if (!promotable) [[unlikely]] {
     if (l.i < l.j) [[likely]] l.sync();
@@ -573,6 +572,17 @@ uint fibSeq(uint n) {
     uint l, r;
     parSeq([&, n] () {l = fibSeq(n - 1);},
            [&, n] () {r = fibSeq(n - 2);});
+    return l + r;
+  }
+}
+
+uint fibParlay(uint n) {
+  if (n <= 1) {
+    return n;
+  } else {
+    uint l, r;
+    parlay::par_do([&, n] () {l = fibParlay(n - 1);},
+                   [&, n] () {r = fibParlay(n - 2);});
     return l + r;
   }
 }
@@ -688,7 +698,7 @@ int main(int argc, char* argv[]) {
       //   parlay::plus<num>(),
       //   [&] (uint i, num& a) { a += data[i % n]; },
       //   0, n*50);
-      spork::fib(40);
+      spork::fibParlay(40);
     auto end = std::chrono::steady_clock::now();
 
     spork::pause_heartbeats();

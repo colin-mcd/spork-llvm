@@ -4,7 +4,6 @@
 #include "parlay/monoid.h"
 
 #include <atomic>
-//#include <sys/cdefs.h>
 #include <type_traits>
 
 //#include <linux/perf_event.h>
@@ -16,8 +15,6 @@
 // TODO: consistent name casing (camel or snake)
 // TODO: consider adaptive heartbeat timer intervals
 // TODO: look into if loop unrolling is why reduce is slower than reduceSeq
-
-//using namespace parlay;
 
 namespace spork {
 
@@ -34,7 +31,7 @@ constinit thread_local volatile bool disable_heartbeats = false;
 void start_heartbeats() noexcept;
 void pause_heartbeats() noexcept;
 
-// Copied from `parlaylib/include/parlay/internal/work_stealing_job.h`
+// Derived from `parlaylib/include/parlay/internal/work_stealing_job.h`
 struct WorkStealingJob {
   using scheduler_t = parlay::scheduler<WorkStealingJob>;
   static scheduler_t& get_current_scheduler() {
@@ -55,7 +52,6 @@ struct WorkStealingJob {
   WorkStealingJob() {}
 
   WorkStealingJob(WorkStealingJob&& other) : done(false), hbt(other.hbt) {}
-  // virtual ~WorkStealingJob() = default;
   
   void operator()() {
     assert(done.load(std::memory_order_relaxed) == false);
@@ -69,10 +65,8 @@ struct WorkStealingJob {
     return done.load(std::memory_order_acquire);
   }
   void wait() const noexcept {
-    // while (!finished()) std::this_thread::yield();
     auto done = [&] () { return finished(); };
     get_current_scheduler().wait_until(done);
-    //assert(finished());
   }
 
   void enqueue() {
@@ -114,7 +108,6 @@ struct WorkStealingJob {
     heartbeat_tokens = heartbeat_tokens - hbt;
   }
 
- //protected:
   virtual void run() = 0;
   std::atomic<bool> done;
   uint hbt; // heartbeat tokens
@@ -284,9 +277,6 @@ void start_heartbeats() noexcept {
   constinit static thread_local bool thread_initialized = false;
   if (!thread_initialized) { // only first time
     thread_initialized = true;
-    //heartbeat_tokens = 0;
-    //disable_heartbeats = false;
-    
     spork_stack_bot = &spork_stack_top;
 
     struct sigaction sa = {};
@@ -315,31 +305,15 @@ void pause_heartbeats() noexcept {
   timer_settime(heartbeat_timer, 0, &heartbeat_its_zero, nullptr);
 }
 
-// x must be a pointer to something invocable
-// which returns a Result
-template <typename _Ret, typename _Fn, typename... _Args>
-_Ret execute_lambda(void* f, _Args... args) {
-  static_assert(std::is_invocable_r_v<_Ret, _Fn&, _Args...>);
-  _Fn* _f = (_Fn*) f;
-  return (*_f)(args...);
-}
-
-template <typename _Fn, typename... _Args>
-void execute_lambda2(void* f, _Args... args) {
-  static_assert(std::is_invocable_r_v<void, _Fn&, _Args...>);
-  _Fn* _f = (_Fn*) f;
-  (*_f)(args...);
-}
-
 template <typename PromLambda>
-static void manualProm(PromLambda&& prom, volatile bool& promotable_flag) {
+void manualProm(const PromLambda&& prom, volatile bool& promotable_flag) {
   // save
   bool before = disable_heartbeats;
   disable_heartbeats = true;
   // now check again to make sure a signal didn't eat all the tokens
   while (heartbeat_tokens && promotable_flag) {
     heartbeat_tokens = heartbeat_tokens - 1;
-    promotable_flag = std::forward<PromLambda>(prom)();
+    promotable_flag = std::forward<const PromLambda>(prom)();
     //spork_stack_top.next = spork_stack_bot;
   }
   // restore
@@ -366,7 +340,7 @@ void spork(volatile bool& promotable_flag, const BodyLambda&& body, const PromLa
   {
     SporkSlot slot(&promotable_flag, &promfn);
     if (heartbeat_tokens) [[unlikely]] {
-      manualProm(prom, promotable_flag);
+      manualProm(std::forward<const PromLambda>(prom), promotable_flag);
     }
     std::forward<const BodyLambda>(body)();
   }

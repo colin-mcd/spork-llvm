@@ -686,6 +686,64 @@ parlay::monoid_value_type_t<BinaryOp> parfor(const BinaryOp&& binop, const BodyL
   return a;
 }
 
+template <typename BodyLambda>
+__attribute__((always_inline)) // TODO: investigate what this attribute actually does
+void parfor(const BodyLambda&& body, uint i, uint _j) {
+  static_assert(std::is_invocable_r_v<void, BodyLambda&, uint>);
+
+  struct SpwnJob : WorkStealingJob {
+    uint i, j;
+    const BodyLambda&& body;
+    void run() override {
+      parfor<BodyLambda>(std::forward<const BodyLambda>(body), i, j);
+    }
+    SpwnJob(const BodyLambda&& _body) :
+      WorkStealingJob(), body(std::forward<const BodyLambda>(_body)) {}
+  };
+
+  SpwnJob l(std::forward<const BodyLambda>(body));
+  SpwnJob r(std::forward<const BodyLambda>(body));
+  volatile bool promotable = true;
+  volatile uint j = _j;
+
+  spork(
+    promotable,
+    [&] () {
+      for (; i < j; i++) {
+        std::forward<const BodyLambda>(body)(i);
+      }
+    },
+    [&] () {
+      uint _i = i + 1;
+      uint _j = j;
+      if (_i >= _j) { r.i = r.j = 0; l.i = l.j = 0; return false; }
+      uint mid = midpoint(_i, _j);
+      j = _i;
+
+      r.done.store(false, std::memory_order_relaxed);
+      r.hbt = (heartbeat_tokens + 1) >> 1;
+      r.i = mid;
+      r.j = _j;
+      r.consume_these_hbt();
+      r.enqueue();
+
+      // TODO: check if work stealing deque is full before enqueueing
+
+      if (_i >= mid) { l.i = l.j = 0; return false; }
+      l.done.store(false, std::memory_order_relaxed);
+      l.hbt = heartbeat_tokens;
+      l.i = _i;
+      l.j = mid;
+      l.consume_these_hbt();
+      l.enqueue();
+      return false;
+    });
+  if (!promotable) [[unlikely]] {
+    if (l.i < l.j) [[likely]] l.sync();
+    if (r.i < r.j) [[likely]] r.sync();
+  }
+}
+
 uint fibSeq(uint n) {
   if (n <= 1) {
     return n;

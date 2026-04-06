@@ -1,8 +1,10 @@
 CLANGPP := ~/code/llvm-project/build/bin/clang++
 OPTLLVM := ~/code/llvm-project/build/bin/opt
-INCLUDE := -I./parlaylib/include/ -I/usr/include/libunwind/
+#INCLUDE := -I./parlaylib/include/ -I/usr/include/libunwind/
+INCLUDE := -I./parlaylib/include/
 DBGFLAG := -ggdb
-LIBRARY := -lunwind -lpthread
+#LIBRARY := -lpthread -lunwind
+LIBRARY := -lpthread
 OPTIONS := -xc++ -stdlib=libc++ -std=c++20
 LLVMOPT := -fpass-plugin=./pass/build/RtsSporkPass.so
 

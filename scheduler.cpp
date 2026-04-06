@@ -127,7 +127,6 @@ struct SporkSlot {
   SporkSlot* volatile next;
   SporkSlot* volatile prev;
 
-  explicit SporkSlot(const PromFn* _promfn);
   explicit SporkSlot(const PromFn* _promfn, SporkSlot* _next, SporkSlot* _prev) :
     promoted(false),
     promfn(_promfn),
@@ -143,68 +142,82 @@ struct SporkSlot {
     promfn(std::forward<const PromFn* const>(other.promfn)),
     next(std::forward<SporkSlot* volatile>(other.next)),
     prev(std::forward<SporkSlot* volatile>(other.prev)) {};
-  // sentinel spork slot for `spork_stack_top`
+  // sentinel spork slot for `spork_deque_front`
   consteval explicit SporkSlot() :
     promoted(true), promfn(nullptr), next(nullptr), prev(nullptr) {}
 
-  // NOTE: `this` *must* be the slot at `spork_stack_bot`
+  explicit SporkSlot(const PromFn* _promfn);
+  static void reset();
   bool close();
-
-  void promote() {
-    //assert(promotable);
-    heartbeat_tokens = heartbeat_tokens - 1;
-    promoted = true;
-    (*((PromFn*) promfn))();
-  }
-  static void promote_top();
+  void promote();
+  static void promote_front();
 };
 
-constinit thread_local SporkSlot spork_stack_top;
-constinit thread_local SporkSlot* volatile spork_stack_bot;
+// sentinel node for spork deque
+constinit thread_local SporkSlot spork_deque_front;
+// `spork_deque_back` points to the back of the spork deque
+constinit thread_local SporkSlot* volatile spork_deque_back;
 
-// The constructor and destructor for `SporkSlot` may
-// change `spork_stack_bot`, but the signal handler may not.
-// If we try to change `spork_stack_bot` in the signal handler,
+// The constructor and `close()` for `SporkSlot` may
+// write to `spork_deque_back`, but the signal handler may only read.
+// If we try to change `spork_deque_back` in the signal handler,
 // it can cause issues because it is a (nonatomic) thread_local variable,
-// and therefore a write may not be compiled to a single instruction.
 SporkSlot::SporkSlot(const PromFn* _promfn)
-  : promoted(false), promfn(_promfn), prev(spork_stack_bot) {
-  prev->next = this;
+  : promoted(false), promfn(_promfn), prev(spork_deque_back) {
+  // prev->next = this;
+  spork_deque_back->next = this;
   // now commit these changes to the spork stack, allowing promotions
-  spork_stack_bot = this;
+  spork_deque_back = this;
 }
 
-// NOTE: `this` *must* be the slot at `spork_stack_bot`
+void SporkSlot::reset() {
+  spork_deque_back = &spork_deque_front;
+}
+
+// NOTE: `this` *must* be the slot at `spork_deque_back`
 bool SporkSlot::close() {
   // TODO idea: just disable heartbeats for this and also constructor above,
   // then perhaps we can remove promoted slots from the spork stack?
-  spork_stack_bot = prev;
+  spork_deque_back = prev;
   return promoted;
 }
 
-void SporkSlot::promote_top() {
-  if (&spork_stack_top == spork_stack_bot) return;
-  SporkSlot* slot = spork_stack_top.next;
+void SporkSlot::promote() {
+  //assert(promotable);
+  heartbeat_tokens = heartbeat_tokens - 1;
+  promoted = true;
+  (*((PromFn*) promfn))();
+}
+
+void SporkSlot::promote_front() {
+  if (&spork_deque_front == spork_deque_back) return;
+  SporkSlot* slot = spork_deque_front.next;
   while (heartbeat_tokens) {
     if (!slot->promoted) {
       slot->promote();
+      // if (slot == spork_deque_back) {
+      // } else {
+      //   slot->prev = &spork_deque_front;
+      // }
+      //slot = slot->next;
       // if this slot can no longer be promoted,
       // we can skip it next time we search
       // TODO: fix this below
       // if (!(*(slot->entry->promotable_flag))) {
-      //   if (slot != spork_stack_bot) {
+      //   if (slot != spork_deque_back) {
       //     slot = slot->next;
-      //     spork_stack_top.next = slot;
+      //     spork_deque_front.next = slot;
       //   } else {
-      //     slot->prev = &spork_stack_top;
+      //     slot->prev = &spork_deque_front;
       //   }
       // }
-    } else if (slot == spork_stack_bot) {
-      //slot->prev = &spork_stack_top;
+    }
+    if (slot == spork_deque_back) {
+      //slot->prev = &spork_deque_front;
       break;
     } else {
       slot = slot->next;
-      //spork_stack_top.next = slot;
+      //spork_deque_front.next = slot;
     }
   }
 }
@@ -251,7 +264,7 @@ void heartbeat_handler(int sig) {
     if (heartbeat_tokens > MAX_HEARTBEAT_TOKENS) {
       heartbeat_tokens = MAX_HEARTBEAT_TOKENS;
     }
-    SporkSlot::promote_top();
+    SporkSlot::promote_front();
   } else {
 #if RECORD_HEARTBEAT_STATS
     volatile uint& mhbs = missed_heartbeats[spork::WorkStealingJob::worker_id()];
@@ -276,7 +289,7 @@ void start_heartbeats() noexcept {
   constinit static thread_local bool thread_initialized = false;
   if (!thread_initialized) { // only first time
     thread_initialized = true;
-    spork_stack_bot = &spork_stack_top;
+    SporkSlot::reset();
 
     struct sigaction sa = {};
     //sa.sa_sigaction = heartbeat_handler;
@@ -309,12 +322,13 @@ void manualProm(const PromLambda&& prom, volatile bool& promoted) {
   // save
   bool before = disable_heartbeats;
   disable_heartbeats = true;
-  // now check again to make sure a signal didn't eat all the tokens
-  while (heartbeat_tokens && !promoted) {
+  // check again to make sure a heartbeat didn't
+  // eat all the tokens or promote this already
+  if (heartbeat_tokens && !promoted) {
     heartbeat_tokens = heartbeat_tokens - 1;
     promoted = true;
     std::forward<const PromLambda>(prom)();
-    //spork_stack_top.next = spork_stack_bot;
+    //spork_deque_front.next = spork_deque_back;
   }
   // restore
   disable_heartbeats = before;
@@ -376,7 +390,7 @@ void par(const LambdaL&& lamL, const LambdaR&& lamR) {
     std::forward<const LambdaL>(lamL),
     [&] () {
       SpwnJob& jpnv = *((SpwnJob*) &jp);
-      jpnv.done.store(false, std::memory_order_relaxed);
+      jpnv.done.store(false, std::memory_order_release);
       jpnv.hbt = heartbeat_tokens >> 1;
       jpnv.consume_these_hbt();
       jpnv.enqueue();
@@ -386,6 +400,38 @@ void par(const LambdaL&& lamL, const LambdaR&& lamR) {
     ((SpwnJob*) &jp)->sync(false);
   } else [[likely]] { // unpromoted
     std::forward<const LambdaR>(jp.lamR)();
+  }
+}
+
+uint fibE(uint n) {
+  if (n <= 1) { return n; }
+  struct SpwnJob : WorkStealingJob {
+    const uint n;
+    uint r;
+    void run() override { r = fibE(n - 2); }
+    
+    SpwnJob(const uint _n) : WorkStealingJob(), n(_n) {}
+    SpwnJob(SpwnJob&& other) : WorkStealingJob(std::forward<SpwnJob>(other)), n(std::forward<const uint>(other.n)) {}
+  };
+  
+  volatile SpwnJob jp(n);
+  uint l;
+
+  bool promoted = spork(
+    [&l, n] () { l = fibE(n - 1); },
+    [&] () {
+      SpwnJob& jpnv = *((SpwnJob*) &jp);
+      jpnv.done.store(false, std::memory_order_release);
+      jpnv.hbt = heartbeat_tokens >> 1;
+      jpnv.consume_these_hbt();
+      jpnv.enqueue();
+    });
+
+  if (promoted) [[unlikely]] { // promoted
+    ((SpwnJob*) &jp)->sync(false);
+    return l + jp.r;
+  } else [[likely]] { // unpromoted
+    return l + fibE(n - 2);
   }
 }
 
@@ -423,62 +469,82 @@ constexpr static const uint midpoint(uint i, uint j) noexcept {
 
 template <typename BodyLambda, typename BinaryOp>
 __attribute__((always_inline))
-parlay::monoid_value_type_t<BinaryOp> seqfor(const BinaryOp&& binop, const BodyLambda&& body, uint i, uint j) {
+parlay::monoid_value_type_t<BinaryOp> seqfor(uint i, uint j, const BodyLambda&& body, const BinaryOp&& binop) {
   using A = parlay::monoid_value_type_t<BinaryOp>;
   static_assert(std::is_invocable_r_v<void, BodyLambda&, uint, A&>);
   static_assert(parlay::is_monoid_v<BinaryOp>);
 
   A a = binop.identity;
-  for (; i < j; i++)
-    std::forward<const BodyLambda>(body)(i, a);
+  for (; i < j; i++) std::forward<const BodyLambda>(body)(i, a);
   return a;
 }
 
 template <typename BodyLambda>
 __attribute__((always_inline))
-void seqfor(const BodyLambda&& body, uint i, uint j) {
+void seqfor(uint i, uint j, const BodyLambda&& body) {
   static_assert(std::is_invocable_r_v<void, BodyLambda&, uint>);
-  for (; i < j; i++)
-    std::forward<const BodyLambda>(body)(i);
+  for (; i < j; i++) std::forward<const BodyLambda>(body)(i);
 }
+
+// #ifndef UNROLL
+// #define UNROLL(n, body, i, a) UNROLL_##n(body, i, a)
+// #define UNROLL_1(body, i, a) body(i, a)
+// #define UNROLL_2(body, i, a) body(i, a); body(i+1, a)
+// #define UNROLL_4(body, i, a) body(i, a); body(i+1, a); body(i+2, a); body(i+3, a)
+// #define UNROLL_8(body, i, a) body(i, a); body(i+1, a); body(i+2, a); body(i+3, a); body(i+4, a); body(i+5, a); body(i+6, a); body(i+7, a)
+// #endif
+
+// template <uint unroll>
+// uint unroll_trunc(uint j) { return j; } // todo unimplemented error?
+
+// template <> uint unroll_trunc<1>(uint j) { return j; }
+// template <> uint unroll_trunc<2>(uint j) { return (j >> 1) << 1; }
+// template <> uint unroll_trunc<4>(uint j) { return (j >> 2) << 2; }
+// template <> uint unroll_trunc<8>(uint j) { return (j >> 3) << 3; }
 
 template <typename BodyLambda, typename BinaryOp>
 __attribute__((always_inline)) // TODO: investigate what this attribute actually does
-parlay::monoid_value_type_t<BinaryOp> parfor(const BinaryOp&& binop, const BodyLambda&& body, uint i, uint _j) {
+parlay::monoid_value_type_t<BinaryOp> parfor_unroll2(uint i, uint _j, const BodyLambda&& body, const BinaryOp&& binop) {
   using A = parlay::monoid_value_type_t<BinaryOp>;
   static_assert(std::is_invocable_r_v<void, BodyLambda&, uint, A&>);
   static_assert(parlay::is_monoid_v<BinaryOp>);
 
   struct SpwnJob : WorkStealingJob {
     uint i, j;
-    A a;
-    const BinaryOp&& binop;
     const BodyLambda&& body;
+    const BinaryOp&& binop;
+    A a;
     void run() override {
-      a = parfor<BodyLambda, BinaryOp>(std::forward<const BinaryOp>(binop), std::forward<const BodyLambda>(body), i, j);
+      a = parfor_unroll2<BodyLambda, BinaryOp>
+        (i, j, std::forward<const BodyLambda>(body), std::forward<const BinaryOp>(binop));
     }
-    SpwnJob(const BinaryOp&& _binop, const BodyLambda&& _body) : WorkStealingJob(), binop(std::forward<const BinaryOp>(_binop)), body(std::forward<const BodyLambda>(_body)) {}
+    SpwnJob(const BodyLambda&& _body, const BinaryOp&& _binop) :
+      WorkStealingJob(),
+      body(std::forward<const BodyLambda>(_body)),
+      binop(std::forward<const BinaryOp>(_binop)) {}
   };
 
-  SpwnJob l(std::forward<const BinaryOp>(binop), std::forward<const BodyLambda>(body));
-  SpwnJob r(std::forward<const BinaryOp>(binop), std::forward<const BodyLambda>(body));
-  volatile uint j = _j;
+  SpwnJob l(std::forward<const BodyLambda>(body), std::forward<const BinaryOp>(binop));
+  SpwnJob r(std::forward<const BodyLambda>(body), std::forward<const BinaryOp>(binop));
+  uint oj = i + (((_j - i) >> 1) << 1);
+  volatile uint j = oj;
   A a = binop.identity;
 
   bool promoted = spork(
     [&] () {
-      for (; i < j; i++) {
+      for (; i < j; i += 2) {
         std::forward<const BodyLambda>(body)(i, a);
+        std::forward<const BodyLambda>(body)(i+1, a);
       }
     },
     [&] () {
-      uint _i = i + 1;
+      uint _i = i + 2;
       uint _j = j;
       if (_i >= _j) { r.i = r.j = 0; l.i = l.j = 0; return; }
       uint mid = midpoint(_i, _j);
       j = _i;
 
-      r.done.store(false, std::memory_order_relaxed);
+      r.done.store(false, std::memory_order_release);
       r.hbt = (heartbeat_tokens + 1) >> 1;
       r.i = mid;
       r.j = _j;
@@ -488,7 +554,77 @@ parlay::monoid_value_type_t<BinaryOp> parfor(const BinaryOp&& binop, const BodyL
       // TODO: check if work stealing deque is full before enqueueing
 
       if (_i >= mid) { l.i = l.j = 0; return; }
-      l.done.store(false, std::memory_order_relaxed);
+      l.done.store(false, std::memory_order_release);
+      l.hbt = heartbeat_tokens;
+      l.i = _i;
+      l.j = mid;
+      l.consume_these_hbt();
+      l.enqueue();
+    });
+  if (promoted) [[unlikely]] {
+    if (l.i < l.j) [[likely]] {
+      l.sync(true);
+      a = binop(a, l.a);
+    }
+    if (r.i < r.j) [[likely]] {
+      r.sync(false);
+      a = binop(a, r.a);
+    }
+  }
+  for (i = oj; i < _j; i++) {
+    std::forward<const BodyLambda>(body)(i, a);
+  }
+  return a;
+}
+
+
+template <typename BodyLambda, typename BinaryOp>
+__attribute__((always_inline)) // TODO: investigate what this attribute actually does
+parlay::monoid_value_type_t<BinaryOp> parfor(uint i, uint _j, const BodyLambda&& body, const BinaryOp&& binop) {
+  using A = parlay::monoid_value_type_t<BinaryOp>;
+  static_assert(std::is_invocable_r_v<void, BodyLambda&, uint, A&>);
+  static_assert(parlay::is_monoid_v<BinaryOp>);
+
+  struct SpwnJob : WorkStealingJob {
+    uint i, j;
+    const BodyLambda&& body;
+    const BinaryOp&& binop;
+    A a;
+    void run() override {
+      a = parfor<BodyLambda, BinaryOp>
+        (i, j, std::forward<const BodyLambda>(body), std::forward<const BinaryOp>(binop));
+    }
+    SpwnJob(const BodyLambda&& _body, const BinaryOp&& _binop) :
+      WorkStealingJob(),
+      body(std::forward<const BodyLambda>(_body)),
+      binop(std::forward<const BinaryOp>(_binop)) {}
+  };
+
+  SpwnJob l(std::forward<const BodyLambda>(body), std::forward<const BinaryOp>(binop));
+  SpwnJob r(std::forward<const BodyLambda>(body), std::forward<const BinaryOp>(binop));
+  volatile uint j = _j;
+  A a = binop.identity;
+
+  bool promoted = spork(
+    [&] () { for (; i < j; i++) std::forward<const BodyLambda>(body)(i, a); },
+    [&] () {
+      uint _i = i + 1;
+      uint _j = j;
+      if (_i >= _j) { r.i = r.j = 0; l.i = l.j = 0; return; }
+      uint mid = midpoint(_i, _j);
+      j = _i;
+
+      r.done.store(false, std::memory_order_release);
+      r.hbt = (heartbeat_tokens + 1) >> 1;
+      r.i = mid;
+      r.j = _j;
+      r.consume_these_hbt();
+      r.enqueue();
+
+      // TODO: check if work stealing deque is full before enqueueing
+
+      if (_i >= mid) { l.i = l.j = 0; return; }
+      l.done.store(false, std::memory_order_release);
       l.hbt = heartbeat_tokens;
       l.i = _i;
       l.j = mid;
@@ -508,16 +644,17 @@ parlay::monoid_value_type_t<BinaryOp> parfor(const BinaryOp&& binop, const BodyL
   return a;
 }
 
+
 template <typename BodyLambda>
 __attribute__((always_inline)) // TODO: investigate what this attribute actually does
-void parfor(const BodyLambda&& body, uint i, uint _j) {
+void parfor(uint i, uint _j, const BodyLambda&& body) {
   static_assert(std::is_invocable_r_v<void, BodyLambda&, uint>);
 
   struct SpwnJob : WorkStealingJob {
     uint i, j;
     const BodyLambda&& body;
     void run() override {
-      parfor<BodyLambda>(std::forward<const BodyLambda>(body), i, j);
+      parfor<BodyLambda>(i, j, std::forward<const BodyLambda>(body));
     }
     SpwnJob(const BodyLambda&& _body) :
       WorkStealingJob(), body(std::forward<const BodyLambda>(_body)) {}
@@ -530,19 +667,16 @@ void parfor(const BodyLambda&& body, uint i, uint _j) {
 
   spork(
     promotable,
-    [&] () {
-      for (; i < j; i++) {
-        std::forward<const BodyLambda>(body)(i);
-      }
-    },
+    [&] () { for (; i < j; i++) std::forward<const BodyLambda>(body)(i); },
     [&] () {
       uint _i = i + 1;
       uint _j = j;
       if (_i >= _j) { r.i = r.j = 0; l.i = l.j = 0; return; }
+      // assumes midpoint favors more iterations on the right
       uint mid = midpoint(_i, _j);
       j = _i;
 
-      r.done.store(false, std::memory_order_relaxed);
+      r.done.store(false, std::memory_order_release);
       r.hbt = (heartbeat_tokens + 1) >> 1;
       r.i = mid;
       r.j = _j;
@@ -552,7 +686,7 @@ void parfor(const BodyLambda&& body, uint i, uint _j) {
       // TODO: check if work stealing deque is full before enqueueing
 
       if (_i >= mid) { l.i = l.j = 0; return; }
-      l.done.store(false, std::memory_order_relaxed);
+      l.done.store(false, std::memory_order_release);
       l.hbt = heartbeat_tokens;
       l.i = _i;
       l.j = mid;
@@ -623,7 +757,7 @@ template <typename F>
 __attribute__((always_inline))
 void p4(size_t s, size_t e, F&& f) {
   //parlay::parallel_for(s, e, std::forward<F>(f), 1);
-  spork::parfor(std::forward<F>(f), s, e);
+  spork::parfor(s, e, std::forward<F>(f));
 }
 
 // template<typename A, typename Body, typename Combine>
@@ -635,8 +769,7 @@ void p4(size_t s, size_t e, F&& f) {
 //   if (n == 0) return z;
 //   if (n <= block_size) {
 //     A a = z;
-//     for (; i < j; i++)
-//       a = std::forward<Body>(body)(a, i);
+//     for (; i < j; i++) a = std::forward<Body>(body)(a, i);
 //     return a;
 //   }
 
@@ -693,11 +826,9 @@ int main(int argc, char* argv[]) {
     // parlay::parallel_for(0, n*50, [&] (uint i) { data[i % n] = 5; });
     // spork::parfor([&] (uint i) { data[i % n] = 5; }, 0, n*50);
     num total =
-      // spork::parfor(
-      //   parlay::plus<num>(),
-      //   [&] (uint i, num& a) { a += data[i % n]; },
-      //   0, n*50);
-      spork::fibSeq(40);
+      // spork::seqfor(0, n*50, [&] (uint i, num& a) {a += data[i % n];}, parlay::plus<num>());
+      // spork::parfor_unroll2(0, n*50, [&] (uint i, num& a) {a += data[i % n];}, parlay::plus<num>());
+      spork::fibE(38);
     auto end = std::chrono::steady_clock::now();
 
     spork::pause_heartbeats();

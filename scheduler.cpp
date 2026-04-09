@@ -24,6 +24,25 @@ constexpr std::size_t CL_SIZE = std::hardware_destructive_interference_size;
 constexpr std::size_t CL_SIZE = 64;
 #endif
 
+void print_uint_arr(const uint* arr, uint len) {
+  std::cout << "[";
+  if (arr && len) {
+    std::cout << arr[0];
+    for (uint i = 1; i < len; i++) std::cout << ", " << arr[i];
+  }
+  std::cout << "]";
+}
+
+void print_uint_avg(const uint* arr, uint len) {
+  if (arr && len) {
+    uint total = 0;
+    for (uint i = 0; i < len; i++) total += arr[i];
+    std::cout << (total / len) << " avg";
+  } else {
+    std::cout << "NaN avg";
+  }
+}
+
 // TODO: consistent name casing (camel or snake)
 // TODO: consider adaptive heartbeat timer intervals
 // TODO: look into if loop unrolling is why reduce is slower than reduceSeq
@@ -367,6 +386,8 @@ void manualProm(const PromLambda&& prom, volatile bool& promoted) {
 }
 
 // TODO: exception handling
+// TODO: look into using `parlay::copyable_function_wrapper` from `utilities.h`
+// (and perhaps also `padded<...>`)
 template <typename BodyLambda, typename PromLambda>
 __attribute__((always_inline))
 bool spork(const BodyLambda&& body, const PromLambda&& prom) {
@@ -709,7 +730,7 @@ void parfor(idx i, idx _j, const BodyLambda&& body) {
 }
 
 template <typename idx>
-idx scan_chunksize(idx n) {
+constexpr idx scan_chunksize(idx n) {
   // TODO: ideally, all splits would be along cache lines
   return (idx) sqrt((double) n);
 }
@@ -734,11 +755,11 @@ A* scan_upsweep(A* arr, idx n, const BinOp&& binop) {
   // so we can split chunks along cache lines
   A* partials = (A*) parlay::p_malloc((size_t) n*sizeof(A));
   if (partials) {
-    parfor<idx>(0, chunks, [=,&binop] (idx chunk) {
-      partials[chunk] =
-        parfor<idx, A>(chunksize*chunk, chunksize*chunk+chunksize, [&] (idx i, A& sum) {
-          sum += fwd(binop)(sum, arr[i]);
-        }, fwd(binop));
+    parfor<idx>(0, chunks, [=,&binop] (idx c) {
+      idx start = c*chunksize;
+      idx end = (chunksize > n - start) ? n : start + chunksize;
+      partials[c] = parfor<idx, A>(start, end, [&] (idx i, A& sum) {
+        sum = fwd(binop)(sum, arr[i]); }, fwd(binop));
     });
     
     scan(chunks, partials, fwd(binop));
@@ -752,11 +773,12 @@ void scan_downsweep(A* partials, A* arr, idx n, const BinOp&& binop) {
   static_assert(std::is_integral_v<idx>);
   idx chunksize = scan_chunksize(n);
   idx chunks = 1 + ((n - 1) / chunksize);
-  A ipfx = arr[-1]; // initial prefix
   
   parfor<idx>(0, chunks, [=,&binop] (idx chunk) {
-    A pfx = chunk ? fwd(binop)(ipfx, partials[chunk - 1]) : ipfx;
-    scan(pfx, &arr[chunk*chunksize], chunksize, fwd(binop));
+    A pfx = chunk ? fwd(binop)(arr[-1], partials[chunk - 1]) : arr[-1];
+    idx start = chunk*chunksize;
+    idx size = (chunksize > n - start) ? (n - start) : chunksize;
+    scan(pfx, &arr[start], size, fwd(binop));
   });
   
   parlay::p_free(partials);
@@ -767,6 +789,8 @@ template <typename idx, typename A, typename BinOp>
 void scan(A a, A* arr, idx n, const BinOp&& binop) {
   static_assert(parlay::is_monoid_for_v<BinOp, A>);
   static_assert(std::is_integral_v<idx>);
+
+  // if (n == 1) return;
 
   idx volatile j = n;
   idx i = 0;
@@ -786,6 +810,8 @@ void scan(A a, A* arr, idx n, const BinOp&& binop) {
       if (_i < t1 && t1 < t2 && t2 < n) j = _i;
     });
 
+  // TODO: could start spwn from prom handler above, then run body, then sync
+  // (slightly less delayed spwn)
   if (promoted) {
     if (i != n) {
       idx t1 = third1<idx>(i, n);
@@ -797,19 +823,17 @@ void scan(A a, A* arr, idx n, const BinOp&& binop) {
         [=,&binop] () { // spwn
           return scan_upsweep(&arr[t1], t2 - t1, fwd(binop));},
         [=,&binop] (char _) { // unpr
-          // std::cout << "unpr start = " << *(t1-1) << std::endl;
           scan<idx>(arr[t1-1], &arr[t1], n - t1, fwd(binop));
           return '\0';},
         [=,&binop] (char _, A* partials) { // prom
           if (partials) {
-            // std::cout << "prom start = " << *(t1-1) << " " << a02 << std::endl;
-            par([=,&binop] () {
-                  scan_downsweep(partials, &arr[t1], t2 - t1, fwd(binop));
+            par([&binop, partials, arrt1 = &arr[t1], t21 = t2 - t1] () {
+                  scan_downsweep(partials, arrt1, t21, fwd(binop));
                 },
                 [=,&binop] () {
-                  A a02 = fwd(binop)(arr[t1-1],
-                                     partials[(scan_chunksize(t2 - t1) - 1) / (t2 - t1)]);
-                  scan(a02, &arr[t2], n - t2, fwd(binop));
+                  A sum12 = partials[(t2 - t1 - 1) / scan_chunksize(t2 - t1)];
+                  A sum02 = fwd(binop)(arr[t1-1], sum12);
+                  scan(sum02, &arr[t2], n - t2, fwd(binop));
                 });
           } else { // could not allocate the partials array
             scan<idx>(arr[t1-1], &arr[t1], n - t1, fwd(binop));
@@ -873,25 +897,6 @@ uint fib(uint n) {
 // }
 } // namespace spork
 
-void print_uint_arr(const uint* arr, uint len) {
-  std::cout << "[";
-  if (arr && len) {
-    std::cout << arr[0];
-    for (uint i = 1; i < len; i++) std::cout << ", " << arr[i];
-  }
-  std::cout << "]";
-}
-
-void print_uint_avg(const uint* arr, uint len) {
-  if (arr && len) {
-    uint total = 0;
-    for (uint i = 0; i < len; i++) total += arr[i];
-    std::cout << (total / len) << " avg";
-  } else {
-    std::cout << "NaN avg";
-  }
-}
-
 template <typename F>
 __attribute__((always_inline))
 void p4(size_t s, size_t e, F&& f) {
@@ -921,7 +926,7 @@ void p4(size_t s, size_t e, F&& f) {
 
 template <typename idx, typename datnum>
 datnum* make_data(idx n) {
-  datnum* arr = new datnum[n];
+  datnum* arr = (datnum*) parlay::p_malloc((size_t) n * sizeof(datnum));
   if (arr) {
     for (idx i = 0; i < n; i++) {
       arr[i] = 1 + (i % 5);

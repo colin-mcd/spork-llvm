@@ -5,46 +5,47 @@ INCLUDE := -I./parlaylib/include/
 DBGFLAG := -ggdb
 #LIBRARY := -lpthread -lunwind
 LIBRARY := -lpthread
+SETPATH := LD_PRELOAD=/usr/local/lib/libjemalloc.so
 OPTIONS := -xc++ -stdlib=libc++ -std=c++20
 LLVMOPT := -fpass-plugin=./pass/build/RtsSporkPass.so
 
 scheduler: scheduler.cpp
-	$(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) $< -o $@
+	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) $< -o $@
 
 schedulerO1: scheduler.cpp
-	$(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) -O1 $< -o $@
+	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) -O1 $< -o $@
 schedulerO2: scheduler.cpp
-	$(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) -O2 $< -o $@
+	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) -O2 $< -o $@
 schedulerO3: scheduler.cpp
-	$(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) -O3 $< -o $@
+	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) -O3 $< -o $@
 
 schedulerO1.s: scheduler.cpp
-	$(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -O1 -S $< -o $@
+	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -O1 -S $< -o $@
 schedulerO2.s: scheduler.cpp
-	$(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -O2 -S $< -o $@
+	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -O2 -S $< -o $@
 schedulerO3.s: scheduler.cpp
-	$(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -O3 -S $< -o $@
+	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -O3 -S $< -o $@
 
 scheduler.i: scheduler.cpp
-	$(CLANGPP) $(INCLUDE) $(OPTIONS) $(DBGFLAG) -E $< -o $@
+	$(SETPATH) $(CLANGPP) $(INCLUDE) $(OPTIONS) $(DBGFLAG) -E $< -o $@
 
 scheduler.s: scheduler.cpp
-	$(CLANGPP) $(INCLUDE) $(OPTIONS) $(DBGFLAG) -S $< -o $@
+	$(SETPATH) $(CLANGPP) $(INCLUDE) $(OPTIONS) $(DBGFLAG) -S $< -o $@
 
 scheduler.o: scheduler.cpp
-	$(CLANGPP) $(INCLUDE) $(OPTIONS) -S $< -o $@
+	$(SETPATH) $(CLANGPP) $(INCLUDE) $(OPTIONS) -S $< -o $@
 
 scheduler.ll: scheduler.cpp
-	$(CLANGPP) $(INCLUDE) $(OPTIONS) -O2 -S -emit-llvm $< -o $@
+	$(SETPATH) $(CLANGPP) $(INCLUDE) $(OPTIONS) -O2 -S -emit-llvm $< -o $@
 
 scheduler.opt.ll: scheduler.ll
-	$(OPTLLVM) -S -O3 $< -o $@
+	$(SETPATH) $(OPTLLVM) -S -O3 $< -o $@
 
 pass/build/RtsSporkPass.so: pass/RtsSporkPass.cpp pass/rts_spork_table.h
 	$(MAKE) -C pass/build
 
 llvmtest: scheduler.cpp pass/build/RtsSporkPass.so
-	$(CLANGPP) $(INCLUDE) $(OPTIONS) $(LIBRARY) $(DBGFLAG) $(LLVMOPT) $< -o $@
+	$(SETPATH) $(CLANGPP) $(INCLUDE) $(OPTIONS) $(LIBRARY) $(DBGFLAG) $(LLVMOPT) $< -o $@
 
 .PHONY: clean
 clean:

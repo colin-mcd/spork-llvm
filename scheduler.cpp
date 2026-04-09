@@ -735,16 +735,16 @@ constexpr idx scan_chunksize(idx n) {
   return (idx) sqrt((double) n);
 }
 
-template <typename idx, typename A, typename BinOp>
+template <const uint unroll = 1, typename idx, typename A, typename BinOp>
 void scan(A a, A* arr, idx n, const BinOp&& binop);
 
-template <typename idx, typename A, typename BinOp>
+template <const uint unroll = 1, typename idx, typename A, typename BinOp>
 __attribute__((always_inline))
 void scan(idx n, A* arr, const BinOp&& binop) {
-  scan<idx, A, BinOp>(fwd(binop).identity, arr, n, fwd(binop));
+  scan<unroll, idx, A, BinOp>(fwd(binop).identity, arr, n, fwd(binop));
 }
 
-template <typename idx, typename A, typename BinOp>
+template <const uint unroll = 1, typename idx, typename A, typename BinOp>
 A* scan_upsweep(A* arr, idx n, const BinOp&& binop) {
   static_assert(parlay::is_monoid_for_v<BinOp, A>);
   static_assert(std::is_integral_v<idx>);
@@ -762,12 +762,12 @@ A* scan_upsweep(A* arr, idx n, const BinOp&& binop) {
         sum = fwd(binop)(sum, arr[i]); }, fwd(binop));
     });
     
-    scan(chunks, partials, fwd(binop));
+    scan<unroll, idx, A, BinOp>(chunks, partials, fwd(binop));
   }
   return partials;
 }
 
-template <typename idx, typename A, typename BinOp>
+template <const uint unroll = 1, typename idx, typename A, typename BinOp>
 void scan_downsweep(A* partials, A* arr, idx n, const BinOp&& binop) {
   static_assert(parlay::is_monoid_for_v<BinOp, A>);
   static_assert(std::is_integral_v<idx>);
@@ -778,32 +778,35 @@ void scan_downsweep(A* partials, A* arr, idx n, const BinOp&& binop) {
     A pfx = chunk ? fwd(binop)(arr[-1], partials[chunk - 1]) : arr[-1];
     idx start = chunk*chunksize;
     idx size = (chunksize > n - start) ? (n - start) : chunksize;
-    scan(pfx, &arr[start], size, fwd(binop));
+    scan<unroll, idx, A, BinOp>(pfx, &arr[start], size, fwd(binop));
   });
   
   parlay::p_free(partials);
 }
 
-
-template <typename idx, typename A, typename BinOp>
+template <const uint unroll, typename idx, typename A, typename BinOp>
 void scan(A a, A* arr, idx n, const BinOp&& binop) {
   static_assert(parlay::is_monoid_for_v<BinOp, A>);
   static_assert(std::is_integral_v<idx>);
 
-  // if (n == 1) return;
-
-  idx volatile j = n;
+  // idx volatile j = n;
+  idx nmod = n - (n % unroll);
+  idx volatile j = nmod;
   idx i = 0;
 
   bool promoted = spork(
-    [&] () { // body
-      for (; i < j; i++) {
-        a = fwd(binop)(a, arr[i]);
-        arr[i] = a;
+    [&, arr] () { // body
+      for (; i < j; i += unroll) {
+        A* arr_i = &arr[i];
+        #pragma unroll(unroll)
+        for (idx r = 0; r < unroll; r++) {
+          a = fwd(binop)(a, arr_i[r]);
+          arr_i[r] = a;
+        }
       }
     },
-    [&] () {
-      idx _i = i + 1;
+    [&, n] () {
+      idx _i = i + unroll;
       idx t1 = third1<idx>(_i, n);
       idx t2 = third2<idx>(_i, n);
       // only break if every third has work to do
@@ -812,38 +815,41 @@ void scan(A a, A* arr, idx n, const BinOp&& binop) {
 
   // TODO: could start spwn from prom handler above, then run body, then sync
   // (slightly less delayed spwn)
-  if (promoted) {
-    if (i != n) {
-      idx t1 = third1<idx>(i, n);
-      idx t2 = third2<idx>(i, n);
-      spork<char, A*, char>(
-        [=,&binop] () { // body
-          scan<idx, A>(arr[i-1], &arr[i], t1 - i, fwd(binop));
-          return '\0';},
-        [=,&binop] () { // spwn
-          return scan_upsweep(&arr[t1], t2 - t1, fwd(binop));},
-        [=,&binop] (char _) { // unpr
-          scan<idx>(arr[t1-1], &arr[t1], n - t1, fwd(binop));
-          return '\0';},
-        [=,&binop] (char _, A* partials) { // prom
-          if (partials) {
-            par([&binop, partials, arrt1 = &arr[t1], t21 = t2 - t1] () {
-                  scan_downsweep(partials, arrt1, t21, fwd(binop));
-                },
-                [=,&binop] () {
-                  A sum12 = partials[(t2 - t1 - 1) / scan_chunksize(t2 - t1)];
-                  A sum02 = fwd(binop)(arr[t1-1], sum12);
-                  scan(sum02, &arr[t2], n - t2, fwd(binop));
-                });
-          } else { // could not allocate the partials array
-            scan<idx>(arr[t1-1], &arr[t1], n - t1, fwd(binop));
-          }
-          return '\0';
-        },
-        [=,&binop] (char _) { // unstolen
-          scan<idx>(arr[t1-1], &arr[t1], n - t1, fwd(binop));
-          return '\0';
-        });
+  if (promoted && i != nmod) {
+    idx t1 = third1<idx>(i, n);
+    idx t2 = third2<idx>(i, n);
+    spork<char, A*, char>(
+      [=,&binop] () { // body
+        scan<unroll, idx, A, BinOp>(arr[i-1], &arr[i], t1 - i, fwd(binop));
+        return '\0';},
+      [=,&binop] () { // spwn
+        return scan_upsweep<unroll, idx, A, BinOp>(&arr[t1], t2 - t1, fwd(binop));},
+      [=,&binop] (char _) { // unpr
+        scan<unroll, idx, A, BinOp>(arr[t1-1], &arr[t1], n - t1, fwd(binop));
+        return '\0';},
+      [=,&binop] (char _, A* partials) { // prom
+        if (partials) {
+          par([&binop, partials, arrt1 = &arr[t1], t21 = t2 - t1] () {
+                scan_downsweep<unroll, idx, A, BinOp>(partials, arrt1, t21, fwd(binop));
+              },
+              [=,&binop] () {
+                A sum12 = partials[(t2 - t1 - 1) / scan_chunksize(t2 - t1)];
+                A sum02 = fwd(binop)(arr[t1-1], sum12);
+                scan<unroll, idx, A, BinOp>(sum02, &arr[t2], n - t2, fwd(binop));
+              });
+        } else { // could not allocate the partials array
+          scan<unroll, idx, A, BinOp>(arr[t1-1], &arr[t1], n - t1, fwd(binop));
+        }
+        return '\0';
+      },
+      [=,&binop] (char _) { // unstolen
+        scan<unroll, idx, A, BinOp>(arr[t1-1], &arr[t1], n - t1, fwd(binop));
+        return '\0';
+      });
+  } else {
+    for (; i < n; i++) {
+      a = fwd(binop)(a, arr[i]);
+      arr[i] = a;
     }
   }
 }
@@ -985,7 +991,7 @@ int main(int argc, char* argv[]) {
     datnum total = 0;
     // total = spork::parfor<idxnum, datnum>(0, n, [&] (idxnum i, datnum& a) {a += data[i];}, parlay::plus<datnum>());
     // total = spork::seqfor<idxnum, datnum>(0, n, [&] (idxnum i, datnum& a) {a += data[i]; data[i] = a;}, parlay::plus<datnum>());
-    spork::scan<idxnum>(n, data, parlay::plus<datnum>());
+    spork::scan<5>(n, data, parlay::plus<datnum>());
     // total = spork::fib(38);
     auto end = std::chrono::steady_clock::now();
 

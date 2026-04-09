@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <type_traits>
+#include <new> // For std::hardware_destructive_interference_size
 
 //#include <linux/perf_event.h>
 //#include <sys/ioctl.h>
@@ -12,13 +13,23 @@
 
 #define RECORD_HEARTBEAT_STATS 1
 
+#ifndef fwd
+#define fwd(x) std::forward<std::remove_reference_t<decltype(x)>>(x)
+#endif
+
+// Common cache line size is 64, but C++17 provides a portable constant
+#ifdef __cpp_lib_hardware_interference_size
+constexpr std::size_t CL_SIZE = std::hardware_destructive_interference_size;
+#else
+constexpr std::size_t CL_SIZE = 64;
+#endif
+
 // TODO: consistent name casing (camel or snake)
 // TODO: consider adaptive heartbeat timer intervals
 // TODO: look into if loop unrolling is why reduce is slower than reduceSeq
 
 namespace spork {
 
-typedef uint spork_id_t;
 //#define FRESH_SPORK_ID __COUNTER__
 
 constexpr uint TOKENS_PER_HEARTBEAT = 30;
@@ -65,11 +76,19 @@ struct WorkStealingJob {
     return done.load(std::memory_order_acquire);
   }
   void wait() const noexcept {
+    // since we ALWAYS promote innermost-first,
+    // all potential parallelism is fully promoted by now
+    // thus, no reason to get heartbeats while waiting
+    pause_heartbeats();
     auto done = [&] () { return finished(); };
     get_current_scheduler().wait_until(done);
+    start_heartbeats();
   }
 
-  void enqueue() {
+  void enqueue(uint with_tokens = 0) {
+    done.store(false, std::memory_order_release);
+    hbt = with_tokens;
+    if (with_tokens) heartbeat_tokens = heartbeat_tokens - with_tokens;
     // TODO: make sure queue doesn't overflow (max 1000, aborts if hit)
     get_current_scheduler().spawn(this);
   }
@@ -87,25 +106,24 @@ struct WorkStealingJob {
     if (try_dequeue()) { // unstolen
       fast_clone(reclaim_tokens);
     } else { // stolen
-      // since we ALWAYS promote innermost-first,
-      // all potential parallelism is fully promoted by now
-      // thus, no reason to get heartbeats while waiting
-      if (!finished()) {
-        pause_heartbeats();
-        wait();
-        start_heartbeats();
-      }
+      if (!finished()) wait();
     }
+  }
+
+  // if stolen, waits until finished and then returns true;
+  // otherwise, returns false.
+  bool sync_is_stolen() {
+    if (!try_dequeue()) {
+      if (!finished()) wait();
+      return true;
+    }
+    return false;
   }
 
   // pretends a volatile WorkStealingJob is nonvolatile
   __attribute__((always_inline))
   WorkStealingJob& pretend_nonvolatile() volatile noexcept {
     return (WorkStealingJob&) *this;
-  }
-  
-  void consume_these_hbt() noexcept {
-    heartbeat_tokens = heartbeat_tokens - hbt;
   }
 
   virtual void run() = 0;
@@ -115,7 +133,7 @@ struct WorkStealingJob {
 
 // TODO: make sure prom doesn't throw any exceptions
 struct PromFn {
-  virtual void operator()() = 0;
+  virtual void operator()() const = 0;
 };
 
 struct SporkSlot {
@@ -124,57 +142,62 @@ struct SporkSlot {
   // TODO: otherwise, we can probably view this as nonvolatile from this struct
   volatile bool promoted;
   const PromFn* promfn;
-  SporkSlot* volatile next;
-  SporkSlot* volatile prev;
+  SporkSlot*volatile* prev;
+  SporkSlot* next;
 
-  explicit SporkSlot(const PromFn* _promfn, SporkSlot* _next, SporkSlot* _prev) :
+  explicit SporkSlot(const PromFn* _promfn, SporkSlot** _prev, SporkSlot* _next) :
     promoted(false),
     promfn(_promfn),
-    next(_next),
-    prev(_prev) {}
+    prev(_prev),
+    next(_next) {}
   explicit SporkSlot(const SporkSlot& other) :
     promoted(other.promoted),
     promfn(other.promfn),
-    next(other.next),
-    prev(other.prev) {}
+    prev(other.prev),
+    next(other.next) {}
   explicit SporkSlot(SporkSlot&& other) :
     promoted(other.promoted),
-    promfn(std::forward<const PromFn* const>(other.promfn)),
-    next(std::forward<SporkSlot* volatile>(other.next)),
-    prev(std::forward<SporkSlot* volatile>(other.prev)) {};
+    promfn(fwd(other.promfn)),
+    prev(fwd(other.prev)),
+    next(fwd(other.next)) {};
   // sentinel spork slot for `spork_deque_front`
   consteval explicit SporkSlot() :
-    promoted(true), promfn(nullptr), next(nullptr), prev(nullptr) {}
+    promoted(true), promfn(nullptr), prev(nullptr), next(nullptr) {}
 
   explicit SporkSlot(const PromFn* _promfn);
   static void reset();
   bool close();
   void promote();
   static void promote_front();
+  // void eager_promote();
 };
 
 // sentinel node for spork deque
 constinit thread_local SporkSlot spork_deque_front;
 // `spork_deque_back` points to the back of the spork deque
-constinit thread_local SporkSlot* volatile spork_deque_back;
+constinit thread_local SporkSlot*volatile* spork_deque_back;
+
+
 
 // The constructor and `close()` for `SporkSlot` may
 // write to `spork_deque_back`, but the signal handler may only read.
 // If we try to change `spork_deque_back` in the signal handler,
 // it can cause issues because it is a (nonatomic) thread_local variable,
+__attribute__((always_inline))
 SporkSlot::SporkSlot(const PromFn* _promfn)
   : promoted(false), promfn(_promfn), prev(spork_deque_back) {
-  // prev->next = this;
-  spork_deque_back->next = this;
+  *prev = this;
+  // if (heartbeat_tokens) [[unlikely]] eager_promote();
   // now commit these changes to the spork stack, allowing promotions
-  spork_deque_back = this;
+  spork_deque_back = &next;
 }
 
 void SporkSlot::reset() {
-  spork_deque_back = &spork_deque_front;
+  spork_deque_back = &spork_deque_front.next;
 }
 
 // NOTE: `this` *must* be the slot at `spork_deque_back`
+__attribute__((always_inline))
 bool SporkSlot::close() {
   // TODO idea: just disable heartbeats for this and also constructor above,
   // then perhaps we can remove promoted slots from the spork stack?
@@ -189,8 +212,16 @@ void SporkSlot::promote() {
   (*((PromFn*) promfn))();
 }
 
+// __attribute__((noinline))
+// void SporkSlot::eager_promote() {
+//   bool before = disable_heartbeats;
+//   disable_heartbeats = true;
+//   promote();
+//   disable_heartbeats = before;
+// }
+
 void SporkSlot::promote_front() {
-  if (&spork_deque_front == spork_deque_back) return;
+  if (&spork_deque_front.next == spork_deque_back) return;
   SporkSlot* slot = spork_deque_front.next;
   while (heartbeat_tokens) {
     if (!slot->promoted) {
@@ -212,7 +243,7 @@ void SporkSlot::promote_front() {
       //   }
       // }
     }
-    if (slot == spork_deque_back) {
+    if (&slot->next == spork_deque_back) {
       //slot->prev = &spork_deque_front;
       break;
     } else {
@@ -318,6 +349,7 @@ void pause_heartbeats() noexcept {
 }
 
 template <typename PromLambda>
+__attribute__((noinline))
 void manualProm(const PromLambda&& prom, volatile bool& promoted) {
   // save
   bool before = disable_heartbeats;
@@ -327,7 +359,7 @@ void manualProm(const PromLambda&& prom, volatile bool& promoted) {
   if (heartbeat_tokens && !promoted) {
     heartbeat_tokens = heartbeat_tokens - 1;
     promoted = true;
-    std::forward<const PromLambda>(prom)();
+    fwd(prom)();
     //spork_deque_front.next = spork_deque_back;
   }
   // restore
@@ -336,7 +368,7 @@ void manualProm(const PromLambda&& prom, volatile bool& promoted) {
 
 // TODO: exception handling
 template <typename BodyLambda, typename PromLambda>
-//__attribute__((always_inline))
+__attribute__((always_inline))
 bool spork(const BodyLambda&& body, const PromLambda&& prom) {
   static_assert(std::is_invocable_v<BodyLambda&&>);
   static_assert(std::is_invocable_v<PromLambda&&>);
@@ -344,18 +376,17 @@ bool spork(const BodyLambda&& body, const PromLambda&& prom) {
   struct PromSpork : PromFn {
     const PromLambda&& prom;
     PromSpork(const PromLambda&& _prom) :
-      prom(std::forward<const PromLambda>(_prom)) {}
-    void operator()() override {
-      std::forward<const PromLambda>(prom)();
+      prom(fwd(_prom)) {}
+    void operator()() const override {
+      fwd(prom)();
     }
   };
-  const PromSpork promfn(std::forward<const PromLambda>(prom));
+  const PromSpork promfn(fwd(prom));
 
   SporkSlot slot(&promfn);
-  if (heartbeat_tokens) [[unlikely]] {
-    manualProm(std::forward<const PromLambda>(prom), slot.promoted);
-  }
-  std::forward<const BodyLambda>(body)();
+  if (heartbeat_tokens) [[unlikely]]
+    manualProm(fwd(prom), slot.promoted);
+  fwd(body)();
   return slot.close();
 }
 
@@ -364,44 +395,116 @@ __attribute__((always_inline))
 static void parSeq(LambdaL&& lamL, LambdaR&& lamR) {
   static_assert(std::is_invocable_v<LambdaL&>);
   static_assert(std::is_invocable_v<LambdaR&>);
-  std::forward<LambdaL>(lamL)();
-  std::forward<LambdaR>(lamR)();
+  fwd(lamL)();
+  fwd(lamR)();
 }
 
 template <typename LambdaL, typename LambdaR>
-//__attribute__((always_inline))
+__attribute__((always_inline))
 void par(const LambdaL&& lamL, const LambdaR&& lamR) {
   static_assert(std::is_invocable_v<const LambdaL&>);
   static_assert(std::is_invocable_v<const LambdaR&>);
   
   struct SpwnJob : WorkStealingJob {
     const LambdaR&& lamR;
-    void run() override {
-      std::forward<const LambdaR>(lamR)();
-    }
-    
-    SpwnJob(const LambdaR&& lamR) : WorkStealingJob(), lamR(std::forward<const LambdaR>(lamR)) {}
-    SpwnJob(SpwnJob&& other) : WorkStealingJob(std::forward<SpwnJob>(other)), lamR(std::forward<const LambdaR>(other.lamR)) {}
+    void run() override { fwd(lamR)(); }
+    SpwnJob(const LambdaR&& lamR) :
+      WorkStealingJob(),
+      lamR(fwd(lamR)) {}
+    SpwnJob(SpwnJob&& other) :
+      WorkStealingJob(fwd(other)),
+      lamR(fwd(other.lamR)) {}
   };
   
-  volatile SpwnJob jp(std::forward<const LambdaR>(lamR));
+  volatile SpwnJob jp(fwd(lamR));
 
   bool promoted = spork(
-    std::forward<const LambdaL>(lamL),
-    [&] () {
-      SpwnJob& jpnv = *((SpwnJob*) &jp);
-      jpnv.done.store(false, std::memory_order_release);
-      jpnv.hbt = heartbeat_tokens >> 1;
-      jpnv.consume_these_hbt();
-      jpnv.enqueue();
-    });
+    fwd(lamL),
+    [&jp] () { ((SpwnJob*) &jp)->enqueue(heartbeat_tokens >> 1); });
 
   if (promoted) [[unlikely]] { // promoted
     ((SpwnJob*) &jp)->sync(false);
   } else [[likely]] { // unpromoted
-    std::forward<const LambdaR>(jp.lamR)();
+    fwd(lamR)();
   }
 }
+
+template <typename BR, typename SR, typename RR, typename BodyL, typename SpwnL, typename UnprL, typename PromL, typename UnstL>
+__attribute__((always_inline))
+RR spork(const BodyL&& body, const SpwnL&& spwn, const UnprL&& unpr, const PromL&& prom, const UnstL&& unst) {
+  static_assert(std::is_invocable_r_v<BR, const BodyL&>);
+  static_assert(std::is_invocable_r_v<SR, const SpwnL&>);
+  static_assert(std::is_invocable_r_v<RR, const UnprL&, BR>);
+  static_assert(std::is_invocable_r_v<RR, const PromL&, BR, SR>);
+  static_assert(std::is_invocable_r_v<RR, const UnstL&, BR>);
+  
+  struct SpwnJob : WorkStealingJob {
+    const SpwnL&& spwn;
+    SR sr;
+    void run() override { sr = fwd(spwn)(); }
+    SpwnJob(const SpwnL&& _spwn) :
+      WorkStealingJob(),
+      spwn(fwd(_spwn)) {}
+    SpwnJob(SpwnJob&& other) :
+      WorkStealingJob(fwd(other)),
+      spwn(fwd(other.spwn)) {}
+  };
+  
+  volatile SpwnJob jp(fwd(spwn));
+  BR br;
+
+  bool promoted = spork(
+    [&] () { br = fwd(body)(); },
+    [&] () { ((SpwnJob*) &jp)->enqueue(heartbeat_tokens >> 1); });
+
+  if (promoted) [[unlikely]] { // promoted
+    if (((SpwnJob*) &jp)->sync_is_stolen()) {
+      return fwd(prom)(br, jp.sr);
+    } else {
+      return fwd(unst)(br);
+    }
+  } else [[likely]] { // unpromoted
+    return fwd(unpr)(br);
+  }
+}
+
+// // allows code in promoted case before sync
+// template <typename BR, typename SR, typename PR, typename RR, typename BodyL, typename SpwnL, typename UnprL, typename PromL, typename SyncL>
+// __attribute__((always_inline))
+// RR spork(const BodyL&& body, const SpwnL&& spwn, const UnprL&& unpr, const PromL&& prom, const SyncL&& sync) {
+//   static_assert(std::is_invocable_r_v<BR, const BodyL&>);
+//   static_assert(std::is_invocable_r_v<SR, const SpwnL&>);
+//   static_assert(std::is_invocable_r_v<RR, const UnprL&, BR>);
+//   static_assert(std::is_invocable_r_v<PR, const PromL&, BR>);
+//   static_assert(std::is_invocable_r_v<RR, const PromL&, PR, SR>);
+  
+//   struct SpwnJob : WorkStealingJob {
+//     const SpwnL&& spwn;
+//     SR sr;
+//     void run() override { sr = fwd(spwn)(); }
+//     SpwnJob(const SpwnL&& _spwn) :
+//       WorkStealingJob(),
+//       spwn(fwd(_spwn)) {}
+//     SpwnJob(SpwnJob&& other) :
+//       WorkStealingJob(fwd(other)),
+//       spwn(fwd(other.spwn)) {}
+//   };
+  
+//   volatile SpwnJob jp(fwd(spwn));
+//   BR br;
+
+//   bool promoted = spork(
+//     [&] () { br = fwd(body)(); },
+//     [&] () { ((SpwnJob*) &jp)->enqueue(heartbeat_tokens >> 1); });
+
+//   if (promoted) [[unlikely]] { // promoted
+//     PR pr = fwd(prom)(br);
+//     ((SpwnJob*) &jp)->sync(false);
+//     return fwd(sync)(pr, jp.sr);
+//   } else [[likely]] { // unpromoted
+//     return fwd(unpr)(br);
+//   }
+// }
 
 uint fibE(uint n) {
   if (n <= 1) { return n; }
@@ -411,7 +514,7 @@ uint fibE(uint n) {
     void run() override { r = fibE(n - 2); }
     
     SpwnJob(const uint _n) : WorkStealingJob(), n(_n) {}
-    SpwnJob(SpwnJob&& other) : WorkStealingJob(std::forward<SpwnJob>(other)), n(std::forward<const uint>(other.n)) {}
+    SpwnJob(SpwnJob&& other) : WorkStealingJob(fwd(other)), n(fwd(other.n)) {}
   };
   
   volatile SpwnJob jp(n);
@@ -421,10 +524,7 @@ uint fibE(uint n) {
     [&l, n] () { l = fibE(n - 1); },
     [&] () {
       SpwnJob& jpnv = *((SpwnJob*) &jp);
-      jpnv.done.store(false, std::memory_order_release);
-      jpnv.hbt = heartbeat_tokens >> 1;
-      jpnv.consume_these_hbt();
-      jpnv.enqueue();
+      jpnv.enqueue(heartbeat_tokens >> 1);
     });
 
   if (promoted) [[unlikely]] { // promoted
@@ -435,9 +535,24 @@ uint fibE(uint n) {
   }
 }
 
+template <typename idx>
 __attribute__((always_inline))
-constexpr static const uint midpoint(uint i, uint j) noexcept {
+constexpr static const idx midpoint(idx i, idx j) noexcept {
+  static_assert(std::is_integral_v<idx>);
   return i + ((j - i) >> 1);
+}
+
+template <typename idx>
+__attribute__((always_inline))
+constexpr static idx third1(idx i, idx j) noexcept {
+  static_assert(std::is_integral_v<idx>);
+  return i + ((j - i) / 5);
+}
+template <typename idx>
+__attribute__((always_inline))
+constexpr static idx third2(idx i, idx j) noexcept {
+  static_assert(std::is_integral_v<idx>);
+  return j - 2 * ((j - i) / 5);
 }
 
 // void waste_some_time() {
@@ -467,235 +582,245 @@ constexpr static const uint midpoint(uint i, uint j) noexcept {
 //   return fd;
 // }
 
-template <typename BodyLambda, typename BinaryOp>
-__attribute__((always_inline))
-parlay::monoid_value_type_t<BinaryOp> seqfor(uint i, uint j, const BodyLambda&& body, const BinaryOp&& binop) {
-  using A = parlay::monoid_value_type_t<BinaryOp>;
-  static_assert(std::is_invocable_r_v<void, BodyLambda&, uint, A&>);
-  static_assert(parlay::is_monoid_v<BinaryOp>);
+template <typename idx, typename A, typename BodyLambda, typename BinOp>
+// __attribute__((always_inline))
+A seqfor(idx i, idx j, const BodyLambda&& body, const BinOp&& binop) {
+  static_assert(std::is_invocable_r_v<void, BodyLambda&, idx, A&>);
+  static_assert(parlay::is_monoid_for_v<BinOp, A>);
 
-  A a = binop.identity;
-  for (; i < j; i++) std::forward<const BodyLambda>(body)(i, a);
+  A a = fwd(binop).identity;
+  for (; i < j; i++) fwd(body)(i, a);
   return a;
 }
 
-template <typename BodyLambda>
-__attribute__((always_inline))
-void seqfor(uint i, uint j, const BodyLambda&& body) {
-  static_assert(std::is_invocable_r_v<void, BodyLambda&, uint>);
-  for (; i < j; i++) std::forward<const BodyLambda>(body)(i);
+template <typename idx, typename BodyLambda>
+// __attribute__((always_inline))
+void seqfor(idx i, idx j, const BodyLambda&& body) {
+  static_assert(std::is_invocable_r_v<void, BodyLambda&, idx>);
+  for (; i < j; i++) fwd(body)(i);
 }
 
-// #ifndef UNROLL
-// #define UNROLL(n, body, i, a) UNROLL_##n(body, i, a)
-// #define UNROLL_1(body, i, a) body(i, a)
-// #define UNROLL_2(body, i, a) body(i, a); body(i+1, a)
-// #define UNROLL_4(body, i, a) body(i, a); body(i+1, a); body(i+2, a); body(i+3, a)
-// #define UNROLL_8(body, i, a) body(i, a); body(i+1, a); body(i+2, a); body(i+3, a); body(i+4, a); body(i+5, a); body(i+6, a); body(i+7, a)
-// #endif
-
-// template <uint unroll>
-// uint unroll_trunc(uint j) { return j; } // todo unimplemented error?
-
-// template <> uint unroll_trunc<1>(uint j) { return j; }
-// template <> uint unroll_trunc<2>(uint j) { return (j >> 1) << 1; }
-// template <> uint unroll_trunc<4>(uint j) { return (j >> 2) << 2; }
-// template <> uint unroll_trunc<8>(uint j) { return (j >> 3) << 3; }
-
-template <typename BodyLambda, typename BinaryOp>
-__attribute__((always_inline)) // TODO: investigate what this attribute actually does
-parlay::monoid_value_type_t<BinaryOp> parfor_unroll2(uint i, uint _j, const BodyLambda&& body, const BinaryOp&& binop) {
-  using A = parlay::monoid_value_type_t<BinaryOp>;
-  static_assert(std::is_invocable_r_v<void, BodyLambda&, uint, A&>);
-  static_assert(parlay::is_monoid_v<BinaryOp>);
+template <typename idx, typename A, typename BodyLambda, typename BinOp>
+//__attribute__((always_inline)) // TODO: investigate what this attribute actually does
+A parfor(idx i, idx _j, const BodyLambda&& body, const BinOp&& binop) {
+  static_assert(std::is_integral_v<idx>);
+  static_assert(std::is_invocable_r_v<void, BodyLambda&, idx, A&>);
+  static_assert(parlay::is_monoid_for_v<BinOp, A>);
 
   struct SpwnJob : WorkStealingJob {
-    uint i, j;
+    idx i, j;
     const BodyLambda&& body;
-    const BinaryOp&& binop;
+    const BinOp&& binop;
     A a;
     void run() override {
-      a = parfor_unroll2<BodyLambda, BinaryOp>
-        (i, j, std::forward<const BodyLambda>(body), std::forward<const BinaryOp>(binop));
+      a = parfor<idx, A, BodyLambda, BinOp>
+        (i, j, fwd(body), fwd(binop));
     }
-    SpwnJob(const BodyLambda&& _body, const BinaryOp&& _binop) :
+    SpwnJob(const BodyLambda&& _body, const BinOp&& _binop) :
       WorkStealingJob(),
-      body(std::forward<const BodyLambda>(_body)),
-      binop(std::forward<const BinaryOp>(_binop)) {}
+      body(fwd(_body)),
+      binop(fwd(_binop)) {}
   };
 
-  SpwnJob l(std::forward<const BodyLambda>(body), std::forward<const BinaryOp>(binop));
-  SpwnJob r(std::forward<const BodyLambda>(body), std::forward<const BinaryOp>(binop));
-  uint oj = i + (((_j - i) >> 1) << 1);
-  volatile uint j = oj;
+  SpwnJob l(fwd(body), fwd(binop));
+  SpwnJob r(fwd(body), fwd(binop));
+  volatile idx j = _j;
   A a = binop.identity;
 
   bool promoted = spork(
+    [&] () { for (; i < j; i++) fwd(body)(i, a); },
     [&] () {
-      for (; i < j; i += 2) {
-        std::forward<const BodyLambda>(body)(i, a);
-        std::forward<const BodyLambda>(body)(i+1, a);
+      idx _i = i + 1;
+      idx _j = j;
+      if (_i >= _j) { r.i = r.j = 0; l.i = l.j = 0; return; }
+      idx mid = midpoint<idx>(_i, _j);
+      j = _i;
+
+      r.i = mid;
+      r.j = _j;
+      r.enqueue((heartbeat_tokens + 1) >> 1);
+
+      // TODO: check if work stealing deque is full before enqueueing
+
+      if (_i >= mid) { l.i = l.j = 0; return; }
+      l.i = _i;
+      l.j = mid;
+      l.enqueue(heartbeat_tokens);
+    });
+  if (promoted) [[unlikely]] {
+    if (l.i < l.j) [[likely]] {
+      l.sync(true);
+      a = binop(a, l.a);
+    }
+    if (r.i < r.j) [[likely]] {
+      r.sync(false);
+      a = binop(a, r.a);
+    }
+  }
+  return a;
+}
+
+
+template <typename idx, typename BodyLambda>
+//__attribute__((always_inline)) // TODO: investigate what this attribute actually does
+void parfor(idx i, idx _j, const BodyLambda&& body) {
+  static_assert(std::is_integral_v<idx>);
+  static_assert(std::is_invocable_r_v<void, BodyLambda&, idx>);
+
+  struct SpwnJob : WorkStealingJob {
+    idx i, j;
+    const BodyLambda&& body;
+    void run() override {
+      parfor<idx, BodyLambda>(i, j, fwd(body));
+    }
+    SpwnJob(const BodyLambda&& _body) :
+      WorkStealingJob(), body(fwd(_body)) {}
+  };
+
+  SpwnJob l(fwd(body));
+  SpwnJob r(fwd(body));
+  volatile idx j = _j;
+
+  bool promoted = spork(
+    [&] () { for (; i < j; i++) fwd(body)(i); },
+    [&] () {
+      idx _i = i + 1;
+      idx _j = j;
+      if (_i >= _j) { r.i = r.j = 0; l.i = l.j = 0; return; }
+      // assumes midpoint favors more iterations on the right
+      idx mid = midpoint<idx>(_i, _j);
+      j = _i;
+
+      r.i = mid;
+      r.j = _j;
+      r.enqueue((heartbeat_tokens + 1) >> 1);
+
+      // TODO: check if work stealing deque is full before enqueueing
+
+      if (_i >= mid) { l.i = l.j = 0; return; }
+      l.i = _i;
+      l.j = mid;
+      l.enqueue(heartbeat_tokens);
+    });
+  if (promoted) [[unlikely]] {
+    if (l.i < l.j) [[unlikely]] l.sync(true);
+    if (r.i < r.j) [[likely]] r.sync(false);
+  }
+}
+
+template <typename idx>
+idx scan_chunksize(idx n) {
+  // TODO: ideally, all splits would be along cache lines
+  return (idx) sqrt((double) n);
+}
+
+template <typename idx, typename A, typename BinOp>
+void scan(A a, A* arr, idx n, const BinOp&& binop);
+
+template <typename idx, typename A, typename BinOp>
+__attribute__((always_inline))
+void scan(idx n, A* arr, const BinOp&& binop) {
+  scan<idx, A, BinOp>(fwd(binop).identity, arr, n, fwd(binop));
+}
+
+template <typename idx, typename A, typename BinOp>
+A* scan_upsweep(A* arr, idx n, const BinOp&& binop) {
+  static_assert(parlay::is_monoid_for_v<BinOp, A>);
+  static_assert(std::is_integral_v<idx>);
+
+  idx chunksize = scan_chunksize(n);
+  idx chunks = 1 + ((n - 1) / chunksize);
+  // TODO: consider aligning this allocation
+  // so we can split chunks along cache lines
+  A* partials = (A*) parlay::p_malloc((size_t) n*sizeof(A));
+  if (partials) {
+    parfor<idx>(0, chunks, [=,&binop] (idx chunk) {
+      partials[chunk] =
+        parfor<idx, A>(chunksize*chunk, chunksize*chunk+chunksize, [&] (idx i, A& sum) {
+          sum += fwd(binop)(sum, arr[i]);
+        }, fwd(binop));
+    });
+    
+    scan(chunks, partials, fwd(binop));
+  }
+  return partials;
+}
+
+template <typename idx, typename A, typename BinOp>
+void scan_downsweep(A* partials, A* arr, idx n, const BinOp&& binop) {
+  static_assert(parlay::is_monoid_for_v<BinOp, A>);
+  static_assert(std::is_integral_v<idx>);
+  idx chunksize = scan_chunksize(n);
+  idx chunks = 1 + ((n - 1) / chunksize);
+  A ipfx = arr[-1]; // initial prefix
+  
+  parfor<idx>(0, chunks, [=,&binop] (idx chunk) {
+    A pfx = chunk ? fwd(binop)(ipfx, partials[chunk - 1]) : ipfx;
+    scan(pfx, &arr[chunk*chunksize], chunksize, fwd(binop));
+  });
+  
+  parlay::p_free(partials);
+}
+
+
+template <typename idx, typename A, typename BinOp>
+void scan(A a, A* arr, idx n, const BinOp&& binop) {
+  static_assert(parlay::is_monoid_for_v<BinOp, A>);
+  static_assert(std::is_integral_v<idx>);
+
+  idx volatile j = n;
+  idx i = 0;
+
+  bool promoted = spork(
+    [&] () { // body
+      for (; i < j; i++) {
+        a = fwd(binop)(a, arr[i]);
+        arr[i] = a;
       }
     },
     [&] () {
-      uint _i = i + 2;
-      uint _j = j;
-      if (_i >= _j) { r.i = r.j = 0; l.i = l.j = 0; return; }
-      uint mid = midpoint(_i, _j);
-      j = _i;
-
-      r.done.store(false, std::memory_order_release);
-      r.hbt = (heartbeat_tokens + 1) >> 1;
-      r.i = mid;
-      r.j = _j;
-      r.consume_these_hbt();
-      r.enqueue();
-
-      // TODO: check if work stealing deque is full before enqueueing
-
-      if (_i >= mid) { l.i = l.j = 0; return; }
-      l.done.store(false, std::memory_order_release);
-      l.hbt = heartbeat_tokens;
-      l.i = _i;
-      l.j = mid;
-      l.consume_these_hbt();
-      l.enqueue();
+      idx _i = i + 1;
+      idx t1 = third1<idx>(_i, n);
+      idx t2 = third2<idx>(_i, n);
+      // only break if every third has work to do
+      if (_i < t1 && t1 < t2 && t2 < n) j = _i;
     });
-  if (promoted) [[unlikely]] {
-    if (l.i < l.j) [[likely]] {
-      l.sync(true);
-      a = binop(a, l.a);
+
+  if (promoted) {
+    if (i != n) {
+      idx t1 = third1<idx>(i, n);
+      idx t2 = third2<idx>(i, n);
+      spork<char, A*, char>(
+        [=,&binop] () { // body
+          scan<idx, A>(arr[i-1], &arr[i], t1 - i, fwd(binop));
+          return '\0';},
+        [=,&binop] () { // spwn
+          return scan_upsweep(&arr[t1], t2 - t1, fwd(binop));},
+        [=,&binop] (char _) { // unpr
+          // std::cout << "unpr start = " << *(t1-1) << std::endl;
+          scan<idx>(arr[t1-1], &arr[t1], n - t1, fwd(binop));
+          return '\0';},
+        [=,&binop] (char _, A* partials) { // prom
+          if (partials) {
+            // std::cout << "prom start = " << *(t1-1) << " " << a02 << std::endl;
+            par([=,&binop] () {
+                  scan_downsweep(partials, &arr[t1], t2 - t1, fwd(binop));
+                },
+                [=,&binop] () {
+                  A a02 = fwd(binop)(arr[t1-1],
+                                     partials[(scan_chunksize(t2 - t1) - 1) / (t2 - t1)]);
+                  scan(a02, &arr[t2], n - t2, fwd(binop));
+                });
+          } else { // could not allocate the partials array
+            scan<idx>(arr[t1-1], &arr[t1], n - t1, fwd(binop));
+          }
+          return '\0';
+        },
+        [=,&binop] (char _) { // unstolen
+          scan<idx>(arr[t1-1], &arr[t1], n - t1, fwd(binop));
+          return '\0';
+        });
     }
-    if (r.i < r.j) [[likely]] {
-      r.sync(false);
-      a = binop(a, r.a);
-    }
-  }
-  for (i = oj; i < _j; i++) {
-    std::forward<const BodyLambda>(body)(i, a);
-  }
-  return a;
-}
-
-
-template <typename BodyLambda, typename BinaryOp>
-__attribute__((always_inline)) // TODO: investigate what this attribute actually does
-parlay::monoid_value_type_t<BinaryOp> parfor(uint i, uint _j, const BodyLambda&& body, const BinaryOp&& binop) {
-  using A = parlay::monoid_value_type_t<BinaryOp>;
-  static_assert(std::is_invocable_r_v<void, BodyLambda&, uint, A&>);
-  static_assert(parlay::is_monoid_v<BinaryOp>);
-
-  struct SpwnJob : WorkStealingJob {
-    uint i, j;
-    const BodyLambda&& body;
-    const BinaryOp&& binop;
-    A a;
-    void run() override {
-      a = parfor<BodyLambda, BinaryOp>
-        (i, j, std::forward<const BodyLambda>(body), std::forward<const BinaryOp>(binop));
-    }
-    SpwnJob(const BodyLambda&& _body, const BinaryOp&& _binop) :
-      WorkStealingJob(),
-      body(std::forward<const BodyLambda>(_body)),
-      binop(std::forward<const BinaryOp>(_binop)) {}
-  };
-
-  SpwnJob l(std::forward<const BodyLambda>(body), std::forward<const BinaryOp>(binop));
-  SpwnJob r(std::forward<const BodyLambda>(body), std::forward<const BinaryOp>(binop));
-  volatile uint j = _j;
-  A a = binop.identity;
-
-  bool promoted = spork(
-    [&] () { for (; i < j; i++) std::forward<const BodyLambda>(body)(i, a); },
-    [&] () {
-      uint _i = i + 1;
-      uint _j = j;
-      if (_i >= _j) { r.i = r.j = 0; l.i = l.j = 0; return; }
-      uint mid = midpoint(_i, _j);
-      j = _i;
-
-      r.done.store(false, std::memory_order_release);
-      r.hbt = (heartbeat_tokens + 1) >> 1;
-      r.i = mid;
-      r.j = _j;
-      r.consume_these_hbt();
-      r.enqueue();
-
-      // TODO: check if work stealing deque is full before enqueueing
-
-      if (_i >= mid) { l.i = l.j = 0; return; }
-      l.done.store(false, std::memory_order_release);
-      l.hbt = heartbeat_tokens;
-      l.i = _i;
-      l.j = mid;
-      l.consume_these_hbt();
-      l.enqueue();
-    });
-  if (promoted) [[unlikely]] {
-    if (l.i < l.j) [[likely]] {
-      l.sync(true);
-      a = binop(a, l.a);
-    }
-    if (r.i < r.j) [[likely]] {
-      r.sync(false);
-      a = binop(a, r.a);
-    }
-  }
-  return a;
-}
-
-
-template <typename BodyLambda>
-__attribute__((always_inline)) // TODO: investigate what this attribute actually does
-void parfor(uint i, uint _j, const BodyLambda&& body) {
-  static_assert(std::is_invocable_r_v<void, BodyLambda&, uint>);
-
-  struct SpwnJob : WorkStealingJob {
-    uint i, j;
-    const BodyLambda&& body;
-    void run() override {
-      parfor<BodyLambda>(i, j, std::forward<const BodyLambda>(body));
-    }
-    SpwnJob(const BodyLambda&& _body) :
-      WorkStealingJob(), body(std::forward<const BodyLambda>(_body)) {}
-  };
-
-  SpwnJob l(std::forward<const BodyLambda>(body));
-  SpwnJob r(std::forward<const BodyLambda>(body));
-  volatile bool promotable = true;
-  volatile uint j = _j;
-
-  spork(
-    promotable,
-    [&] () { for (; i < j; i++) std::forward<const BodyLambda>(body)(i); },
-    [&] () {
-      uint _i = i + 1;
-      uint _j = j;
-      if (_i >= _j) { r.i = r.j = 0; l.i = l.j = 0; return; }
-      // assumes midpoint favors more iterations on the right
-      uint mid = midpoint(_i, _j);
-      j = _i;
-
-      r.done.store(false, std::memory_order_release);
-      r.hbt = (heartbeat_tokens + 1) >> 1;
-      r.i = mid;
-      r.j = _j;
-      r.consume_these_hbt();
-      r.enqueue();
-
-      // TODO: check if work stealing deque is full before enqueueing
-
-      if (_i >= mid) { l.i = l.j = 0; return; }
-      l.done.store(false, std::memory_order_release);
-      l.hbt = heartbeat_tokens;
-      l.i = _i;
-      l.j = mid;
-      l.consume_these_hbt();
-      l.enqueue();
-    });
-  if (!promotable) [[unlikely]] {
-    if (l.i < l.j) [[unlikely]] l.sync();
-    if (r.i < r.j) [[likely]] r.sync();
   }
 }
 
@@ -732,6 +857,20 @@ uint fib(uint n) {
     return l + r;
   }
 }
+
+// uint fibspork(uint n) {
+//   if (n <= 1) {
+//     return n;
+//   } else {
+//     return
+//       spork<uint, uint, uint>
+//         ([n] () {return fibspork(n - 1);},
+//          [n] () {return fibspork(n - 2);},
+//          [n] (uint l) {return l + fibspork(n - 2);},
+//          [] (uint l, uint r) { return l + r; },
+//          [n] () {});
+//   }
+// }
 } // namespace spork
 
 void print_uint_arr(const uint* arr, uint len) {
@@ -756,8 +895,8 @@ void print_uint_avg(const uint* arr, uint len) {
 template <typename F>
 __attribute__((always_inline))
 void p4(size_t s, size_t e, F&& f) {
-  //parlay::parallel_for(s, e, std::forward<F>(f), 1);
-  spork::parfor(s, e, std::forward<F>(f));
+  //parlay::parallel_for(s, e, fwd(f), 1);
+  spork::parfor<size_t>(s, e, fwd(f));
 }
 
 // template<typename A, typename Body, typename Combine>
@@ -769,33 +908,34 @@ void p4(size_t s, size_t e, F&& f) {
 //   if (n == 0) return z;
 //   if (n <= block_size) {
 //     A a = z;
-//     for (; i < j; i++) a = std::forward<Body>(body)(a, i);
+//     for (; i < j; i++) a = fwd(body)(a, i);
 //     return a;
 //   }
 
 //   A L, R;
 //   parlay::par_do([&] {L = reduce(z, body, binop, i, i + ((j - i) >> 1));},
 //                  [&] {R = reduce(z, body, binop, i + ((j - i) >> 1), j);});
-//   std::forward<Combine>(binop)(L,R);
+//   fwd(binop)(L,R);
 //   return L;
 // }
 
+template <typename idx, typename datnum>
+datnum* make_data(idx n) {
+  datnum* arr = new datnum[n];
+  if (arr) {
+    for (idx i = 0; i < n; i++) {
+      arr[i] = 1 + (i % 5);
+    }
+  } else {
+    std::cerr << "Failed to allocate data array" << std::endl;
+  }
+  return arr;
+}
 
 int main(int argc, char* argv[]) {
   //size_t n = atoi(argv[1]);
-  constexpr uint n = 8000000;
-  char data[n];
-  for (uint i = 0; i < n; i++) {
-    data[i] = 1 + (i % 5);
-  }
-
-  // this might take a sec the first time it is called
-  spork::WorkStealingJob::get_current_scheduler();
-#if RECORD_HEARTBEAT_STATS
-  spork::init_heartbeat_stats();
-#endif
-  
-  using num = unsigned long long;
+  using idxnum = unsigned;
+  using datnum = unsigned;
 
   // num total = 0;
   // volatile uint j = n*50;
@@ -803,10 +943,19 @@ int main(int argc, char* argv[]) {
   //   total += data[i % n];
   // }
   // std::cout << total << std::endl;
+
+  constexpr idxnum n = 80000000;
+  datnum* data = make_data<idxnum, datnum>(n);
   
   auto total_time = 0;
   constexpr uint WARMUP = 10;
   constexpr uint NUM_TRIALS = 30;
+
+  // this might take a sec the first time it is called
+  spork::WorkStealingJob::get_current_scheduler();
+#if RECORD_HEARTBEAT_STATS
+  spork::init_heartbeat_stats();
+#endif
 
   for (uint r = 0; r < WARMUP + NUM_TRIALS; r++) {
 #if RECORD_HEARTBEAT_STATS
@@ -825,16 +974,20 @@ int main(int argc, char* argv[]) {
     // });
     // parlay::parallel_for(0, n*50, [&] (uint i) { data[i % n] = 5; });
     // spork::parfor([&] (uint i) { data[i % n] = 5; }, 0, n*50);
-    num total =
+    // num total =
       // spork::seqfor(0, n*50, [&] (uint i, num& a) {a += data[i % n];}, parlay::plus<num>());
-      // spork::parfor_unroll2(0, n*50, [&] (uint i, num& a) {a += data[i % n];}, parlay::plus<num>());
-      spork::fibE(38);
+      // spork::parfor_unroll2<uint>(0, n*50, [&] (uint i, num& a) {a += data[i % n];}, parlay::plus<num>());
+    datnum total = 0;
+    // total = spork::parfor<idxnum, datnum>(0, n, [&] (idxnum i, datnum& a) {a += data[i];}, parlay::plus<datnum>());
+    // total = spork::seqfor<idxnum, datnum>(0, n, [&] (idxnum i, datnum& a) {a += data[i]; data[i] = a;}, parlay::plus<datnum>());
+    spork::scan<idxnum>(n, data, parlay::plus<datnum>());
+    // total = spork::fib(38);
     auto end = std::chrono::steady_clock::now();
 
     spork::pause_heartbeats();
     
     auto time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-    std::cout << /*(uint) data[n - 1]*/ total << " in " << time_ms << " ms";
+    std::cout << (datnum) data[n - 2] << " " << total << " in " << time_ms << " ms";
 #if RECORD_HEARTBEAT_STATS
     std::cout <<" (";
     print_uint_avg((uint*) spork::num_heartbeats, spork::WorkStealingJob::num_workers());

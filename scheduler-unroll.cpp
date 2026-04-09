@@ -621,7 +621,7 @@ void seqfor(idx i, idx j, const BodyLambda&& body) {
   for (; i < j; i++) fwd(body)(i);
 }
 
-template <typename idx, typename A, typename BodyLambda, typename BinOp>
+template <const uint unroll, typename idx, typename A, typename BodyLambda, typename BinOp>
 //__attribute__((always_inline)) // TODO: investigate what this attribute actually does
 A parfor(idx i, idx _j, const BodyLambda&& body, const BinOp&& binop) {
   static_assert(std::is_integral_v<idx>);
@@ -634,7 +634,7 @@ A parfor(idx i, idx _j, const BodyLambda&& body, const BinOp&& binop) {
     const BinOp&& binop;
     A a;
     void run() override {
-      a = parfor<idx, A, BodyLambda, BinOp>
+      a = parfor<unroll, idx, A, BodyLambda, BinOp>
         (i, j, fwd(body), fwd(binop));
     }
     SpwnJob(const BodyLambda&& _body, const BinOp&& _binop) :
@@ -645,17 +645,22 @@ A parfor(idx i, idx _j, const BodyLambda&& body, const BinOp&& binop) {
 
   SpwnJob l(fwd(body), fwd(binop));
   SpwnJob r(fwd(body), fwd(binop));
-  volatile idx j = _j;
+  volatile idx j = i + (_j - i - ((_j - i) % unroll));
   A a = binop.identity;
 
   bool promoted = spork(
     [&] () {
-      for (; i < j; i++) {
-        fwd(body)(i, a);
+      for (; i < j; i += unroll) {
+        idx i2 = i;
+        #pragma unroll(unroll)
+        for (idx r = 0; r < unroll; r++) {
+          fwd(body)(i2, a);
+          i2++;
+        }
       }
     },
     [&] () {
-      idx _i = i + 1;
+      idx _i = i + unroll;
       if (_i >= _j) { r.i = r.j = 0; l.i = l.j = 0; return; }
       idx mid = midpoint<idx>(_i, _j);
       j = _i;
@@ -679,13 +684,19 @@ A parfor(idx i, idx _j, const BodyLambda&& body, const BinOp&& binop) {
     if (r.i < r.j) [[likely]] {
       r.sync(false);
       a = binop(a, r.a);
+    } else {
+      goto last_loop;
     }
+    goto done;
   }
+  last_loop:
+  for (; i < _j; i++) fwd(body)(i, a);
+  done:
   return a;
 }
 
 
-template <typename idx, typename BodyLambda>
+template <const uint unroll, typename idx, typename BodyLambda>
 //__attribute__((always_inline)) // TODO: investigate what this attribute actually does
 void parfor(idx i, idx _j, const BodyLambda&& body) {
   static_assert(std::is_integral_v<idx>);
@@ -695,7 +706,7 @@ void parfor(idx i, idx _j, const BodyLambda&& body) {
     idx i, j;
     const BodyLambda&& body;
     void run() override {
-      parfor<idx, BodyLambda> (i, j, fwd(body));
+      parfor<unroll, idx, BodyLambda> (i, j, fwd(body));
     }
     SpwnJob(const BodyLambda&& _body) :
       WorkStealingJob(),
@@ -704,12 +715,21 @@ void parfor(idx i, idx _j, const BodyLambda&& body) {
 
   SpwnJob l(fwd(body));
   SpwnJob r(fwd(body));
-  volatile idx j = _j;
+  volatile idx j = i + (_j - i - ((_j - i) % unroll));
 
   bool promoted = spork(
-    [&] () { for (; i < j; i++) { fwd(body)(i); } },
     [&] () {
-      idx _i = i + 1;
+      for (; i < j; i += unroll) {
+        idx i2 = i;
+        #pragma unroll(unroll)
+        for (idx r = 0; r < unroll; r++) {
+          fwd(body)(i2);
+          i2++;
+        }
+      }
+    },
+    [&] () {
+      idx _i = i + unroll;
       if (_i >= _j) { r.i = r.j = 0; l.i = l.j = 0; return; }
       idx mid = midpoint<idx>(_i, _j);
       j = _i;
@@ -731,8 +751,14 @@ void parfor(idx i, idx _j, const BodyLambda&& body) {
     }
     if (r.i < r.j) [[likely]] {
       r.sync(false);
+    } else {
+      goto last_loop;
     }
   }
+  last_loop:
+  for (; i < _j; i++) fwd(body)(i);
+  done:
+  return;
 }
 
 template <typename idx>
@@ -741,16 +767,16 @@ constexpr idx scan_chunksize(idx n) {
   return (idx) sqrt((double) n);
 }
 
-template <typename idx, typename A, typename BinOp>
+template <const uint unroll, typename idx, typename A, typename BinOp>
 void scan(A a, A* arr, idx n, const BinOp&& binop);
 
-template <typename idx, typename A, typename BinOp>
+template <const uint unroll, typename idx, typename A, typename BinOp>
 __attribute__((always_inline))
 void scan(idx n, A* arr, const BinOp&& binop) {
-  scan<idx, A, BinOp>(fwd(binop).identity, arr, n, fwd(binop));
+  scan<unroll, idx, A, BinOp>(fwd(binop).identity, arr, n, fwd(binop));
 }
 
-template <typename idx, typename A, typename BinOp>
+template <const uint unroll, typename idx, typename A, typename BinOp>
 A* scan_upsweep(A* arr, idx n, const BinOp&& binop) {
   static_assert(parlay::is_monoid_for_v<BinOp, A>);
   static_assert(std::is_integral_v<idx>);
@@ -761,52 +787,58 @@ A* scan_upsweep(A* arr, idx n, const BinOp&& binop) {
   // so we can split chunks along cache lines
   A* partials = (A*) parlay::p_malloc((size_t) n*sizeof(A));
   if (partials) {
-    parfor<idx>(0, chunks, [=,&binop] (idx c) {
+    parfor<1, idx>(0, chunks, [=,&binop] (idx c) {
       idx start = c*chunksize;
       idx end = (chunksize > n - start) ? n : start + chunksize;
-      partials[c] = parfor<idx, A>(start, end, [&, arr] (idx i, A& sum) {
+      partials[c] = parfor<1, idx, A>(start, end, [&, arr] (idx i, A& sum) {
         sum = fwd(binop)(sum, arr[i]); }, fwd(binop));
     });
     
-    scan<idx, A, BinOp>(chunks, partials, fwd(binop));
+    scan<unroll, idx, A, BinOp>(chunks, partials, fwd(binop));
   }
   return partials;
 }
 
-template <typename idx, typename A, typename BinOp>
+template <const uint unroll, typename idx, typename A, typename BinOp>
 void scan_downsweep(A* partials, A* arr, idx n, const BinOp&& binop) {
   static_assert(parlay::is_monoid_for_v<BinOp, A>);
   static_assert(std::is_integral_v<idx>);
   idx chunksize = scan_chunksize(n);
   idx chunks = 1 + ((n - 1) / chunksize);
   
-  parfor<idx>(0, chunks, [=,&binop] (idx chunk) {
+  parfor<1, idx>(0, chunks, [=,&binop] (idx chunk) {
     A pfx = chunk ? fwd(binop)(arr[-1], partials[chunk - 1]) : arr[-1];
     idx start = chunk*chunksize;
     idx size = (chunksize > n - start) ? (n - start) : chunksize;
-    scan<idx, A, BinOp>(pfx, &arr[start], size, fwd(binop));
+    scan<unroll, idx, A, BinOp>(pfx, &arr[start], size, fwd(binop));
   });
   
   parlay::p_free(partials);
 }
 
-template <typename idx, typename A, typename BinOp>
+template <const uint unroll, typename idx, typename A, typename BinOp>
 void scan(A a, A* arr, idx n, const BinOp&& binop) {
   static_assert(parlay::is_monoid_for_v<BinOp, A>);
   static_assert(std::is_integral_v<idx>);
 
-  idx volatile j = n;
+  // idx volatile j = n;
+  idx nmod = n - (n % unroll);
+  idx volatile j = nmod;
   idx i = 0;
 
   bool promoted = spork(
     [&, arr] () { // body
-      for (; i < j; i++) {
-        a = fwd(binop)(a, arr[i]);
-        arr[i] = a;
+      for (; i < j; i += unroll) {
+        A* arr_i = &arr[i];
+        #pragma unroll(unroll)
+        for (idx r = 0; r < unroll; r++) {
+          a = fwd(binop)(a, arr_i[r]);
+          arr_i[r] = a;
+        }
       }
     },
     [&, n] () {
-      idx _i = i + 1;
+      idx _i = i + unroll;
       idx t1 = third1<idx>(_i, n);
       idx t2 = third2<idx>(_i, n);
       // only break if every third has work to do
@@ -815,37 +847,42 @@ void scan(A a, A* arr, idx n, const BinOp&& binop) {
 
   // TODO: could start spwn from prom handler above, then run body, then sync
   // (slightly less delayed spwn)
-  if (promoted && i != n) {
+  if (promoted && i != nmod) {
     idx t1 = third1<idx>(i, n);
     idx t2 = third2<idx>(i, n);
     spork<char, A*, char>(
       [=,&binop] () { // body
-        scan<idx, A, BinOp>(arr[i-1], &arr[i], t1 - i, fwd(binop));
+        scan<unroll, idx, A, BinOp>(arr[i-1], &arr[i], t1 - i, fwd(binop));
         return '\0';},
       [=,&binop] () { // spwn
-        return scan_upsweep<idx, A, BinOp>(&arr[t1], t2 - t1, fwd(binop));},
+        return scan_upsweep<unroll, idx, A, BinOp>(&arr[t1], t2 - t1, fwd(binop));},
       [=,&binop] (char _) { // unpr
-        scan<idx, A, BinOp>(arr[t1-1], &arr[t1], n - t1, fwd(binop));
+        scan<unroll, idx, A, BinOp>(arr[t1-1], &arr[t1], n - t1, fwd(binop));
         return '\0';},
       [=,&binop] (char _, A* partials) { // prom
         if (partials) {
           par([&binop, partials, arrt1 = &arr[t1], t21 = t2 - t1] () {
-                scan_downsweep<idx, A, BinOp>(partials, arrt1, t21, fwd(binop));
+                scan_downsweep<unroll, idx, A, BinOp>(partials, arrt1, t21, fwd(binop));
               },
               [=,&binop] () {
                 A sum12 = partials[(t2 - t1 - 1) / scan_chunksize(t2 - t1)];
                 A sum02 = fwd(binop)(arr[t1-1], sum12);
-                scan<idx, A, BinOp>(sum02, &arr[t2], n - t2, fwd(binop));
+                scan<unroll, idx, A, BinOp>(sum02, &arr[t2], n - t2, fwd(binop));
               });
         } else { // could not allocate the partials array
-          scan<idx, A, BinOp>(arr[t1-1], &arr[t1], n - t1, fwd(binop));
+          scan<unroll, idx, A, BinOp>(arr[t1-1], &arr[t1], n - t1, fwd(binop));
         }
         return '\0';
       },
       [=,&binop] (char _) { // unstolen
-        scan<idx, A, BinOp>(arr[t1-1], &arr[t1], n - t1, fwd(binop));
+        scan<unroll, idx, A, BinOp>(arr[t1-1], &arr[t1], n - t1, fwd(binop));
         return '\0';
       });
+  } else {
+    for (; i < n; i++) {
+      a = fwd(binop)(a, arr[i]);
+      arr[i] = a;
+    }
   }
 }
 
@@ -987,7 +1024,7 @@ int main(int argc, char* argv[]) {
     // total = spork::parfor<4, idxnum, datnum>(0, n, [&] (idxnum i, datnum& a) {a += data[i];}, parlay::plus<datnum>());
     // total = spork::seqfor<idxnum, datnum>(0, n, [&] (idxnum i, datnum& a) {a += data[i];}, parlay::plus<datnum>());
     // total = spork::seqfor<idxnum, datnum>(0, n, [&] (idxnum i, datnum& a) {a += data[i]; data[i] = a;}, parlay::plus<datnum>());
-    spork::scan(n, data, parlay::plus<datnum>());
+    spork::scan<5>(n, data, parlay::plus<datnum>());
     // total = spork::fib(38);
     auto end = std::chrono::steady_clock::now();
 

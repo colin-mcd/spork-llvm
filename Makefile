@@ -9,42 +9,42 @@ SETPATH := LD_PRELOAD=/usr/local/lib/libjemalloc.so
 OPTIONS := -xc++ -stdlib=libc++ -std=c++20
 LLVMOPT := -fpass-plugin=./pass/build/RtsSporkPass.so
 
-scheduler: scheduler.cpp
+scheduler: scheduler.cpp *.hpp
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) $< -o $@
 
-schedulerO1: scheduler.cpp
+schedulerO1: scheduler.cpp *.hpp
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) -O1 $< -o $@
-schedulerO2: scheduler.cpp
+schedulerO2: scheduler.cpp *.hpp
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) -O2 $< -o $@
-schedulerO3: scheduler.cpp
+schedulerO3: scheduler.cpp *.hpp
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) -O3 $< -o $@
 
-schedulerO1.s: scheduler.cpp
+schedulerO1.s: scheduler.cpp *.hpp
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -O1 -S $< -o $@
-schedulerO2.s: scheduler.cpp
+schedulerO2.s: scheduler.cpp *.hpp
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -O2 -S $< -o $@
-schedulerO3.s: scheduler.cpp
+schedulerO3.s: scheduler.cpp *.hpp
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -O3 -S $< -o $@
 
-scheduler.i: scheduler.cpp
+scheduler.i: scheduler.cpp *.hpp
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(OPTIONS) $(DBGFLAG) -E $< -o $@
 
-scheduler.s: scheduler.cpp
+scheduler.s: scheduler.cpp *.hpp
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(OPTIONS) $(DBGFLAG) -S $< -o $@
 
-scheduler.o: scheduler.cpp
+scheduler.o: scheduler.cpp *.hpp
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(OPTIONS) -S $< -o $@
 
-scheduler.ll: scheduler.cpp
+scheduler.ll: scheduler.cpp *.hpp
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(OPTIONS) -O2 -S -emit-llvm $< -o $@
 
-scheduler.opt.ll: scheduler.ll
+scheduler.opt.ll: scheduler.ll *.hpp
 	$(SETPATH) $(OPTLLVM) -S -O3 $< -o $@
 
 pass/build/RtsSporkPass.so: pass/RtsSporkPass.cpp pass/rts_spork_table.h
 	$(MAKE) -C pass/build
 
-llvmtest: scheduler.cpp pass/build/RtsSporkPass.so
+llvmtest: scheduler.cpp *.hpp pass/build/RtsSporkPass.so
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(OPTIONS) $(LIBRARY) $(DBGFLAG) $(LLVMOPT) $< -o $@
 
 .PHONY: clean

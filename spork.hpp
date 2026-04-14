@@ -21,20 +21,17 @@ RR spork(const BodyL&& body, const SpwnL&& spwn, const UnprL&& unpr, const PromL
     SpwnJob(const SpwnL&& _spwn) :
       WorkStealingJob(),
       spwn(fwd(_spwn)) {}
-    SpwnJob(SpwnJob&& other) :
-      WorkStealingJob(fwd(other)),
-      spwn(fwd(other.spwn)) {}
   };
   
-  volatile SpwnJob jp(fwd(spwn));
+  SpwnJob jp(fwd(spwn));
   BR br;
 
   bool promoted = with_prom_handler(
     [&] () { br = fwd(body)(); },
-    [&] () { ((SpwnJob*) &jp)->enqueue(heartbeat_tokens >> 1); });
+    [&] () { jp.enqueue(heartbeat_tokens >> 1); });
 
   if (promoted) [[unlikely]] { // promoted
-    if (((SpwnJob*) &jp)->sync_is_stolen()) {
+    if (jp.sync_is_stolen()) {
       return fwd(prom)(br, jp.sr);
     } else {
       return fwd(unst)(br);

@@ -49,7 +49,7 @@ void pause_heartbeats() noexcept;
 
 // Derived from `parlaylib/include/parlay/internal/work_stealing_job.h`
 struct WorkStealingJob {
-  using scheduler_t = parlay::scheduler<volatile WorkStealingJob>;
+  using scheduler_t = parlay::scheduler<WorkStealingJob>;
   static scheduler_t& get_current_scheduler() {
     scheduler_t* current_scheduler = scheduler_t::get_current_scheduler();
     if (current_scheduler == nullptr) {
@@ -69,11 +69,11 @@ struct WorkStealingJob {
 
   // WorkStealingJob(WorkStealingJob&& other) : done(false), hbt(other.hbt) {}
   
-  void operator()() volatile {
+  void operator()() {
     assert(done.load(std::memory_order_relaxed) == false);
     heartbeat_tokens = hbt;
     start_heartbeats();
-    const_cast<WorkStealingJob*>(this)->run();
+    run();
     pause_heartbeats();
     done.store(true, std::memory_order_release);
   }
@@ -82,7 +82,7 @@ struct WorkStealingJob {
     return done.load(std::memory_order_acquire);
   }
 
-  void wait() volatile const noexcept {
+  void wait() const noexcept {
     // since we ALWAYS promote innermost-first,
     // all potential parallelism is fully promoted by now
     // thus, no reason to get heartbeats while waiting
@@ -92,7 +92,7 @@ struct WorkStealingJob {
     start_heartbeats();
   }
 
-  void enqueue(uint with_tokens = 0) volatile {
+  void enqueue(uint with_tokens = 0) {
     // done.store(false, std::memory_order_release);
     // done = false;
     hbt = with_tokens;
@@ -105,12 +105,12 @@ struct WorkStealingJob {
     return get_current_scheduler().get_own_job() != nullptr;
   }
 
-  void fast_clone(bool reclaim_tokens) volatile {
+  void fast_clone(bool reclaim_tokens) {
     if (reclaim_tokens) heartbeat_tokens = heartbeat_tokens + hbt;
     const_cast<WorkStealingJob*>(this)->run();
   }
 
-  void sync(bool reclaim_tokens) volatile {
+  void sync(bool reclaim_tokens) {
     if (try_dequeue()) { // unstolen
       fast_clone(reclaim_tokens);
     } else { // stolen
@@ -138,12 +138,12 @@ struct WorkStealingJob {
   // }
 
   virtual void run() = 0;
-  std::atomic<bool> done; // TODO: try a `std::atomic_flag` instead
+  volatile std::atomic<bool> done; // TODO: try a `std::atomic_flag` instead
   // ^^^ if you do, need to later initialize it to `ATOMIC_FLAG_INIT`
   // before any operations, and then `done.test_and_set` to set it to true (returning prev value),
   // and `done.clear` to reset to false.
   // Note: `done.test` atomically returns value of flag
-  uint hbt; // heartbeat tokens
+  volatile uint hbt; // heartbeat tokens
 };
 
 namespace { // private

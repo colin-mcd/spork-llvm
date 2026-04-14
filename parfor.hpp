@@ -65,7 +65,7 @@ parlay::monoid_value_type_t<BinOp> parfor(idx i, idx j, const BodyLambda&& body,
   static_assert(std::is_invocable_r_v<void, BodyLambda&, idx, A&>);
 
   struct SpwnJob : WorkStealingJob {
-    idx i, j;
+    volatile idx i, j;
     const BodyLambda&& body;
     const BinOp&& binop;
     A a;
@@ -98,9 +98,7 @@ parlay::monoid_value_type_t<BinOp> parfor(idx i, idx j, const BodyLambda&& body,
     [&] () {
       for (; i < loop_end;) {
         fwd(body)(i, a);
-        //std::atomic_signal_fence(std::memory_order_acquire);
         sig_safe_i = static_cast<sig_atomic_t>(++i);
-        //std::atomic_signal_fence(std::memory_order_release);
       }
     },
     [&] () {

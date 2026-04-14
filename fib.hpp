@@ -17,7 +17,7 @@ inline uint fibE(uint n) {
     // SpwnJob(SpwnJob&& other) : WorkStealingJob(fwd(other)), n(fwd(other.n)) {}
   };
   
-  volatile SpwnJob jp(n);
+  SpwnJob jp(n);
   uint l;
 
   bool promoted = with_prom_handler(

@@ -14,7 +14,6 @@ inline uint fibE(uint n) {
     void run() override { r = fibE(n - 2); }
     
     SpwnJob(const uint _n) : WorkStealingJob(), n(_n) {}
-    // SpwnJob(SpwnJob&& other) : WorkStealingJob(fwd(other)), n(fwd(other.n)) {}
   };
   
   SpwnJob jp(n);
@@ -40,10 +39,6 @@ inline uint fibSeq(uint n) {
     return n;
   } else {
     return fibSeq(n-1) + fibSeq(n-2);
-    // uint l, r;
-    // parSeq([&, n] () {l = fibSeq(n - 1);},
-    //        [&, n] () {r = fibSeq(n - 2);});
-    // return l + r;
   }
 }
 

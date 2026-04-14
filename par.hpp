@@ -26,9 +26,6 @@ void par(const LambdaL&& lamL, const LambdaR&& lamR) {
     SpwnJob(const LambdaR&& lamR) :
       WorkStealingJob(),
       lamR(fwd(lamR)) {}
-    // SpwnJob(SpwnJob&& other) :
-    //   WorkStealingJob(fwd(other)),
-    //   lamR(fwd(other.lamR)) {}
   };
   
   SpwnJob jp(fwd(lamR));

@@ -48,14 +48,6 @@ constexpr static const idx midpoint(idx i, idx j) noexcept {
 }
 } // private
 
-// template<typename T>
-// struct plus : public std::plus<> {
-//   static_assert(is_binary_operator_for_v<std::plus<>, T>);
-//   T identity;
-//   plus() : identity(0) { }
-//   explicit plus(T identity_) : identity(std::move(identity_)) { }
-// };
-
 template <typename idx, typename BodyLambda, typename BinOp>
 //__attribute__((always_inline)) // TODO: investigate what this attribute actually does
 parlay::monoid_value_type_t<BinOp> parfor(idx i, idx j, const BodyLambda&& body, const BinOp&& binop) {
@@ -84,8 +76,6 @@ parlay::monoid_value_type_t<BinOp> parfor(idx i, idx j, const BodyLambda&& body,
   // make sure that loop index can fit in `i`
   static_assert(sizeof(sig_atomic_t) >= sizeof(idx));
   // static_assert(std::numeric_limits<sig_atomic_t>::max() >= std::numeric_limits<idx>::max());
-  // TODO: do we need to use a `std::atomic_signal_fence` anywhere?
-  // https://en.cppreference.com/w/cpp/atomic/atomic_signal_fence.html
 
   // main code may write `sig_safe_i`; signal handler may only read
   volatile sig_atomic_t sig_safe_i = i;

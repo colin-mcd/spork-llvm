@@ -40,12 +40,12 @@ void seqfor(idx n, const BodyLambda&& body) {
 
 
 namespace { // private
-template <typename idx>
-__attribute__((always_inline))
-constexpr const idx midpoint(idx i, idx j) noexcept {
-  static_assert(std::is_integral_v<idx>);
-  return i + ((j - i) / 2);
-}
+  template <typename idx>
+  __attribute__((always_inline))
+  constexpr const idx midpoint(idx i, idx j) noexcept {
+    static_assert(std::is_integral_v<idx>);
+    return i + ((j - i) / 2);
+  }
 } // private
 
 template <typename idx, typename BodyLambda, typename BinOp>

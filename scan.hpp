@@ -8,12 +8,6 @@
 
 namespace spork {
 
-template <typename idx>
-constexpr idx scan_chunksize(idx n) {
-  // TODO: ideally, all splits would be along cache lines
-  return (idx) sqrt((double) n);
-}
-
 template <typename idx, typename A, typename BinOp>
 void scan(A a, A* arr, idx n, const BinOp&& binop);
 
@@ -23,8 +17,15 @@ void scan(idx n, A* arr, const BinOp&& binop) {
   scan<idx, A, BinOp>(fwd(binop).identity, arr, n, fwd(binop));
 }
 
+template <typename idx>
+__attribute__((always_inline))
+constexpr static idx scan_chunksize(idx n) {
+  // TODO: ideally, all splits would be along cache lines
+  return (idx) sqrt((double) n);
+}
+
 template <typename idx, typename A, typename BinOp>
-A* scan_upsweep(A* arr, idx n, const BinOp&& binop) {
+static A* scan_upsweep(A* arr, idx n, const BinOp&& binop) {
   static_assert(parlay::is_monoid_for_v<BinOp, A>);
   static_assert(std::is_integral_v<idx>);
 
@@ -47,7 +48,7 @@ A* scan_upsweep(A* arr, idx n, const BinOp&& binop) {
 }
 
 template <typename idx, typename A, typename BinOp>
-void scan_downsweep(A* partials, A* arr, idx n, const BinOp&& binop) {
+static void scan_downsweep(A* partials, A* arr, idx n, const BinOp&& binop) {
   static_assert(parlay::is_monoid_for_v<BinOp, A>);
   static_assert(std::is_integral_v<idx>);
   idx chunksize = scan_chunksize(n);
@@ -63,16 +64,15 @@ void scan_downsweep(A* partials, A* arr, idx n, const BinOp&& binop) {
   parlay::p_free(partials);
 }
 
-
 template <typename idx>
 __attribute__((always_inline))
-constexpr static idx third1(idx i, idx j) noexcept {
+static constexpr idx third1(idx i, idx j) noexcept {
   static_assert(std::is_integral_v<idx>);
   return i + ((j - i) / 5);
 }
 template <typename idx>
 __attribute__((always_inline))
-constexpr static idx third2(idx i, idx j) noexcept {
+static constexpr idx third2(idx i, idx j) noexcept {
   static_assert(std::is_integral_v<idx>);
   return j - 1 * ((j - i) / 5);
 }

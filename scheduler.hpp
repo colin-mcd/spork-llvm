@@ -29,6 +29,7 @@
 // TODO: consistent name casing (camel or snake)
 // TODO: consider adaptive heartbeat timer intervals
 // TODO: look into if loop unrolling is why reduce is slower than reduceSeq
+// TODO: consider if writing pointers is async-signal-safe
 
 namespace spork {
 
@@ -66,7 +67,7 @@ struct WorkStealingJob {
 
   WorkStealingJob() {}
 
-  WorkStealingJob(WorkStealingJob&& other) : done(false), hbt(other.hbt) {}
+  // WorkStealingJob(WorkStealingJob&& other) : done(false), hbt(other.hbt) {}
   
   void operator()() volatile {
     assert(done.load(std::memory_order_relaxed) == false);
@@ -76,9 +77,11 @@ struct WorkStealingJob {
     pause_heartbeats();
     done.store(true, std::memory_order_release);
   }
+
   [[nodiscard]] bool finished() volatile const noexcept {
     return done.load(std::memory_order_acquire);
   }
+
   void wait() volatile const noexcept {
     // since we ALWAYS promote innermost-first,
     // all potential parallelism is fully promoted by now
@@ -177,7 +180,7 @@ namespace { // private
     consteval explicit SporkSlot() :
       promoted(true), promfn(nullptr), prev(nullptr), next(nullptr) {}
 
-    ~SporkSlot();
+    // ~SporkSlot();
   
     explicit SporkSlot(const PromFn* _promfn);
     static void reset();
@@ -191,8 +194,9 @@ namespace { // private
   
   // sentinel node for spork deque
   inline constinit thread_local SporkSlot spork_deque_front;
-  // `spork_deque_back` points to the back of the spork deque
-  inline constinit thread_local SporkSlot*volatile* spork_deque_back;
+  // `spork_deque_back` points to the `next` pointer of the last slot in spork deque
+  // (a slot is at the back if the address of its `next` pointer equals `spork_deque_back`)
+  inline constinit thread_local SporkSlot * volatile * volatile spork_deque_back;
   
   // The constructor and `close()` for `SporkSlot` may
   // write to `spork_deque_back`, but the signal handler may only read.
@@ -220,9 +224,9 @@ namespace { // private
     return promoted;
   }
 
-  inline SporkSlot::~SporkSlot() {
-    spork_deque_back = prev;
-  }
+  // inline SporkSlot::~SporkSlot() {
+  //   spork_deque_back = prev;
+  // }
   
   inline void SporkSlot::promote() {
     //assert(promotable);
@@ -415,7 +419,7 @@ inline bool with_prom_handler(const BodyLambda&& body, const PromLambda&& prom) 
   if (heartbeat_tokens) [[unlikely]]
     slot.eager_promote(fwd(prom));
   fwd(body)();
-  return slot.promoted;
+  return slot.close();
 }
 }
 

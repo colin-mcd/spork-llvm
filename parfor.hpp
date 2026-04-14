@@ -78,8 +78,8 @@ parlay::monoid_value_type_t<BinOp> parfor(idx i, idx j, const BodyLambda&& body,
       binop(fwd(_binop)) {}
   };
 
-  volatile SpwnJob l(fwd(body), fwd(binop));
-  volatile SpwnJob r(fwd(body), fwd(binop));
+  SpwnJob l(fwd(body), fwd(binop));
+  SpwnJob r(fwd(body), fwd(binop));
 
   // make sure that loop index can fit in `i`
   static_assert(sizeof(sig_atomic_t) >= sizeof(idx));

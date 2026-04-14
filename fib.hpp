@@ -14,7 +14,7 @@ inline uint fibE(uint n) {
     void run() override { r = fibE(n - 2); }
     
     SpwnJob(const uint _n) : WorkStealingJob(), n(_n) {}
-    SpwnJob(SpwnJob&& other) : WorkStealingJob(fwd(other)), n(fwd(other.n)) {}
+    // SpwnJob(SpwnJob&& other) : WorkStealingJob(fwd(other)), n(fwd(other.n)) {}
   };
   
   volatile SpwnJob jp(n);

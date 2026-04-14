@@ -1,4 +1,5 @@
-CLANGPP := ~/code/llvm-project/build/bin/clang++
+CLANGPP := ~/code/llvm-project/build/bin/clang++ -stdlib=libc++
+# CLANGPP := g++
 OPTLLVM := ~/code/llvm-project/build/bin/opt
 #INCLUDE := -I./parlaylib/include/ -I/usr/include/libunwind/
 INCLUDE := -I./parlaylib/include/
@@ -6,39 +7,39 @@ DBGFLAG := -ggdb
 #LIBRARY := -lpthread -lunwind
 LIBRARY := -lpthread
 SETPATH := LD_PRELOAD=/usr/local/lib/libjemalloc.so
-OPTIONS := -xc++ -stdlib=libc++ -std=c++20
+OPTIONS := -xc++ -std=c++20
 LLVMOPT := -fpass-plugin=./pass/build/RtsSporkPass.so
 
-scheduler: scheduler.cpp *.hpp
+scheduler: scheduler.cpp *.hpp Makefile
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) $< -o $@
 
-schedulerO1: scheduler.cpp *.hpp
+schedulerO1: scheduler.cpp *.hpp Makefile
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) -O1 $< -o $@
-schedulerO2: scheduler.cpp *.hpp
+schedulerO2: scheduler.cpp *.hpp Makefile
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) -O2 $< -o $@
-schedulerO3: scheduler.cpp *.hpp
+schedulerO3: scheduler.cpp *.hpp Makefile
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) -O3 $< -o $@
 
-schedulerO1.s: scheduler.cpp *.hpp
+schedulerO1.s: scheduler.cpp *.hpp Makefile
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -O1 -S $< -o $@
-schedulerO2.s: scheduler.cpp *.hpp
+schedulerO2.s: scheduler.cpp *.hpp Makefile
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -O2 -S $< -o $@
-schedulerO3.s: scheduler.cpp *.hpp
+schedulerO3.s: scheduler.cpp *.hpp Makefile
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -O3 -S $< -o $@
 
-scheduler.i: scheduler.cpp *.hpp
+scheduler.i: scheduler.cpp *.hpp Makefile
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(OPTIONS) $(DBGFLAG) -E $< -o $@
 
-scheduler.s: scheduler.cpp *.hpp
+scheduler.s: scheduler.cpp *.hpp Makefile
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(OPTIONS) $(DBGFLAG) -S $< -o $@
 
-scheduler.o: scheduler.cpp *.hpp
+scheduler.o: scheduler.cpp *.hpp Makefile
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(OPTIONS) -S $< -o $@
 
-scheduler.ll: scheduler.cpp *.hpp
+scheduler.ll: scheduler.cpp *.hpp Makefile
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(OPTIONS) -O2 -S -emit-llvm $< -o $@
 
-scheduler.opt.ll: scheduler.ll *.hpp
+scheduler.opt.ll: scheduler.ll *.hpp Makefile
 	$(SETPATH) $(OPTLLVM) -S -O3 $< -o $@
 
 pass/build/RtsSporkPass.so: pass/RtsSporkPass.cpp pass/rts_spork_table.h

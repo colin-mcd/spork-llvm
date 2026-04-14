@@ -153,34 +153,21 @@ namespace { // private
   };
   
   struct SporkSlot {
-    // TODO: consider making `prom_flag` not a pointer,
-    // storing `spork`'s `volatile bool promotable_flag` inside this struct
     // TODO: otherwise, we can probably view this as nonvolatile from this struct
     volatile bool promoted;
     const PromFn* promfn;
+    // `prev` does not need to be volatile itself, since the signal handler never uses it
     SporkSlot*volatile* prev;
+    // Pointer to the next spork slot. Before following it,
+    // check if this is already the back of the spork deque:
+    // `&next == spork_deque_back`.
+    // Note: `next` may be a dangling pointer.
     SporkSlot* volatile next;
   
-    explicit SporkSlot(const PromFn* _promfn, SporkSlot** _prev, SporkSlot* _next) :
-      promoted(false),
-      promfn(_promfn),
-      prev(_prev),
-      next(_next) {}
-    explicit SporkSlot(const SporkSlot& other) :
-      promoted(other.promoted),
-      promfn(other.promfn),
-      prev(other.prev),
-      next(other.next) {}
-    explicit SporkSlot(SporkSlot&& other) :
-      promoted(other.promoted),
-      promfn(fwd(other.promfn)),
-      prev(fwd(other.prev)),
-      next(fwd(other.next)) {};
-    // sentinel spork slot for `spork_deque_front`
+    // Constructs the sentinel spork slot for `spork_deque_front`.
+    // DO NOT USE OTHERWISE!
     consteval explicit SporkSlot() :
       promoted(true), promfn(nullptr), prev(nullptr), next(nullptr) {}
-
-    // ~SporkSlot();
   
     explicit SporkSlot(const PromFn* _promfn);
     static void reset();
@@ -223,10 +210,6 @@ namespace { // private
     spork_deque_back = prev;
     return promoted;
   }
-
-  // inline SporkSlot::~SporkSlot() {
-  //   spork_deque_back = prev;
-  // }
   
   inline void SporkSlot::promote() {
     //assert(promotable);
@@ -235,44 +218,13 @@ namespace { // private
     (*((PromFn*) promfn))();
   }
   
-  // __attribute__((noinline))
-  // void SporkSlot::eager_promote() {
-  //   bool before = disable_heartbeats;
-  //   disable_heartbeats = true;
-  //   promote();
-  //   disable_heartbeats = before;
-  // }
-  
   inline void SporkSlot::promote_front() {
     if (&spork_deque_front.next == spork_deque_back) return;
     SporkSlot* slot = spork_deque_front.next;
     while (heartbeat_tokens) {
-      if (!slot->promoted) {
-        slot->promote();
-        // if (slot == spork_deque_back) {
-        // } else {
-        //   slot->prev = &spork_deque_front;
-        // }
-        //slot = slot->next;
-        // if this slot can no longer be promoted,
-        // we can skip it next time we search
-        // TODO: fix this below
-        // if (!(*(slot->entry->promotable_flag))) {
-        //   if (slot != spork_deque_back) {
-        //     slot = slot->next;
-        //     spork_deque_front.next = slot;
-        //   } else {
-        //     slot->prev = &spork_deque_front;
-        //   }
-        // }
-      }
-      if (&slot->next == spork_deque_back) {
-        //slot->prev = &spork_deque_front;
-        break;
-      } else {
-        slot = slot->next;
-        //spork_deque_front.next = slot;
-      }
+      if (!slot->promoted) slot->promote();
+      if (&slot->next == spork_deque_back) break;
+      else slot = slot->next;
     }
   }
 
@@ -289,7 +241,6 @@ namespace { // private
       heartbeat_tokens = heartbeat_tokens - 1;
       promoted = true;
       fwd(prom)();
-      //spork_deque_front.next = spork_deque_back;
     }
     // restore
     disable_heartbeats = before;

@@ -68,16 +68,15 @@ struct WorkStealingJob {
   WorkStealingJob() {}
   
   void operator()() {
-    assert(done.load(std::memory_order_relaxed) == false);
     heartbeat_tokens = hbt;
     start_heartbeats();
     run();
     pause_heartbeats();
-    done.store(true, std::memory_order_release);
+    assert(!done.test_and_set(std::memory_order_release));
   }
 
   [[nodiscard]] bool finished() volatile const noexcept {
-    return done.load(std::memory_order_acquire);
+    return done.test(std::memory_order_acquire);
   }
 
   void wait() const noexcept {
@@ -125,11 +124,7 @@ struct WorkStealingJob {
   }
 
   virtual void run() = 0;
-  volatile std::atomic<bool> done; // TODO: try a `std::atomic_flag` instead
-  // ^^^ if you do, need to later initialize it to `ATOMIC_FLAG_INIT`
-  // before any operations, and then `done.test_and_set` to set it to true (returning prev value),
-  // and `done.clear` to reset to false.
-  // Note: `done.test` atomically returns value of flag
+  volatile std::atomic_flag done;
   volatile uint hbt; // heartbeat tokens
 };
 

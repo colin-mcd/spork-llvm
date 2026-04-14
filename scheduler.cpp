@@ -1,5 +1,7 @@
 #include "scheduler.hpp"
 #include "scan.hpp"
+#include "fib.hpp"
+
 
 void print_uint_arr(const uint* arr, uint len) {
   std::cout << "[";
@@ -20,14 +22,16 @@ void print_uint_avg(const uint* arr, uint len) {
   }
 }
 
-// void waste_some_time() {
-//   for (uint i = 0; i < 1000000; i++) {
-//     if (i % 12345 == 678901241) [[likely]] {
-//       // should never happen
-//       std::cout << "waste_some_time i = " << i << std::endl;
-//     }
-//   }
-// }
+void waste_some_time() {
+  static uint x = 110101241;
+  for (uint i = 0; i < 10000000; i++) {
+    x ^= x + 21521809;
+    if (x % 12345 == 67890) [[likely]] {
+      // should never happen
+      std::cout << "waste_some_time i = " << i << std::endl;
+    }
+  }
+}
 
 // int setup_perf_interrupt(long long period_cycles) {
 //   struct perf_event_attr pe{};
@@ -54,43 +58,29 @@ void print_uint_avg(const uint* arr, uint len) {
 //   spork::parfor<size_t>(s, e, fwd(f));
 // }
 
-// template<typename A, typename Body, typename Combine>
-// auto parlayreduce(A z, const Body&& body, const Combine&& binop, uint i, uint j) {
-//   static_assert(std::is_invocable_r_v<void, Body&, uint, A&>);
-//   static_assert(std::is_invocable_r_v<void, Combine&, A&, A>);
-//   long n = j - i;
-//   long block_size = 100;
-//   if (n == 0) return z;
-//   if (n <= block_size) {
-//     A a = z;
-//     for (; i < j; i++) a = fwd(body)(a, i);
-//     return a;
-//   }
-
-//   A L, R;
-//   parlay::par_do([&] {L = reduce(z, body, binop, i, i + ((j - i) >> 1));},
-//                  [&] {R = reduce(z, body, binop, i + ((j - i) >> 1), j);});
-//   fwd(binop)(L,R);
-//   return L;
-// }
-
 template <typename idx, typename datnum>
 datnum* make_data(idx n) {
   datnum* arr = (datnum*) parlay::p_malloc(static_cast<size_t>(n) * sizeof(datnum));
   if (arr) {
     for (idx i = 0; i < n; i++) {
-      arr[i] = 1 + (i % 5);
+      arr[i] = (i % (idx) 2);
     }
   } else {
     std::cerr << "Failed to allocate data array" << std::endl;
+    exit(1);
   }
   return arr;
+}
+
+template <typename datnum>
+void free_data(datnum* arr) {
+  parlay::p_free(arr);
 }
 
 int main(int argc, char* argv[]) {
   //size_t n = atoi(argv[1]);
   using idxnum = unsigned;
-  using datnum = unsigned long long;
+  using datnum = int;
 
   // num total = 0;
   // volatile uint j = n*50;
@@ -99,7 +89,7 @@ int main(int argc, char* argv[]) {
   // }
   // std::cout << total << std::endl;
 
-  constexpr idxnum n = 80000000;
+  constexpr idxnum n = 800000000;
   datnum* data = make_data<idxnum, datnum>(n);
   
   auto total_time = 0;
@@ -129,11 +119,13 @@ int main(int argc, char* argv[]) {
       // spork::seqfor(0, n*50, [&] (uint i, num& a) {a += data[i % n];}, parlay::plus<num>());
       // spork::parfor_unroll2<uint>(0, n*50, [&] (uint i, num& a) {a += data[i % n];}, parlay::plus<num>());
     datnum total = 0;
-    total = spork::parfor<idxnum, datnum>(0, n, [&] (idxnum i, datnum& a) {a += data[i];}, parlay::plus<datnum>());
+    // total = spork::parfor(n, [&] (idxnum i, datnum& a) { a += data[i]; }, parlay::plus<datnum>());
+    // spork::parfor(n, [&] (idxnum i) {data[i]++;});
+    // total = spork::parfor<idxnum>(0, n, [&] (idxnum i, datnum& a) {waste_some_time(); a += data[i];}, parlay::plus<datnum>());
     // total = spork::seqfor<idxnum, datnum>(0, n, [&] (idxnum i, datnum& a) {a += data[i];}, parlay::plus<datnum>());
     // total = spork::seqfor<idxnum, datnum>(0, n, [&] (idxnum i, datnum& a) {a += data[i]; data[i] = a;}, parlay::plus<datnum>());
     // spork::scan(n, data, parlay::plus<datnum>());
-    // total = spork::fib(38);
+    total = spork::fib(38);
     auto end = std::chrono::steady_clock::now();
 
     spork::pause_heartbeats();
@@ -153,4 +145,5 @@ int main(int argc, char* argv[]) {
   std::cout << "Average " << (total_time / NUM_TRIALS) << " ms" << std::endl;
 
   spork::pause_heartbeats();
+  free_data(data);
 }

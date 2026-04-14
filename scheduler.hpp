@@ -66,8 +66,6 @@ struct WorkStealingJob {
   }
 
   WorkStealingJob() {}
-
-  // WorkStealingJob(WorkStealingJob&& other) : done(false), hbt(other.hbt) {}
   
   void operator()() {
     assert(done.load(std::memory_order_relaxed) == false);
@@ -93,8 +91,6 @@ struct WorkStealingJob {
   }
 
   void enqueue(uint with_tokens = 0) {
-    // done.store(false, std::memory_order_release);
-    // done = false;
     hbt = with_tokens;
     if (with_tokens) heartbeat_tokens = heartbeat_tokens - with_tokens;
     // TODO: make sure queue doesn't overflow (max 1000, aborts if hit)
@@ -117,9 +113,6 @@ struct WorkStealingJob {
       if (!finished()) wait();
     }
   }
-  // void sync(bool reclaim_tokens) volatile {
-  //   ((WorkStealingJob*) this)->sync(reclaim_tokens);
-  // }
 
   // if stolen, waits until finished and then returns true;
   // otherwise, returns false.
@@ -130,12 +123,6 @@ struct WorkStealingJob {
     }
     return false;
   }
-
-  // pretends a volatile WorkStealingJob is nonvolatile
-  // __attribute__((always_inline))
-  // WorkStealingJob& pretend_nonvolatile() volatile noexcept {
-  //   return const_cast<WorkStealingJob&>(*this);
-  // }
 
   virtual void run() = 0;
   volatile std::atomic<bool> done; // TODO: try a `std::atomic_flag` instead
@@ -356,8 +343,7 @@ struct PromSpork : PromFn {
 };
 
 // TODO: exception handling
-// TODO: look into using `parlay::copyable_function_wrapper` from `utilities.h`
-// (and perhaps also `padded<...>`)
+// Look into parlay's `padded<...>`
 template <typename BodyLambda, typename PromLambda>
 __attribute__((always_inline))
 inline bool with_prom_handler(const BodyLambda&& body, const PromLambda&& prom) {

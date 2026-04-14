@@ -86,9 +86,8 @@ parlay::monoid_value_type_t<BinOp> parfor(idx i, idx j, const BodyLambda&& body,
 
   bool promoted = with_prom_handler(
     [&] () {
-      for (; i < loop_end;) {
+      for (; i < loop_end; sig_safe_i = static_cast<sig_atomic_t>(++i)) {
         fwd(body)(i, a);
-        sig_safe_i = static_cast<sig_atomic_t>(++i);
       }
     },
     [&] () {

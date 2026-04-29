@@ -1,6 +1,8 @@
-CLANGPP := ~/code/llvm-project/build/bin/clang++ -stdlib=libc++
+# CLANGPP := ~/code/llvm-project/build/bin/clang++ -stdlib=libc++
+CLANGPP := clang++ -stdlib=libc++
 # CLANGPP := g++
-OPTLLVM := ~/code/llvm-project/build/bin/opt
+# OPTLLVM := ~/code/llvm-project/build/bin/opt
+OPTLLVM := opt
 #INCLUDE := -I./parlaylib/include/ -I/usr/include/libunwind/
 INCLUDE := -I./parlaylib/include/
 DBGFLAG := -ggdb

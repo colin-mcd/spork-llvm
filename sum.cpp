@@ -15,7 +15,7 @@ int main(int argc, char* argv[]) {
   using datnum = short;
   parlay::sequence<datnum> data = parlay::tabulate(n, [&] (long k) -> datnum { return 1; });
   benchmark([n, &data] () {
-    return spork::seqfor(n, [&] (idxnum i, datnum& total) {
+    return spork::parfor(n, [&] (idxnum i, datnum& total) {
       total += data[i];
     }, parlay::plus<datnum>());
   });

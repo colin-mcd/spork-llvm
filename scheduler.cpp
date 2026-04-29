@@ -3,28 +3,9 @@
 #include "scan.hpp"
 #include "fib.hpp"
 #include "parlay/sequence.h"
+#include "benchmark.hpp"
 // #include "parlay/parallel.h"
 // #include "parlay/primitives.h"
-
-
-void print_uint_arr(const uint* arr, uint len) {
-  std::cout << "[";
-  if (arr && len) {
-    std::cout << arr[0];
-    for (uint i = 1; i < len; i++) std::cout << ", " << arr[i];
-  }
-  std::cout << "]";
-}
-
-void print_uint_avg(const uint* arr, uint len) {
-  if (arr && len) {
-    uint total = 0;
-    for (uint i = 0; i < len; i++) total += arr[i];
-    std::cout << (total / len) << " avg";
-  } else {
-    std::cout << "NaN avg";
-  }
-}
 
 void waste_some_time() {
   static uint x = 110101241;
@@ -94,21 +75,10 @@ int main(int argc, char* argv[]) {
   
   
   auto total_time = 0;
-  constexpr uint WARMUP = 10;
-  constexpr uint NUM_TRIALS = 300;
 
-  // this might take a sec the first time it is called
-  spork::WorkStealingJob::get_current_scheduler();
-  spork::init_heartbeat_stats();
-
-  for (uint r = 0; r < WARMUP + NUM_TRIALS; r++) {
-    spork::reset_heartbeat_stats();
-    spork::start_heartbeats();
-    
-    auto start = std::chrono::steady_clock::now();
-
+  benchmark([&] () {
     datnum total = 0;
-    total = spork::parfor(n, [&] (idxnum i, datnum& a) { a += data[i]; }, parlay::plus<datnum>());
+    total = spork::parlayfor(n, [&] (idxnum i, datnum& a) { a += data[i]; }, parlay::plus<datnum>());
     // total = spork::seqfor(n, [&] (idxnum i, datnum& a) { a += data[i]; }, parlay::plus<datnum>());
     // spork::parfor(n, [&] (idxnum i) {data[i]++;});
     // spork::scan(n, data, parlay::plus<datnum>());
@@ -116,24 +86,7 @@ int main(int argc, char* argv[]) {
     // spork::seqfor(n, [&] (idxnum i, datnum& a) { a += data[i]; data[i] = a; }, parlay::plus<datnum>());
 
     // total = spork::fib(38);
-    auto end = std::chrono::steady_clock::now();
-
-    spork::pause_heartbeats();
-    
-    auto time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-    std::cout << (datnum) data[n - 1] << " " << total << " in " << time_ms << " ms";
-#ifdef RECORD_HEARTBEAT_STATS
-    std::cout <<" (";
-    print_uint_avg((uint*) spork::num_heartbeats, spork::WorkStealingJob::num_workers());
-    std::cout << " heartbeats, ";
-    print_uint_avg((uint*) spork::missed_heartbeats, spork::WorkStealingJob::num_workers());
-    std::cout << " missed during eager proms)";
-#endif
-    std::cout << std::endl;
-    if (r >= WARMUP) total_time += time_ms;
-  }
-  std::cout << "Average " << (total_time / NUM_TRIALS) << " ms" << std::endl;
-
-  spork::pause_heartbeats();
+    return total;
+  });
   free_data(data);
 }

@@ -1,9 +1,12 @@
 #ifndef SPORK_PARFOR_H_
 #define SPORK_PARFOR_H_
 
+#include "parlay/internal/sequence_ops.h"
 #include "parlay/monoid.h"
 #include "parlay/parallel.h"
 #include "parlay/portability.h"
+#include "parlay/primitives.h"
+//#include <iterator>
 #include "scheduler.hpp"
 #include <atomic>
 #include <bits/types/sig_atomic_t.h>
@@ -18,7 +21,7 @@ parlay::monoid_value_type_t<BinOp> seqfor(idx i, idx j, const BodyLambda&& body,
   static_assert(std::is_invocable_r_v<void, BodyLambda&, idx, A&>);
 
   A a = fwd(binop).identity;
-  for (; i < j; i++) { fwd(body)(i, a); fwd(body)(i, a); }
+  for (; i < j; i++) { fwd(body)(i, a); }
   // sig_atomic_t sig_safe_i = i;
   // idx loop_end = j;
   // for (; i < loop_end; sig_safe_i = static_cast<sig_atomic_t>(++i)) fwd(body)(i, a);
@@ -188,11 +191,7 @@ parlay::monoid_value_type_t<BinOp> parfor(idx i, idx j, const BodyLambda&& body,
 //#include <__functional/binary_function.h>
 
 template <typename idx, typename BodyLambda>
-//__attribute__((always_inline)) // TODO: investigate what this attribute actually does
 void parfor(idx i, idx j, const BodyLambda&& body) {
-  // TODO
-  // parfor<idx>(_i, _j, [&] (idx i, Unit& u) {fwd(body)(i);}, fwd(u));
-
   char _ = parfor(i, j, [&] (idx i, char _) {fwd(body)(i);}, parlay::plus<char>());
 }
 
@@ -205,6 +204,36 @@ template <typename idx, typename BodyLambda, typename BinOp>
 parlay::monoid_value_type_t<BinOp> parfor(idx n, const BodyLambda&& body, const BinOp&& binop) {
   return parfor((idx) 0, n, fwd(body), fwd(binop));
 }
+
+
+// ==================================================
+
+template <typename idx, typename BodyLambda, typename BinOp>
+parlay::monoid_value_type_t<BinOp> parlayfor(idx i, idx j, const BodyLambda&& body, const BinOp&& binop) {
+  auto is = parlay::delayed_tabulate(j - i, [&] (long k) {
+    auto a = fwd(binop).identity;
+    fwd(body)(i + k, a);
+    return a;
+  });
+  return parlay::reduce(is, fwd(binop));
+}
+
+template <typename idx, typename BodyLambda>
+void parlayfor(idx i, idx j, const BodyLambda&& body) {
+  char _ = parlayfor(i, j, [&] (idx i, char _) {fwd(body)(i);}, parlay::plus<char>());
+}
+
+template <typename idx, typename BodyLambda>
+void parlayfor(idx n, const BodyLambda&& body) {
+  parlayfor((idx) 0, n, fwd(body));
+}
+
+template <typename idx, typename BodyLambda, typename BinOp>
+parlay::monoid_value_type_t<BinOp> parlayfor(idx n, const BodyLambda&& body, const BinOp&& binop) {
+  return parlayfor((idx) 0, n, fwd(body), fwd(binop));
+}
+
+
 
 }
 

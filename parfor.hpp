@@ -10,7 +10,9 @@
 #include "scheduler.hpp"
 #include <atomic>
 #include <bits/types/sig_atomic_t.h>
+#include <cstdint>
 #include <limits.h>
+#include <type_traits>
 
 namespace spork {
 
@@ -75,107 +77,168 @@ namespace { // private
   //     }
   //   }
   // }
+
+  template <typename idx, typename BodyLambda, typename BinOp>
+  //__attribute__((always_inline)) // TODO: investigate what this attribute actually does
+  void parfor_(idx i, idx j, parlay::monoid_value_type_t<BinOp>& a, const BodyLambda&& body, const BinOp&& binop) {
+    static_assert(std::is_integral_v<idx>);
+    static_assert(parlay::is_monoid_v<BinOp>);
+    using A = parlay::monoid_value_type_t<BinOp>;
+    static_assert(std::is_invocable_r_v<void, BodyLambda&, idx, A&>);
+    // make sure that loop index can fit in sig_atomic_t
+    static_assert(sizeof(sig_atomic_t) >= sizeof(idx));
+  
+    struct SpwnJob : WorkStealingJob {
+      volatile idx i, j;
+      const BodyLambda&& body;
+      const BinOp&& binop;
+      A a;
+      void run() override {
+        a = fwd(binop).identity;
+        parfor_<idx, BodyLambda, BinOp>(i, j, a, fwd(body), fwd(binop));
+      }
+      SpwnJob(const BodyLambda&& _body, const BinOp&& _binop) :
+        WorkStealingJob(),
+        body(fwd(_body)),
+        binop(fwd(_binop)) {}
+    };
+  
+    SpwnJob l(fwd(body), fwd(binop));
+    SpwnJob r(fwd(body), fwd(binop));
+  
+    // A a = fwd(binop).identity;
+  
+    // const idx UNROLL_FACTOR = __spork_unroll_factor(i, j);
+    // // compiler detects unroll factor of this loop:
+    // // (never 0, so this condition will eventually be eliminated)
+    // if (UNROLL_FACTOR == 0) {
+    //   for (; i < j; i++) fwd(body)(i, a);
+    //   return a;
+    // }
+  
+    // main code may write `sig_safe_i`; signal handler may only read
+    volatile sig_atomic_t sig_safe_i = i; // + (j - i) % UNROLL_FACTOR;
+    // main code may only read `loop_end`; signal handler may write
+    volatile idx loop_end = j;
+  
+    // ... and applies it to the following loop:
+    bool promoted = with_prom_handler(
+      [&, body = fwd(body)] () {
+        // #pragma spork unroll UNROLL
+        // for (; i + EXTRA_UNROLL < loop_end; sig_safe_i = static_cast<sig_atomic_t>(++i)) {
+        //   fwd(body)(i, a);
+        // }
+        // if (EXTRA_UNROLL > 0) {
+        // // now finish the last few iterations
+        // for (; i < loop_end; sig_safe_i = static_cast<sig_atomic_t>(++i)) {
+        //   fwd(body)(i, a);
+        // }
+        // }
+  
+  
+        // for (; i < loop_end; ++i) {
+        //   fwd(body)(i, a);
+        //   sig_safe_i = static_cast<sig_atomic_t>(i);
+        // }
+        //#pragma clang loop unroll(enable)
+        // parfor_loop<idx, BodyLambda, BinOp>(UNROLL_FACTOR, i, j, sig_safe_i, loop_end, a, fwd(body), fwd(binop));
+        for (; i < loop_end; sig_safe_i = static_cast<sig_atomic_t>(++i)) body(i, a);
+  
+  
+        // for (; sig_safe_i < loop_end;) {
+        //   fwd(body)(sig_safe_i, a);
+        //   sig_safe_i = sig_safe_i + 1;
+        //   std::atomic_signal_fence(std::memory_order_release);
+        // }
+      },
+      [&] () {
+        idx prom_i = sig_safe_i + 1; // = sig_safe_i + UNROLL_FACTOR;
+        if (prom_i >= loop_end) { r.i = 0; r.j = 0; l.i = 0; l.j = 0; return; }
+        idx mid = midpoint<idx>(prom_i, loop_end);
+        loop_end = prom_i;
+  
+        r.i = mid;
+        r.j = j;
+        r.enqueue((heartbeat_tokens + 1) >> 1);
+  
+        // TODO: check if work stealing deque is full before enqueueing
+  
+        if (prom_i >= mid) { l.i = 0; l.j = 0; return; }
+        l.i = prom_i;
+        l.j = mid;
+        l.enqueue(heartbeat_tokens);
+      });
+    if (promoted) [[unlikely]] {
+      if (l.i < l.j) [[likely]] {
+        l.sync(true);
+        a = fwd(binop)(a, l.a);
+      }
+      if (r.i < r.j) [[likely]] {
+        r.sync(false);
+        a = fwd(binop)(a, r.a);
+      }
+    }
+  }
 } // private
 
 template <typename idx, typename BodyLambda, typename BinOp>
-//__attribute__((always_inline)) // TODO: investigate what this attribute actually does
-parlay::monoid_value_type_t<BinOp> parfor(idx i, idx j, const BodyLambda&& body, const BinOp&& binop) {
-  static_assert(std::is_integral_v<idx>);
-  static_assert(parlay::is_monoid_v<BinOp>);
+void parfor(idx i, idx j, parlay::monoid_value_type_t<BinOp>& a, const BodyLambda&& body, const BinOp&& binop) {
   using A = parlay::monoid_value_type_t<BinOp>;
-  static_assert(std::is_invocable_r_v<void, BodyLambda&, idx, A&>);
   // make sure that loop index can fit in sig_atomic_t
-  static_assert(sizeof(sig_atomic_t) >= sizeof(idx));
+  if constexpr (sizeof(sig_atomic_t) < sizeof(idx)) {
+    if (i >= j) return;
 
-  struct SpwnJob : WorkStealingJob {
-    volatile idx i, j;
-    const BodyLambda&& body;
-    const BinOp&& binop;
-    A a;
-    void run() override {
-      a = parfor<idx, BodyLambda, BinOp>(i, j, fwd(body), fwd(binop));
+    // we assume sig_atomic_t is at least 32 bits
+    static_assert(sizeof(sig_atomic_t) >= sizeof(uint32_t));
+
+    if (std::is_signed_v<idx> &&
+        i >= SIG_ATOMIC_MIN &&
+        j <= SIG_ATOMIC_MAX) {
+      // use sig_atomic_t instead of idx
+      parfor_(static_cast<sig_atomic_t>(i), static_cast<sig_atomic_t>(j), a,
+              [body = fwd(body)] (sig_atomic_t k, A& a) {
+                return body(static_cast<idx>(k), a);
+              }, fwd(binop));
+    } else if (std::is_unsigned_v<idx> &&
+               sizeof(sig_atomic_t) <= sizeof(uint32_t) &&
+               j <= 0xFFFFFFFFU) {
+        // use sig_atomic_t instead of idx
+        parfor_(static_cast<uint32_t>(i), static_cast<uint32_t>(j), a,
+                [body = fwd(body)] (uint32_t k, A& a) {
+                  return body(static_cast<idx>(k), a);
+                }, fwd(binop));
+    } else if ((j - i) <= 0xFFFFFFFFU) {
+      parfor_((uint32_t) 0, static_cast<uint32_t>(j - i), a,
+              [i, body = fwd(body)] (uint32_t k, A& a) {
+                return body(i + static_cast<idx>(k), a);
+              }, fwd(binop));
+    } else {
+      idx n = j - i;
+      // may need up to 2 extra bits to avoid overflows:
+      // one if idx is signed, another for range end
+      // (e.g. may need to do parfor(0, MAX_INT+1, ...))
+      idx num_blocks = 1 + ((j - i - 1) >> 30);
+      // needs to be a std::function to avoid recursive template explosion
+      const std::function<void(idx, A&)> fn = [j, i, &body, &binop] (idx block, A& a) {
+        idx offset = block << 30;
+        uint32_t block_end = (block == 1 + ((j - i - 1) >> 30)) ?
+          ((block + 1) << 30) : (j - i - offset);
+        parfor_((uint32_t) 0, block_end, a,
+                [base = i + offset, &body] (uint32_t k, A& a) {
+                  fwd(body)(base + static_cast<idx>(k), a);
+                }, fwd(binop));
+      };
+      parfor((idx) 0, num_blocks, a, fwd(fn), fwd(binop));
     }
-    SpwnJob(const BodyLambda&& _body, const BinOp&& _binop) :
-      WorkStealingJob(),
-      body(fwd(_body)),
-      binop(fwd(_binop)) {}
-  };
-
-  SpwnJob l(fwd(body), fwd(binop));
-  SpwnJob r(fwd(body), fwd(binop));
-
-  A a = fwd(binop).identity;
-
-  // const idx UNROLL_FACTOR = __spork_unroll_factor(i, j);
-  // // compiler detects unroll factor of this loop:
-  // // (never 0, so this condition will eventually be eliminated)
-  // if (UNROLL_FACTOR == 0) {
-  //   for (; i < j; i++) fwd(body)(i, a);
-  //   return a;
-  // }
-
-  // main code may write `sig_safe_i`; signal handler may only read
-  volatile sig_atomic_t sig_safe_i = i; // + (j - i) % UNROLL_FACTOR;
-  // main code may only read `loop_end`; signal handler may write
-  volatile idx loop_end = j;
-
-  // ... and applies it to the following loop:
-  bool promoted = with_prom_handler(
-    [&, body = fwd(body)] () {
-      // #pragma spork unroll UNROLL
-      // for (; i + EXTRA_UNROLL < loop_end; sig_safe_i = static_cast<sig_atomic_t>(++i)) {
-      //   fwd(body)(i, a);
-      // }
-      // if (EXTRA_UNROLL > 0) {
-      // // now finish the last few iterations
-      // for (; i < loop_end; sig_safe_i = static_cast<sig_atomic_t>(++i)) {
-      //   fwd(body)(i, a);
-      // }
-      // }
-
-
-      // for (; i < loop_end; ++i) {
-      //   fwd(body)(i, a);
-      //   sig_safe_i = static_cast<sig_atomic_t>(i);
-      // }
-      //#pragma clang loop unroll(enable)
-      // parfor_loop<idx, BodyLambda, BinOp>(UNROLL_FACTOR, i, j, sig_safe_i, loop_end, a, fwd(body), fwd(binop));
-      for (; i < loop_end; sig_safe_i = static_cast<sig_atomic_t>(++i)) body(i, a);
-
-
-      // for (; sig_safe_i < loop_end;) {
-      //   fwd(body)(sig_safe_i, a);
-      //   sig_safe_i = sig_safe_i + 1;
-      //   std::atomic_signal_fence(std::memory_order_release);
-      // }
-    },
-    [&] () {
-      idx prom_i = sig_safe_i + 1; // = sig_safe_i + UNROLL_FACTOR;
-      if (prom_i >= loop_end) { r.i = 0; r.j = 0; l.i = 0; l.j = 0; return; }
-      idx mid = midpoint<idx>(prom_i, loop_end);
-      loop_end = prom_i;
-
-      r.i = mid;
-      r.j = j;
-      r.enqueue((heartbeat_tokens + 1) >> 1);
-
-      // TODO: check if work stealing deque is full before enqueueing
-
-      if (prom_i >= mid) { l.i = 0; l.j = 0; return; }
-      l.i = prom_i;
-      l.j = mid;
-      l.enqueue(heartbeat_tokens);
-    });
-  if (promoted) [[unlikely]] {
-    if (l.i < l.j) [[likely]] {
-      l.sync(true);
-      a = fwd(binop)(a, l.a);
-    }
-    if (r.i < r.j) [[likely]] {
-      r.sync(false);
-      a = fwd(binop)(a, r.a);
-    }
+  } else {
+    parfor_(i, j, a, fwd(body), fwd(binop));
   }
+}
+
+template <typename idx, typename BodyLambda, typename BinOp>
+parlay::monoid_value_type_t<BinOp> parfor(idx i, idx j, const BodyLambda&& body, const BinOp&& binop) {
+  parlay::monoid_value_type_t<BinOp> a = fwd(binop).identity;
+  parfor(i, j, a, fwd(body), fwd(binop));
   return a;
 }
 

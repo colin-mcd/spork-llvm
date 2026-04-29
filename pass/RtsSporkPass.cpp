@@ -84,23 +84,10 @@
 
 #define DEBUG_TYPE "rts-spork"
 
-// TODO: multiple modules (maybe something for the linker?)
-
 using namespace llvm;
 
-// number of fields to be stored in a spork info slot
-static constexpr unsigned kNumRelativeSporkArgs = 3;
-static constexpr unsigned kNumConstantSporkArgs = 3;
 // name of extern function call to look for
-static constexpr char kTargetFnName[] = "__RECORD_SPORK";
-// emitted spork table name
-static constexpr char kTableName[] = "__rts_spork_table";
-// emitted spork table size name
-static constexpr char kTableSizeName[] = "__rts_spork_table_size";
-// on CallInst
-static constexpr char kMDSiteId[] = "rts_spork_id";
-// on AllocaInst
-static constexpr char kMDSlotIdx[] = "rts_spork_slot";
+static constexpr char SPORK_UNROLL_FACTOR_NAME[] = "__spork_unroll_factor";
 
 /* Helpers */
 
@@ -115,20 +102,19 @@ static bool GEPAllZero(GetElementPtrInst *GEP) {
   return true;
 }
 
-// Strip pointer casts / GEPs with zero offset to find the underlying alloca.
-// Returns nullptr if we cannot prove the value originates from a local alloca.
-static Value *resolveToAllocaOrConstant(Value *V) {
-  if (AllocaInst *AI = dyn_cast<AllocaInst>(V)) {
-    return AI;
-  } else if (Constant *C = dyn_cast<Constant>(V)) {
-    return C;
+// Strip pointer casts / GEPs with zero offset to find the underlying instruction.
+// Returns nullptr if we cannot prove the value originates from an I.
+template <typename I>
+static I *resolveTo(Value *V) {
+  if (I *i = dyn_cast<I>(V)) {
+    return i;
   } else if (BitCastInst *BC = dyn_cast<BitCastInst>(V)) {
-    return resolveToAllocaOrConstant(BC->getOperand(0));
+    return resolveTo<I>(BC->getOperand(0));
   } else if (AddrSpaceCastInst *AC = dyn_cast<AddrSpaceCastInst>(V)) {
-    return resolveToAllocaOrConstant(AC->getOperand(0));
+    return resolveTo<I>(AC->getOperand(0));
   } else if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(V)) {
     // Only follow if all indices are zero (i.e. no actual displacement).
-    if (GEPAllZero(GEP)) return resolveToAllocaOrConstant(GEP->getPointerOperand());
+    if (GEPAllZero(GEP)) return resolveTo<I>(GEP->getPointerOperand());
   }
   // anything else: give up
   return nullptr;
@@ -138,119 +124,111 @@ static Value *resolveToAllocaOrConstant(Value *V) {
 
 struct RtsSporkIRPass : public PassInfoMixin<RtsSporkIRPass> {
 
-  struct SporkInfo {
+  struct SporkLoopInfo {
     CallInst *CI;
     uint64_t id;
-    AllocaInst *allocas[kNumRelativeSporkArgs];
-    Constant *constants[kNumConstantSporkArgs];
+    AllocaInst* i;
+    AllocaInst* j;
+    Loop* l;
   };
   
-  using SporkNest = std::vector<SporkInfo*>;
+  using SporkNest = std::vector<SporkLoopInfo*>;
 
-  void tryRecordSporkInfo(const Instruction* I, std::vector<SporkInfo>& sporks, const Function& F) {
+  void tryRecordSporkLoopInfo(const Instruction* I, std::vector<SporkLoopInfo>& sporks, const Function& F) {
     CallInst *CI = dyn_cast<CallInst>(&I);
     if (!CI) return;
 
     Function *Callee = CI->getCalledFunction();
-    if (!Callee || Callee->getName() != kTargetFnName) return;
+    if (!Callee || Callee->getName() != SPORK_UNROLL_FACTOR_NAME) return;
 
-    if (CI->arg_size() != kNumRelativeSporkArgs + kNumConstantSporkArgs) {
-      errs() << "[spork] WARNING: call to " << kTargetFnName
+    if (CI->arg_size() != 2) {
+      errs() << "[spork] WARNING: call to " << SPORK_UNROLL_FACTOR_NAME
              << " has only " << CI->arg_size() << " args, skipping.\n";
       return;
     }
 
-    SporkInfo si;
-    for (unsigned a = 0; a < kNumRelativeSporkArgs; ++a) {
-      si.allocas[a] = dyn_cast<AllocaInst>(resolveToAllocaOrConstant(CI->getArgOperand(a)));
-      if (!si.allocas[a]) {
-        errs() << "[spork] WARNING: arg " << a << " of call at " << F.getName()
-               << " could not be resolved to an alloca, skipping.\n";
-        return;
-      }
+    SporkLoopInfo si;
+    si.i = resolveTo<AllocaInst>(CI->getArgOperand(0));
+    si.j = resolveTo<AllocaInst>(CI->getArgOperand(1));
+    if (!si.i || !si.j) {
+      errs() << "[spork] WARNING: arg(s) of call at " << F.getName()
+             << " could not be resolved to a store, skipping.\n";
+      return;
     }
-    for (unsigned a = 0; a < kNumConstantSporkArgs; ++a) {
-      Value* arg = CI->getArgOperand(kNumRelativeSporkArgs + a);
-      Value* resolved = resolveToAllocaOrConstant(arg);
-      si.constants[a] = dyn_cast<Constant>(resolved);
-      if (!si.allocas[a]) {
-        errs() << "[spork] WARNING: arg " << kNumRelativeSporkArgs + a
-               << " of call at " << F.getName() << " could not be resolved to a constant, skipping.\n";
-        return;
-      }
-    }
+
     si.CI = CI;
     si.id = (uint64_t) sporks.size();
     sporks.push_back(si);
   }
 
   // Populates `sites` with the SporkInfo corresponding
-  // to each `kTargetFnName` function call in a module
-  void populateSporkInfo(const Module &M, std::vector<SporkInfo> &sites) {
+  // to each `SPORK_UNROLL_FACTOR_NAME` function call in a module
+  void populateSporkInfo(const Module &M, std::vector<SporkLoopInfo> &sites) {
     for (const Function &F : M)
       for (const BasicBlock &B : F)
         for (const Instruction &I : B)
-          tryRecordSporkInfo(&I, sites, F);
+          tryRecordSporkLoopInfo(&I, sites, F);
   }
 
-  void populateSporkNest(Module &M, const std::vector<SporkInfo> &sites) {
-    GlobalVariable *GA = M.getNamedGlobal("llvm.global.annotations");
-    if (!GA) return;
+  // void populateSporkNest(Module &M, const std::vector<SporkLoopInfo> &sites) {
+  //   GlobalVariable *GA = M.getNamedGlobal("llvm.global.annotations");
+  //   if (!GA) return;
 
-    ConstantArray *CA = dyn_cast<ConstantArray>(GA->getOperand(0));
-    for (unsigned i = 0; i < CA->getNumOperands(); ++i) {
-      auto *CS = dyn_cast<ConstantStruct>(CA->getOperand(i));
+  //   ConstantArray *CA = dyn_cast<ConstantArray>(GA->getOperand(0));
+  //   for (unsigned i = 0; i < CA->getNumOperands(); ++i) {
+  //     auto *CS = dyn_cast<ConstantStruct>(CA->getOperand(i));
 
-      // Operand 1 = annotation string
-      Constant *AnnoPtr = CS->getOperand(1);
-      GlobalVariable *AnnoGV = cast<GlobalVariable>(cast<ConstantExpr>(AnnoPtr)->getOperand(0));
-      ConstantDataArray *AnnoData = cast<ConstantDataArray>(AnnoGV->getInitializer());
+  //     // Operand 1 = annotation string
+  //     Constant *AnnoPtr = CS->getOperand(1);
+  //     GlobalVariable *AnnoGV = cast<GlobalVariable>(cast<ConstantExpr>(AnnoPtr)->getOperand(0));
+  //     ConstantDataArray *AnnoData = cast<ConstantDataArray>(AnnoGV->getInitializer());
 
-      std::string AnnoStr = AnnoData->getAsCString().str();
+  //     std::string AnnoStr = AnnoData->getAsCString().str();
 
-      if (AnnoStr == "spork_range") {
-        // Operand 0 = annotated entity
-        Value *Annotated = CS->getOperand(0);
+  //     if (AnnoStr == "spork_unroll") {
+  //       // Operand 0 = annotated entity
+  //       Value *Annotated = CS->getOperand(0);
 
-        // Instruction *I = dyn_cast<Instruction>(Annotated);
-        // if (I == nullptr) continue;
+  //       // Instruction *I = dyn_cast<Instruction>(Annotated);
+  //       // if (I == nullptr) continue;
         
-        AllocaInst *AI = dyn_cast<AllocaInst>(Annotated);
-        if (AI == nullptr) continue;
-        BasicBlock *b = AI->getParent();
+  //       AllocaInst *AI = dyn_cast<AllocaInst>(Annotated);
+  //       if (AI == nullptr) continue;
+  //       BasicBlock *b = AI->getParent();
 
-        // Operands 2 and 3 = file and line
+  //       // Operands 2 and 3 = file and line
 
-        // Operand 4 = extra args (your labels)
-        Value *Extra = CS->getOperand(4);
+  //       // Operand 4 = extra args (your labels)
+  //       Value *Extra = CS->getOperand(4);
 
-        // You'll need to peel this apart depending on how Clang encoded it
-      }
-    }
-    // for (Function &F : M) {
-    //   for (BasicBlock &B : F) {
-    //     for (Instruction &I : B) {
-    //       MDNode* meta = I.getMetadata("spork_range");
-    //       for (auto mo = meta->op_begin(); mo < meta->op_end(); mo++) {
-    //         Metadata *md = mo->get();
-    //         md->
-    //       }
-    //       if (AllocaInst *AI = dyn_cast<AllocaInst>(&I)) {
+  //       // You'll need to peel this apart depending on how Clang encoded it
+  //     }
+  //   }
+  //   // for (Function &F : M) {
+  //   //   for (BasicBlock &B : F) {
+  //   //     for (Instruction &I : B) {
+  //   //       MDNode* meta = I.getMetadata("spork_range");
+  //   //       for (auto mo = meta->op_begin(); mo < meta->op_end(); mo++) {
+  //   //         Metadata *md = mo->get();
+  //   //         md->
+  //   //       }
+  //   //       if (AllocaInst *AI = dyn_cast<AllocaInst>(&I)) {
             
-    //       }
-    //     }
-    //   }
-    // }
-  }
+  //   //       }
+  //   //     }
+  //   //   }
+  //   // }
+  // }
 
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
     LLVMContext &Ctx = M.getContext();
 
     // Collect all calls to __RECORD_SPORK across the module
-    std::vector<SporkInfo> sites;
+    std::vector<SporkLoopInfo> sites;
     populateSporkInfo(M, sites);
     // Now remove those calls
-    for (SporkInfo si : sites) si.CI->removeFromParent();
+    //for (SporkLoopInfo sli : sites) sli.CI->removeFromParent();
+    // TODO: replace each sli.CI with the unroll factor!
 
     if (sites.empty()) {
       LLVM_DEBUG(dbgs() << "[spork] No calls found.\n");
@@ -260,169 +238,7 @@ struct RtsSporkIRPass : public PassInfoMixin<RtsSporkIRPass> {
     uint64_t N = sites.size();
     LLVM_DEBUG(dbgs() << "[spork] Found " << N << " call site(s).\n");
 
-    // -- Build the global table type ------------------------------------------
-    //
-    //   struct RtsSporkSite {
-    //       int64_t offsets[kNumRelativeSporkArgs + kNumConstantSporkArgs];   // one per argument
-    //   };
-    //   RtsSporkSite __rts_spork_table[N];       // zero-initialised for now
-    //   uint64_t     __rts_spork_table_size = N;
-    //
-    Type *I64Ty = Type::getInt64Ty(Ctx);
-    Type *I64Array = ArrayType::get(I64Ty, kNumRelativeSporkArgs + kNumConstantSporkArgs);
-
-    // The site struct: { int64_t offsets[4]; }
-    StructType *SiteTy = StructType::create(
-        Ctx, {I64Array}, "struct.RtsSporkSite", /*isPacked=*/false);
-
-    // The table array
-    ArrayType *TableTy = ArrayType::get(SiteTy, N);
-
-    // Zero initialiser – offsets filled at program start by the machine pass
-    // (or at link time if using a constructor stub approach).
-    Constant *ZeroTable = ConstantAggregateZero::get(TableTy);
-
-    GlobalVariable *GTable = new GlobalVariable(
-        M, TableTy,
-        /*isConstant=*/false,
-        GlobalValue::ExternalLinkage,
-        ZeroTable,
-        kTableName);
-    GTable->setAlignment(Align(8));
-    GTable->setSection(".data");
-
-    // Table size
-    GlobalVariable *GSize = new GlobalVariable(
-        M, I64Ty,
-        /*isConstant=*/true,
-        GlobalValue::ExternalLinkage,
-        ConstantInt::get(I64Ty, N),
-        kTableSizeName);
-    GSize->setAlignment(Align(8));
-
-    // -- Annotate each call site with metadata --------------------------------
-    //
-    // !rts_spork_id  = !{ i64 <site_id> }   attached to the CallInst
-    // !rts_spork_slot = !{ i64 <site_id>, i64 <arg_index> }  on each AllocaInst
-    //
-    // The machine pass will iterate over MachineInstrs, find the call via the
-    // metadata, look up the alloca slots, and patch __rts_spork_table.
-
-    unsigned MDSiteIdKind  = Ctx.getMDKindID(kMDSiteId);
-    unsigned MDSlotIdxKind = Ctx.getMDKindID(kMDSlotIdx);
-
-    for (SporkInfo &si : sites) {
-      // Tag the call instruction.
-      MDNode *CallMD = MDNode::get(
-          Ctx,
-          {ConstantAsMetadata::get(ConstantInt::get(I64Ty, si.id))});
-      si.CI->setMetadata(MDSiteIdKind, CallMD);
-
-      // Tag each alloca (may be shared across args – use arg index to
-      // disambiguate in the machine pass).
-      for (unsigned a = 0; a < kNumSporkArgs; ++a) {
-        if (!si.args[a]) continue;
-        MDNode *SlotMD = MDNode::get(
-            Ctx,
-            {ConstantAsMetadata::get(ConstantInt::get(I64Ty, si.id)),
-             ConstantAsMetadata::get(ConstantInt::get(I64Ty, a))});
-        // Append (don't overwrite) – an alloca may appear in multiple sites.
-        Value *arga = si.args[a];
-        if (AllocaInst *AI = dyn_cast<AllocaInst>(arga)) {
-          AI->setMetadata(MDSlotIdxKind, SlotMD);
-        }
-      }
-    }
-
-    // -- Emit a __attribute__((constructor)) filler function ------------------
-    //
-    // At IR level we don't yet know the real offsets (the backend hasn't run).
-    // We therefore emit a *placeholder* constructor whose body is filled in by
-    // the MachineFunctionPass.  Here we just create the function signature and
-    // insert it into the global_ctors list so the linker will call it.
-    //
-    // The machine pass will find the function by the well-known name
-    // "__rts_spork_init" and patch its MachineBasicBlock to store the
-    // offsets obtained from MachineFrameInfo.
-    //
-    // For now, emit:
-    //   void __rts_spork_init() { /* machine pass will fill this */ }
-    // and register it at priority 0 (runs before user code).
-
-    FunctionType *InitFTy = FunctionType::get(Type::getVoidTy(Ctx), false);
-    Function *InitFn = Function::Create(
-        InitFTy, GlobalValue::InternalLinkage, "__rts_spork_init", &M);
-    InitFn->addFnAttr(Attribute::NoInline); // keep it addressable for patching
-    BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", InitFn);
-    IRBuilder<> Builder(Entry);
-
-    // We store a sentinel (INT64_MIN = 0x8000000000000000) so the machine pass
-    // can recognise un-patched slots at debug time, and also so that
-    // applications can detect "no frame info available".
-    Constant *Sentinel = ConstantInt::get(I64Ty, INT64_MIN);
-    Type     *I32Ty    = Type::getInt32Ty(Ctx);
-
-    for (SporkInfo &si : sites) {
-      for (unsigned a = 0; a < kNumSporkArgs; ++a) {
-        // GEP into __rts_spork_table[si.id].offsets[a]
-        Value *Slot = Builder.CreateInBoundsGEP(
-            TableTy, GTable,
-            {ConstantInt::get(I32Ty, 0),
-             ConstantInt::get(I32Ty, si.id),
-             ConstantInt::get(I32Ty, 0),           // field 0: offsets[]
-             ConstantInt::get(I32Ty, a)},
-            "slot");
-        // Store sentinel; the machine pass will replace with real offsets.
-        Builder.CreateStore(Sentinel, Slot);
-      }
-    }
-    Builder.CreateRetVoid();
-
-    // Register in @llvm.global_ctors at priority 0.
-    addToGlobalCtors(M, InitFn, /*Priority=*/0, /*Data=*/nullptr);
-
     return PreservedAnalyses::none(); // we modified the IR
-  }
-
-private:
-  /// Append an entry to @llvm.global_ctors.
-  static void addToGlobalCtors(Module &M, Function *F, int Priority,
-                               Constant *Data) {
-    LLVMContext &Ctx = M.getContext();
-    Type   *I32Ty = Type::getInt32Ty(Ctx);
-    Type   *I8PtrTy = PointerType::getUnqual(Ctx);
-
-    StructType *EltTy = StructType::get(I32Ty, F->getType(), I8PtrTy);
-
-    Constant *Elt = ConstantStruct::get(
-        EltTy,
-        ConstantInt::get(I32Ty, Priority),
-        F,
-        Data ? Data : Constant::getNullValue(I8PtrTy));
-
-    GlobalVariable *GV = M.getGlobalVariable("llvm.global_ctors");
-    if (!GV) {
-      ArrayType *ArrTy = ArrayType::get(EltTy, 1);
-      GV = new GlobalVariable(M, ArrTy, false,
-                              GlobalValue::AppendingLinkage,
-                              ConstantArray::get(ArrTy, {Elt}),
-                              "llvm.global_ctors");
-    } else {
-      // Append to existing array.
-      ConstantArray *OldArr = cast<ConstantArray>(GV->getInitializer());
-      ArrayType *OldTy = cast<ArrayType>(OldArr->getType());
-      std::vector<Constant *> Elts;
-      for (unsigned i = 0; i < OldTy->getNumElements(); ++i)
-        Elts.push_back(OldArr->getOperand(i));
-      Elts.push_back(Elt);
-      ArrayType *NewTy = ArrayType::get(EltTy, Elts.size());
-      Constant  *NewArr = ConstantArray::get(NewTy, Elts);
-      GlobalVariable *NewGV = new GlobalVariable(
-          M, NewTy, false, GlobalValue::AppendingLinkage, NewArr,
-          "llvm.global_ctors");
-      GV->eraseFromParent();
-      (void)NewGV;
-    }
   }
 };
 

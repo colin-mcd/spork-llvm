@@ -18,7 +18,11 @@ parlay::monoid_value_type_t<BinOp> seqfor(idx i, idx j, const BodyLambda&& body,
   static_assert(std::is_invocable_r_v<void, BodyLambda&, idx, A&>);
 
   A a = fwd(binop).identity;
-  for (; i < j; i++) fwd(body)(i, a);
+  for (; i < j; i++) { fwd(body)(i, a); fwd(body)(i, a); }
+  // sig_atomic_t sig_safe_i = i;
+  // idx loop_end = j;
+  // for (; i < loop_end; sig_safe_i = static_cast<sig_atomic_t>(++i)) fwd(body)(i, a);
+  // std::cout << sig_safe_i << std::endl;
   return a;
 }
 
@@ -46,6 +50,28 @@ namespace { // private
     static_assert(std::is_integral_v<idx>);
     return i + ((j - i) / 2);
   }
+
+  // template <typename idx, typename BodyLambda, typename BinOp>
+  // __attribute__((always_inline))
+  // void parfor_loop(const idx& unroll_factor,
+  //                  idx& i, const idx& j,
+  //                  volatile sig_atomic_t &sig_safe_i, volatile idx &loop_end,
+  //                  parlay::monoid_value_type_t<BinOp>& a,
+  //                  const BodyLambda&& body, const BinOp&& binop) {
+  //   idx pre_loop_end = (j - i) % unroll_factor;
+  //   for (idx pre_loop_idx = 0; pre_loop_idx < pre_loop_end; pre_loop_idx++) {
+  //     fwd(body)(i, a);
+  //     i++;
+  //   }
+  //   // now (j - i) is a multiple of unroll_factor
+  //   for (; i < loop_end; sig_safe_i = static_cast<sig_atomic_t>(i += unroll_factor)) {
+  //     #pragma clang unroll(full)
+  //     for (idx uf = 0; uf < unroll_factor; uf++) {
+  //       fwd(body)(i, a);
+  //       i++;
+  //     }
+  //   }
+  // }
 } // private
 
 template <typename idx, typename BodyLambda, typename BinOp>
@@ -55,6 +81,8 @@ parlay::monoid_value_type_t<BinOp> parfor(idx i, idx j, const BodyLambda&& body,
   static_assert(parlay::is_monoid_v<BinOp>);
   using A = parlay::monoid_value_type_t<BinOp>;
   static_assert(std::is_invocable_r_v<void, BodyLambda&, idx, A&>);
+  // make sure that loop index can fit in sig_atomic_t
+  static_assert(sizeof(sig_atomic_t) >= sizeof(idx));
 
   struct SpwnJob : WorkStealingJob {
     volatile idx i, j;
@@ -73,25 +101,53 @@ parlay::monoid_value_type_t<BinOp> parfor(idx i, idx j, const BodyLambda&& body,
   SpwnJob l(fwd(body), fwd(binop));
   SpwnJob r(fwd(body), fwd(binop));
 
-  // make sure that loop index can fit in `i`
-  static_assert(sizeof(sig_atomic_t) >= sizeof(idx));
-  // static_assert(std::numeric_limits<sig_atomic_t>::max() >= std::numeric_limits<idx>::max());
-
-  // main code may write `sig_safe_i`; signal handler may only read
-  volatile sig_atomic_t sig_safe_i = i;
-  // main code may only read `loop_end`; signal handler may write
-  // __attribute__((, 12345));
-  volatile idx loop_end = j;
   A a = fwd(binop).identity;
 
+  // const idx UNROLL_FACTOR = __spork_unroll_factor(i, j);
+  // // compiler detects unroll factor of this loop:
+  // // (never 0, so this condition will eventually be eliminated)
+  // if (UNROLL_FACTOR == 0) {
+  //   for (; i < j; i++) fwd(body)(i, a);
+  //   return a;
+  // }
+
+  // main code may write `sig_safe_i`; signal handler may only read
+  volatile sig_atomic_t sig_safe_i = i; // + (j - i) % UNROLL_FACTOR;
+  // main code may only read `loop_end`; signal handler may write
+  volatile idx loop_end = j;
+
+  // ... and applies it to the following loop:
   bool promoted = with_prom_handler(
     [&] () {
-      for (; i < loop_end; sig_safe_i = static_cast<sig_atomic_t>(++i)) {
-        fwd(body)(i, a);
-      }
+      // #pragma spork unroll UNROLL
+      // for (; i + EXTRA_UNROLL < loop_end; sig_safe_i = static_cast<sig_atomic_t>(++i)) {
+      //   fwd(body)(i, a);
+      // }
+      // if (EXTRA_UNROLL > 0) {
+      // // now finish the last few iterations
+      // for (; i < loop_end; sig_safe_i = static_cast<sig_atomic_t>(++i)) {
+      //   fwd(body)(i, a);
+      // }
+      // }
+
+
+      // for (; i < loop_end; ++i) {
+      //   fwd(body)(i, a);
+      //   sig_safe_i = static_cast<sig_atomic_t>(i);
+      // }
+      //#pragma clang loop unroll(enable)
+      // parfor_loop<idx, BodyLambda, BinOp>(UNROLL_FACTOR, i, j, sig_safe_i, loop_end, a, fwd(body), fwd(binop));
+      for (; i < loop_end; sig_safe_i = static_cast<sig_atomic_t>(++i)) fwd(body)(i, a);
+
+
+      // for (; sig_safe_i < loop_end;) {
+      //   fwd(body)(sig_safe_i, a);
+      //   sig_safe_i = sig_safe_i + 1;
+      //   std::atomic_signal_fence(std::memory_order_release);
+      // }
     },
     [&] () {
-      idx prom_i = sig_safe_i + 1;
+      idx prom_i = sig_safe_i + 1; // = sig_safe_i + UNROLL_FACTOR;
       if (prom_i >= loop_end) { r.i = 0; r.j = 0; l.i = 0; l.j = 0; return; }
       idx mid = midpoint<idx>(prom_i, loop_end);
       loop_end = prom_i;

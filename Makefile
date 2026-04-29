@@ -7,8 +7,8 @@ DBGFLAG := -ggdb
 #LIBRARY := -lpthread -lunwind
 LIBRARY := -lpthread
 SETPATH := LD_PRELOAD=/usr/local/lib/libjemalloc.so
-OPTIONS := -xc++ -std=c++20
-LLVMOPT := -fpass-plugin=./pass/build/RtsSporkPass.so
+OPTIONS := -xc++ -std=c++20 -Rpass=loop-unroll
+LLVMOPT := -fpass-plugin=./gempass/build/SporkUnroll.so
 
 scheduler: scheduler.cpp *.hpp Makefile
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) $< -o $@
@@ -19,6 +19,9 @@ schedulerO2: scheduler.cpp *.hpp Makefile
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) -O2 $< -o $@
 schedulerO3: scheduler.cpp *.hpp Makefile
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) -O3 $< -o $@
+
+scheduler_expanded.cpp: scheduler.cpp *.hpp Makefile
+	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -E $< -o $@
 
 schedulerO1.s: scheduler.cpp *.hpp Makefile
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -O1 -S $< -o $@
@@ -42,11 +45,18 @@ scheduler.ll: scheduler.cpp *.hpp Makefile
 scheduler.opt.ll: scheduler.ll *.hpp Makefile
 	$(SETPATH) $(OPTLLVM) -S -O3 $< -o $@
 
-pass/build/RtsSporkPass.so: pass/RtsSporkPass.cpp pass/rts_spork_table.h
+pass/build/RtsSporkPass.so: pass/RtsSporkPass.cpp pass/rts_spork_table.h Makefile
 	$(MAKE) -C pass/build
 
-llvmtest: scheduler.cpp *.hpp pass/build/RtsSporkPass.so
-	$(SETPATH) $(CLANGPP) $(INCLUDE) $(OPTIONS) $(LIBRARY) $(DBGFLAG) $(LLVMOPT) $< -o $@
+gempass/build/SporkUnroll.so: gempass/SporkUnrollPass.cpp Makefile
+	$(MAKE) -C gempass/build
+
+llvmtest: scheduler.cpp *.hpp gempass/build/SporkUnroll.so Makefile
+#	$(SETPATH) $(CLANGPP) $(INCLUDE) $(OPTIONS) $(LIBRARY) $(DBGFLAG) $(LLVMOPT) -O3 $< -o $@
+	$(SETPATH) $(CLANGPP) $(INCLUDE) $(OPTIONS) $(LIBRARY) $(DBGFLAG) -emit-llvm -S -O3 $< -o llvmtest.ll
+	$(SETPATH) $(OPTLLVM) -load-pass-plugin=gempass/build/SporkUnroll.so  llvmtest.ll -o llvmtest.spork-unrolled.ll
+	$(SETPATH) $(OPTLLVM) -O3 llvmtest.spork-unrolled.ll -o llvmtest.opt.ll
+	$(SETPATH) $(CLANGPP) $(LIBRARY) $(DBGFLAG) llvmtest.opt.ll -o $@
 
 .PHONY: clean
 clean:

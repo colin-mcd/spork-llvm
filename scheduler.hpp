@@ -28,7 +28,6 @@
 
 // TODO: consistent name casing (camel or snake)
 // TODO: consider adaptive heartbeat timer intervals
-// TODO: look into if loop unrolling is why reduce is slower than reduceSeq
 // TODO: consider if writing pointers is async-signal-safe
 
 namespace spork {
@@ -261,7 +260,7 @@ inline void reset_heartbeat_stats() {
 //   ucontext_t* ctx = (ucontext_t*) ucontext;
 inline void heartbeat_handler(int sig) {
   int saved_errno = errno;
-  if (saved_errno) { std::cout << "SAVED_ERRNO = " << saved_errno << std::endl; }
+  // if (saved_errno) { std::cout << "SAVED_ERRNO = " << saved_errno << std::endl; }
   if (!disable_heartbeats) {
 #ifdef RECORD_HEARTBEAT_STATS
     volatile uint& hbs = num_heartbeats[spork::WorkStealingJob::worker_id()];
@@ -354,5 +353,10 @@ inline bool with_prom_handler(const BodyLambda&& body, const PromLambda&& prom) 
   return slot.close();
 }
 }
+
+// Allows loop unrolling (even for volatile loop induction/bound variables),
+// returning the compiler-chosen unroll factor
+// template <typename idx>
+// extern idx __spork_unroll_factor(idx& i, idx& j);
 
 #endif // SPORK_SCHEDULER_H_

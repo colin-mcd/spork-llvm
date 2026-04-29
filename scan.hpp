@@ -75,66 +75,81 @@ namespace { //private
   __attribute__((always_inline))
   inline constexpr idx third2(idx i, idx j) noexcept {
     static_assert(std::is_integral_v<idx>);
-    return j - 1 * ((j - i) / 5);
+    return j - 2 * ((j - i) / 5);
   }
 } // private
+
 
 template <typename idx, typename A, typename BinOp>
 inline void scan(A a, A* arr, idx n, const BinOp&& binop) {
   static_assert(parlay::is_monoid_for_v<BinOp, A>);
   static_assert(std::is_integral_v<idx>);
+  // make sure that loop index can fit in sig_atomic_t
+  static_assert(sizeof(sig_atomic_t) >= sizeof(idx));
 
-  idx volatile j = n;
   idx i = 0;
+  volatile sig_atomic_t sig_safe_i = 0;
+  volatile idx loop_end = n;
+
+  struct UpsweepJob : WorkStealingJob {
+    const BinOp&& binop;
+    volatile idx n;
+    A* volatile arr; // before run(): stores arr; after run(): stores sqrt(n) partials
+    void run() override { arr = scan_upsweep(arr, n, fwd(binop)); }
+    UpsweepJob(const BinOp&& _binop) : binop(fwd(_binop)) {}
+  };
+
+  UpsweepJob up(fwd(binop));
 
   bool promoted = with_prom_handler(
     [&, arr] () { // body
-      for (; i < j; i++) {
+      // for (; i + 5 <= loop_end; sig_safe_i = static_cast<sig_atomic_t>(i += 5)) {
+      //   A* arri = &arr[i];
+      //   #pragma clang loop unroll(full)
+      //   for (idx ii = 0; ii < 5; ii++) {
+      //     a = fwd(binop)(a, arri[ii]);
+      //     arri[ii] = a;
+      //   }
+      // }
+      for (; i < loop_end; sig_safe_i = static_cast<sig_atomic_t>(++i)) {
         a = fwd(binop)(a, arr[i]);
         arr[i] = a;
       }
     },
     [&, n] () { // prom handler
-      idx _i = i + 1;
-      idx t1 = third1<idx>(_i, n);
-      idx t2 = third2<idx>(_i, n);
+      idx prom_i = sig_safe_i + 5;//1;
+      idx t1 = third1<idx>(prom_i, n);
+      idx t2 = third2<idx>(prom_i, n);
       // only break if every third has work to do
-      if (_i < t1 && t1 < t2 && t2 < n) j = _i;
+      if (prom_i < t1 && t1 < t2 && t2 < n) {
+        loop_end = prom_i;
+        up.arr = &arr[t1];
+        up.n = t2 - t1;
+        up.enqueue((heartbeat_tokens + 1) >> 1);
+      }
     });
 
-  // TODO: could start spwn from prom handler above, then run body, then sync
-  // (slightly less delayed spwn)
   if (promoted && i != n) {
     idx t1 = third1<idx>(i, n);
     idx t2 = third2<idx>(i, n);
-    spork<char, A*, char>(
-      [=,&binop] () { // body
-        scan(arr[i-1], &arr[i], t1 - i, fwd(binop));
-        return '\0';},
-      [=,&binop] () { // spwn
-        return scan_upsweep(&arr[t1], t2 - t1, fwd(binop));},
-      [=,&binop] (char _) { // unpr
-        scan(arr[t1-1], &arr[t1], n - t1, fwd(binop));
-        return '\0';},
-      [=,&binop] (char _, A* partials) { // prom
-        if (partials) {
-          par([&binop, partials, arrt1 = &arr[t1], t21 = t2 - t1] () {
-                scan_downsweep(partials, arrt1, t21, fwd(binop));
-              },
-              [=,&binop] () {
-                A sum12 = partials[(t2 - t1 - 1) / scan_chunksize(t2 - t1)];
-                A sum02 = fwd(binop)(arr[t1-1], sum12);
-                scan(sum02, &arr[t2], n - t2, fwd(binop));
-              });
-        } else { // could not allocate the partials array
-          scan(arr[t1-1], &arr[t1], n - t1, fwd(binop));
-        }
-        return '\0';
+    
+    scan(arr[i-1], &arr[i], t1 - i, fwd(binop));
+    
+    // if up was stolen, sync, then make sure the results array is non-null
+    if (up.sync_is_stolen() && up.arr) {
+      A* partials = up.arr;
+      par([&binop, partials, arrt1 = &arr[t1], t21 = t2 - t1] () {
+        scan_downsweep(partials, arrt1, t21, fwd(binop));
       },
-      [=,&binop] (char _) { // unstolen
-        scan(arr[t1-1], &arr[t1], n - t1, fwd(binop));
-        return '\0';
-      });
+        [=,&binop] () {
+          A sum12 = partials[(t2 - t1 - 1) / scan_chunksize(t2 - t1)];
+          A sum02 = fwd(binop)(arr[t1-1], sum12);
+          scan(sum02, &arr[t2], n - t2, fwd(binop));
+        });
+    } else {
+      // if unstolen, just keep going
+      scan(arr[t1-1], &arr[t1], n - t1, fwd(binop));
+    }
   }
 }
 

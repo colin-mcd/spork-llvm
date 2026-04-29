@@ -1,0 +1,8 @@
+[
+{
+  "directory": "/home/coolin/code/spork-llvm/gempass/build",
+  "command": "/usr/bin/c++ -D_GLIBCXX_USE_CXX11_ABI=1 -D_GLIBCXX_USE_CXX11_ABI=\"1 -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS\" -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -I/home/coolin/code/llvm-project/llvm/include -I/home/coolin/code/llvm-project/build/include  -fPIC -fno-semantic-interposition -fvisibility-inlines-hidden -Werror=date-time -Wall -Wextra -Wno-unused-parameter -Wwrite-strings -Wcast-qual -Wno-missing-field-initializers -Wimplicit-fallthrough -Wno-nonnull -Wno-class-memaccess -Wno-dangling-reference -Wno-redundant-move -Wno-pessimizing-move -Wno-array-bounds -Wno-stringop-overread -Wno-dangling-pointer -Wno-noexcept-type -Wdelete-non-virtual-dtor -Wsuggest-override -Wno-comment -Wno-misleading-indentation -Wctad-maybe-unsupported -ffunction-sections -fdata-sections -O3 -DNDEBUG -std=gnu++17 -fPIC -fno-exceptions -funwind-tables -fno-rtti -Wall -Wextra -Wno-unused-parameter -o CMakeFiles/SporkUnrollPass.dir/SporkUnrollPass.cpp.o -c /home/coolin/code/spork-llvm/gempass/SporkUnrollPass.cpp",
+  "file": "/home/coolin/code/spork-llvm/gempass/SporkUnrollPass.cpp",
+  "output": "build/CMakeFiles/SporkUnrollPass.dir/SporkUnrollPass.cpp.o"
+}
+]

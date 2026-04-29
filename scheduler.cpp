@@ -1,6 +1,10 @@
 #include "scheduler.hpp"
+#include "parlay/primitives.h"
 #include "scan.hpp"
 #include "fib.hpp"
+#include "parlay/sequence.h"
+// #include "parlay/parallel.h"
+// #include "parlay/primitives.h"
 
 
 void print_uint_arr(const uint* arr, uint len) {
@@ -80,21 +84,18 @@ void free_data(datnum* arr) {
 int main(int argc, char* argv[]) {
   //size_t n = atoi(argv[1]);
   using idxnum = unsigned;
-  using datnum = int;
-
-  // num total = 0;
-  // volatile uint j = n*50;
-  // for (uint i = 0; i < j; i++) {
-  //   total += data[i % n];
-  // }
-  // std::cout << total << std::endl;
+  using datnum = short;
 
   constexpr idxnum n = 800000000;
   datnum* data = make_data<idxnum, datnum>(n);
+  parlay::sequence<datnum> dataseq = parlay::sequence<datnum>(data, &data[n]);
+  std::cout << "dataseq.size() = " << dataseq.size() << std::endl;
+  data = dataseq.data();
+  
   
   auto total_time = 0;
   constexpr uint WARMUP = 10;
-  constexpr uint NUM_TRIALS = 30;
+  constexpr uint NUM_TRIALS = 300;
 
   // this might take a sec the first time it is called
   spork::WorkStealingJob::get_current_scheduler();
@@ -105,33 +106,22 @@ int main(int argc, char* argv[]) {
     spork::start_heartbeats();
     
     auto start = std::chrono::steady_clock::now();
-    //parlay::parallel_for(0, n, [&] (uint i) { irregular_body(data, i, n); });
-    // p4(0, n, [&] (uint i) {
-    //   volatile char x = 0;
-    //   if (i < 10) {
-    //     p4(0, 10000000, [&] (uint j) { x = x + i*j; });
-    //   }
-    //   data[i] = x;
-    // });
-    // parlay::parallel_for(0, n*50, [&] (uint i) { data[i % n] = 5; });
-    // spork::parfor([&] (uint i) { data[i % n] = 5; }, 0, n*50);
-    // num total =
-      // spork::seqfor(0, n*50, [&] (uint i, num& a) {a += data[i % n];}, parlay::plus<num>());
-      // spork::parfor_unroll2<uint>(0, n*50, [&] (uint i, num& a) {a += data[i % n];}, parlay::plus<num>());
+
     datnum total = 0;
-    // total = spork::parfor(n, [&] (idxnum i, datnum& a) { a += data[i]; }, parlay::plus<datnum>());
+    total = spork::parfor(n, [&] (idxnum i, datnum& a) { a += data[i]; }, parlay::plus<datnum>());
+    // total = spork::seqfor(n, [&] (idxnum i, datnum& a) { a += data[i]; }, parlay::plus<datnum>());
     // spork::parfor(n, [&] (idxnum i) {data[i]++;});
-    // total = spork::parfor<idxnum>(0, n, [&] (idxnum i, datnum& a) {waste_some_time(); a += data[i];}, parlay::plus<datnum>());
-    // total = spork::seqfor<idxnum, datnum>(0, n, [&] (idxnum i, datnum& a) {a += data[i];}, parlay::plus<datnum>());
-    // total = spork::seqfor<idxnum, datnum>(0, n, [&] (idxnum i, datnum& a) {a += data[i]; data[i] = a;}, parlay::plus<datnum>());
     // spork::scan(n, data, parlay::plus<datnum>());
-    total = spork::fib(38);
+    // parlay::scan_inclusive_inplace(dataseq, parlay::plus<datnum>());
+    // spork::seqfor(n, [&] (idxnum i, datnum& a) { a += data[i]; data[i] = a; }, parlay::plus<datnum>());
+
+    // total = spork::fib(38);
     auto end = std::chrono::steady_clock::now();
 
     spork::pause_heartbeats();
     
     auto time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-    std::cout << (datnum) data[n - 2] << " " << total << " in " << time_ms << " ms";
+    std::cout << (datnum) data[n - 1] << " " << total << " in " << time_ms << " ms";
 #ifdef RECORD_HEARTBEAT_STATS
     std::cout <<" (";
     print_uint_avg((uint*) spork::num_heartbeats, spork::WorkStealingJob::num_workers());

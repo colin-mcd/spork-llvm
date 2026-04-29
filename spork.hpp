@@ -27,7 +27,7 @@ RR spork(const BodyL&& body, const SpwnL&& spwn, const UnprL&& unpr, const PromL
   BR br;
 
   bool promoted = with_prom_handler(
-    [&] () { br = fwd(body)(); },
+    [&br, body = fwd(body)] () { br = body(); },
     [&] () { jp.enqueue(heartbeat_tokens >> 1); });
 
   if (promoted) [[unlikely]] { // promoted

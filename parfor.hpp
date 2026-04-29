@@ -121,7 +121,7 @@ parlay::monoid_value_type_t<BinOp> parfor(idx i, idx j, const BodyLambda&& body,
 
   // ... and applies it to the following loop:
   bool promoted = with_prom_handler(
-    [&] () {
+    [&, body = fwd(body)] () {
       // #pragma spork unroll UNROLL
       // for (; i + EXTRA_UNROLL < loop_end; sig_safe_i = static_cast<sig_atomic_t>(++i)) {
       //   fwd(body)(i, a);
@@ -140,7 +140,7 @@ parlay::monoid_value_type_t<BinOp> parfor(idx i, idx j, const BodyLambda&& body,
       // }
       //#pragma clang loop unroll(enable)
       // parfor_loop<idx, BodyLambda, BinOp>(UNROLL_FACTOR, i, j, sig_safe_i, loop_end, a, fwd(body), fwd(binop));
-      for (; i < loop_end; sig_safe_i = static_cast<sig_atomic_t>(++i)) fwd(body)(i, a);
+      for (; i < loop_end; sig_safe_i = static_cast<sig_atomic_t>(++i)) body(i, a);
 
 
       // for (; sig_safe_i < loop_end;) {
@@ -192,7 +192,7 @@ parlay::monoid_value_type_t<BinOp> parfor(idx i, idx j, const BodyLambda&& body,
 
 template <typename idx, typename BodyLambda>
 void parfor(idx i, idx j, const BodyLambda&& body) {
-  char _ = parfor(i, j, [&] (idx i, char _) {fwd(body)(i);}, parlay::plus<char>());
+  char _ = parfor(i, j, [body = fwd(body)] (idx i, char _) {body(i);}, parlay::plus<char>());
 }
 
 template <typename idx, typename BodyLambda>
@@ -210,17 +210,19 @@ parlay::monoid_value_type_t<BinOp> parfor(idx n, const BodyLambda&& body, const 
 
 template <typename idx, typename BodyLambda, typename BinOp>
 parlay::monoid_value_type_t<BinOp> parlayfor(idx i, idx j, const BodyLambda&& body, const BinOp&& binop) {
-  auto is = parlay::delayed_tabulate(j - i, [&] (long k) {
-    auto a = fwd(binop).identity;
-    fwd(body)(i + k, a);
-    return a;
-  });
+  auto is = parlay::delayed_tabulate(
+    j - i,
+    [binop = fwd(binop), body = fwd(body), i] (long k) {
+      auto a = binop.identity;
+      body(i + k, a);
+      return a;
+    });
   return parlay::reduce(is, fwd(binop));
 }
 
 template <typename idx, typename BodyLambda>
 void parlayfor(idx i, idx j, const BodyLambda&& body) {
-  char _ = parlayfor(i, j, [&] (idx i, char _) {fwd(body)(i);}, parlay::plus<char>());
+  char _ = parlayfor(i, j, [body = fwd(body)] (idx i, char _) {body(i);}, parlay::plus<char>());
 }
 
 template <typename idx, typename BodyLambda>

@@ -9,7 +9,7 @@ DBGFLAG := -ggdb
 #LIBRARY := -lpthread -lunwind
 LIBRARY := -lpthread
 SETPATH := LD_PRELOAD=/usr/local/lib/libjemalloc.so
-OPTIONS := -xc++ -std=c++20 -O3 -Rpass=loop-unroll
+OPTIONS := -xc++ -std=c++20 -O3
 LLVMOPT := -fpass-plugin=./gempass/build/SporkUnroll.so
 
 %: %.cpp *.hpp Makefile

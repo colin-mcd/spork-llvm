@@ -9,9 +9,10 @@ int main(int argc, char* argv[]) {
     n = atoi(argv[2]);
   } else {
     n = 800000000;
+    // n = 8000000000;
   }
 
-  using idxnum = unsigned;
+  using idxnum = long long;
   using datnum = short;
   parlay::sequence<datnum> data = parlay::tabulate(n, [&] (long k) -> datnum { return 1; });
   benchmark([n, &data] () {

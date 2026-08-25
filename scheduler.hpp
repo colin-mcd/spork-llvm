@@ -142,15 +142,19 @@ namespace { // private
     public:
 
     inline void store(T* p) noexcept {
-      std::atomic_signal_fence(std::memory_order_release);
+      std::atomic_signal_fence(std::memory_order_release); // or below
+      // asm volatile("" ::: "memory"); // or above
       ptr.store(p, std::memory_order_relaxed);
     }
 
     inline T* load() const noexcept {
-      T* p = ptr.load(std::memory_order_relaxed);
+      T* p = ptr.load(std::memory_order_relaxed); // or below
+      // asm volatile("" ::: "memory"); // or above
       std::atomic_signal_fence(std::memory_order_acquire);
       return p;
     }
+
+    consteval async_signal_safe_pointer() noexcept : ptr(nullptr) {}
 
     async_signal_safe_pointer(T* p) noexcept {
       store(p);
@@ -176,67 +180,71 @@ namespace { // private
       store(other.load());
       return *this;
     }
+    
+    bool operator==(async_signal_safe_pointer<T>&& other) const noexcept {
+      return load() == other.load();
+    }
   };
 
-  template <typename T>
-  class async_signal_safe {
-    // std::atomic<T> a;
-    public:
-    #ifdef USE_SIGNAL_SAFE_ATOMIC
-    using t = std::atomic<T>;
-    static_assert(t::is_always_lock_free);
-    #else
-    using t = volatile T;
-    #endif
-  };
-  template <typename T>
-  using async_signal_safe_t = typename async_signal_safe<T>::t;
+  // template <typename T>
+  // class async_signal_safe {
+  //   // std::atomic<T> a;
+  //   public:
+  //   #ifdef USE_SIGNAL_SAFE_ATOMIC
+  //   using t = std::atomic<T>;
+  //   static_assert(t::is_always_lock_free);
+  //   #else
+  //   using t = volatile T;
+  //   #endif
+  // };
+  // template <typename T>
+  // using async_signal_safe_t = typename async_signal_safe<T>::t;
 
-  template <typename T>
-  T async_signal_safe_load(const async_signal_safe_t<T>& p) {
-    #ifdef USE_SIGNAL_SAFE_ATOMIC
-    T v = p.load(std::memory_order_relaxed);
-    std::atomic_signal_fence(std::memory_order_acquire);
-    // asm volatile("" ::: "memory");
-    #else
-    T v = p;
-    #endif
-    return v;
-  }
+  // template <typename T>
+  // T async_signal_safe_load(const async_signal_safe_t<T>& p) {
+  //   #ifdef USE_SIGNAL_SAFE_ATOMIC
+  //   T v = p.load(std::memory_order_relaxed);
+  //   std::atomic_signal_fence(std::memory_order_acquire);
+  //   // asm volatile("" ::: "memory");
+  //   #else
+  //   T v = p;
+  //   #endif
+  //   return v;
+  // }
 
-  template <typename T>
-  void async_signal_safe_store(async_signal_safe_t<T>& p, T v) {
-    #ifdef USE_SIGNAL_SAFE_ATOMIC
-    std::atomic_signal_fence(std::memory_order_release);
-    // asm volatile("" ::: "memory");
-    p.store(v, std::memory_order_relaxed);
-    #else
-    p = v;
-    #endif
-  }
+  // template <typename T>
+  // void async_signal_safe_store(async_signal_safe_t<T>& p, T v) {
+  //   #ifdef USE_SIGNAL_SAFE_ATOMIC
+  //   std::atomic_signal_fence(std::memory_order_release);
+  //   // asm volatile("" ::: "memory");
+  //   p.store(v, std::memory_order_relaxed);
+  //   #else
+  //   p = v;
+  //   #endif
+  // }
 
-  template <typename T>
-  T async_signal_safe_load_ptr(const async_signal_safe_t<T*>& p) {
-    #ifdef USE_SIGNAL_SAFE_ATOMIC
-    T v = *p.load(std::memory_order_relaxed);
-    std::atomic_signal_fence(std::memory_order_acquire);
-    // asm volatile("" ::: "memory");
-    #else
-    T v = *p;
-    #endif
-    return v;
-  }
+  // template <typename T>
+  // T async_signal_safe_load_ptr(const async_signal_safe_t<T*>& p) {
+  //   #ifdef USE_SIGNAL_SAFE_ATOMIC
+  //   T v = *p.load(std::memory_order_relaxed);
+  //   std::atomic_signal_fence(std::memory_order_acquire);
+  //   // asm volatile("" ::: "memory");
+  //   #else
+  //   T v = *p;
+  //   #endif
+  //   return v;
+  // }
   
-  template <typename T>
-  void async_signal_safe_store_ptr(async_signal_safe_t<T*>& p, T v) {
-    #ifdef USE_SIGNAL_SAFE_ATOMIC
-    std::atomic_signal_fence(std::memory_order_release);
-    // asm volatile("" ::: "memory");
-    *p.store(v, std::memory_order_relaxed);
-    #else
-    *p = v;
-    #endif
-  }
+  // template <typename T>
+  // void async_signal_safe_store_ptr(async_signal_safe_t<T*>& p, T v) {
+  //   #ifdef USE_SIGNAL_SAFE_ATOMIC
+  //   std::atomic_signal_fence(std::memory_order_release);
+  //   // asm volatile("" ::: "memory");
+  //   *p.store(v, std::memory_order_relaxed);
+  //   #else
+  //   *p = v;
+  //   #endif
+  // }
 
   // TODO: make sure prom doesn't throw any exceptions
   struct PromFn {
@@ -251,17 +259,17 @@ namespace { // private
     volatile bool promoted;
     const PromFn* promfn;
     // `prev` does not need to be volatile itself, since the signal handler never uses it
-    async_signal_safe_t<SporkSlot*>* prev;
+    async_signal_safe_pointer<SporkSlot>* prev;
     // Pointer to the next spork slot. Before following it,
     // check if this is already the back of the spork deque:
     // `&next == spork_deque_back`.
     // Note: `next` may be a dangling pointer.
-    async_signal_safe_t<SporkSlot*> next;
+    async_signal_safe_pointer<SporkSlot> next;
   
     // Constructs the sentinel spork slot for `spork_deque_front`.
     // DO NOT USE OTHERWISE!
     consteval explicit SporkSlot() :
-      promoted(true), promfn(nullptr), prev(nullptr), next(nullptr) {}
+      promoted(true), promfn(nullptr), prev(nullptr), next(async_signal_safe_pointer<SporkSlot>()) {}
   
     explicit SporkSlot(const PromFn* _promfn);
     static void reset();
@@ -277,7 +285,7 @@ namespace { // private
   inline constinit thread_local SporkSlot spork_deque_front{};
   // `spork_deque_back` points to the `next` pointer of the last slot in spork deque
   // (a slot is at the back if the address of its `next` pointer equals `spork_deque_back`)
-  inline constinit thread_local async_signal_safe_t<async_signal_safe_t<SporkSlot*>*> spork_deque_back;
+  inline constinit thread_local async_signal_safe_pointer<async_signal_safe_pointer<SporkSlot>> spork_deque_back;
   
   // The constructor and `close()` for `SporkSlot` may
   // write to `spork_deque_back`, but the signal handler may only read.
@@ -285,9 +293,9 @@ namespace { // private
   // it can cause issues because it is a (nonatomic) thread_local variable,
   // __attribute__((always_inline))
   inline SporkSlot::SporkSlot(const PromFn* _promfn)
-    : promoted(false), promfn(_promfn), prev(async_signal_safe_load<async_signal_safe_t<SporkSlot*>*>(spork_deque_back)) {
-    // async_signal_safe_store_ptr<SporkSlot>(*prev, this);
-    *prev = this; // TODO?
+    : promoted(false), promfn(_promfn) {
+    prev = spork_deque_back.load();
+    *prev = this;
     // if (heartbeat_tokens) [[unlikely]] eager_promote();
     // now commit these changes to the spork stack, allowing promotions
     spork_deque_back = &next; // TODO
@@ -314,12 +322,12 @@ namespace { // private
   }
   
   inline void SporkSlot::promote_front() {
-    if (&spork_deque_front.next == spork_deque_back) return; // TODO
-    SporkSlot* slot = spork_deque_front.next; // TODO
+    if (&spork_deque_front.next == spork_deque_back) return;
+    SporkSlot* slot = spork_deque_front.next.load();
     while (heartbeat_tokens) {
       if (!slot->promoted) slot->promote();
       if (&slot->next == spork_deque_back) break; // TODO
-      else slot = slot->next;
+      else slot = slot->next.load();
     }
   }
 

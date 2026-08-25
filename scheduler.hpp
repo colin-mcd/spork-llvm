@@ -15,6 +15,8 @@
 //#include <sys/ioctl.h>
 //#include <fcntl.h>
 
+#define USE_SIGNAL_SAFE_ATOMIC
+
 #define RECORD_HEARTBEAT_STATS
 
 #define fwd(x) std::forward<std::remove_reference_t<decltype(x)>>(x)
@@ -128,6 +130,114 @@ struct WorkStealingJob {
 };
 
 namespace { // private
+
+  template <typename T>
+  class async_signal_safe_pointer {
+    // needs the atomic pointer to always be lock free for good performance;
+    // if not, should warn the user and fail to compile
+    static_assert(std::atomic<T*>::is_always_lock_free,
+                  "async_signal_safe_pointer relies on being always lock free!");
+    private:
+    std::atomic<T*> ptr;
+    public:
+
+    inline void store(T* p) noexcept {
+      std::atomic_signal_fence(std::memory_order_release);
+      ptr.store(p, std::memory_order_relaxed);
+    }
+
+    inline T* load() const noexcept {
+      T* p = ptr.load(std::memory_order_relaxed);
+      std::atomic_signal_fence(std::memory_order_acquire);
+      return p;
+    }
+
+    async_signal_safe_pointer(T* p) noexcept {
+      store(p);
+    }
+
+    T& operator*() {
+      return *load();
+    }
+
+    const T& operator*() const {
+      return *load();
+    }
+
+    T* operator->() noexcept {
+      return load();
+    }
+
+    const T* operator->() const noexcept {
+      return load();
+    }
+
+    async_signal_safe_pointer<T>& operator=(async_signal_safe_pointer<T>&& other) noexcept {
+      store(other.load());
+      return *this;
+    }
+  };
+
+  template <typename T>
+  class async_signal_safe {
+    // std::atomic<T> a;
+    public:
+    #ifdef USE_SIGNAL_SAFE_ATOMIC
+    using t = std::atomic<T>;
+    static_assert(t::is_always_lock_free);
+    #else
+    using t = volatile T;
+    #endif
+  };
+  template <typename T>
+  using async_signal_safe_t = typename async_signal_safe<T>::t;
+
+  template <typename T>
+  T async_signal_safe_load(const async_signal_safe_t<T>& p) {
+    #ifdef USE_SIGNAL_SAFE_ATOMIC
+    T v = p.load(std::memory_order_relaxed);
+    std::atomic_signal_fence(std::memory_order_acquire);
+    // asm volatile("" ::: "memory");
+    #else
+    T v = p;
+    #endif
+    return v;
+  }
+
+  template <typename T>
+  void async_signal_safe_store(async_signal_safe_t<T>& p, T v) {
+    #ifdef USE_SIGNAL_SAFE_ATOMIC
+    std::atomic_signal_fence(std::memory_order_release);
+    // asm volatile("" ::: "memory");
+    p.store(v, std::memory_order_relaxed);
+    #else
+    p = v;
+    #endif
+  }
+
+  template <typename T>
+  T async_signal_safe_load_ptr(const async_signal_safe_t<T*>& p) {
+    #ifdef USE_SIGNAL_SAFE_ATOMIC
+    T v = *p.load(std::memory_order_relaxed);
+    std::atomic_signal_fence(std::memory_order_acquire);
+    // asm volatile("" ::: "memory");
+    #else
+    T v = *p;
+    #endif
+    return v;
+  }
+  
+  template <typename T>
+  void async_signal_safe_store_ptr(async_signal_safe_t<T*>& p, T v) {
+    #ifdef USE_SIGNAL_SAFE_ATOMIC
+    std::atomic_signal_fence(std::memory_order_release);
+    // asm volatile("" ::: "memory");
+    *p.store(v, std::memory_order_relaxed);
+    #else
+    *p = v;
+    #endif
+  }
+
   // TODO: make sure prom doesn't throw any exceptions
   struct PromFn {
     virtual void operator()() const = 0;
@@ -135,15 +245,18 @@ namespace { // private
   
   struct SporkSlot {
     // TODO: otherwise, we can probably view this as nonvolatile from this struct
+    // TODO: change promoted to a sig_atomic_t, and make sure that
+    // can't be reordered across async_signal_safe_loads/stores?
+    // -> perhaps also make it std::atomic<bool>?
     volatile bool promoted;
     const PromFn* promfn;
     // `prev` does not need to be volatile itself, since the signal handler never uses it
-    SporkSlot*volatile* prev;
+    async_signal_safe_t<SporkSlot*>* prev;
     // Pointer to the next spork slot. Before following it,
     // check if this is already the back of the spork deque:
     // `&next == spork_deque_back`.
     // Note: `next` may be a dangling pointer.
-    SporkSlot* volatile next;
+    async_signal_safe_t<SporkSlot*> next;
   
     // Constructs the sentinel spork slot for `spork_deque_front`.
     // DO NOT USE OTHERWISE!
@@ -161,10 +274,10 @@ namespace { // private
   };
   
   // sentinel node for spork deque
-  inline constinit thread_local SporkSlot spork_deque_front;
+  inline constinit thread_local SporkSlot spork_deque_front{};
   // `spork_deque_back` points to the `next` pointer of the last slot in spork deque
   // (a slot is at the back if the address of its `next` pointer equals `spork_deque_back`)
-  inline constinit thread_local SporkSlot * volatile * volatile spork_deque_back;
+  inline constinit thread_local async_signal_safe_t<async_signal_safe_t<SporkSlot*>*> spork_deque_back;
   
   // The constructor and `close()` for `SporkSlot` may
   // write to `spork_deque_back`, but the signal handler may only read.
@@ -172,15 +285,16 @@ namespace { // private
   // it can cause issues because it is a (nonatomic) thread_local variable,
   // __attribute__((always_inline))
   inline SporkSlot::SporkSlot(const PromFn* _promfn)
-    : promoted(false), promfn(_promfn), prev(spork_deque_back) {
-    *prev = this;
+    : promoted(false), promfn(_promfn), prev(async_signal_safe_load<async_signal_safe_t<SporkSlot*>*>(spork_deque_back)) {
+    // async_signal_safe_store_ptr<SporkSlot>(*prev, this);
+    *prev = this; // TODO?
     // if (heartbeat_tokens) [[unlikely]] eager_promote();
     // now commit these changes to the spork stack, allowing promotions
-    spork_deque_back = &next;
+    spork_deque_back = &next; // TODO
   }
   
   inline void SporkSlot::reset() {
-    spork_deque_back = &spork_deque_front.next;
+    spork_deque_back = &spork_deque_front.next; // TODO
   }
   
   // NOTE: `this` *must* be the slot at `spork_deque_back`
@@ -188,7 +302,7 @@ namespace { // private
   inline bool SporkSlot::close() {
     // TODO idea: just disable heartbeats for this and also constructor above,
     // then perhaps we can remove promoted slots from the spork stack?
-    spork_deque_back = prev;
+    spork_deque_back = prev; // TODO
     return promoted;
   }
   
@@ -200,11 +314,11 @@ namespace { // private
   }
   
   inline void SporkSlot::promote_front() {
-    if (&spork_deque_front.next == spork_deque_back) return;
-    SporkSlot* slot = spork_deque_front.next;
+    if (&spork_deque_front.next == spork_deque_back) return; // TODO
+    SporkSlot* slot = spork_deque_front.next; // TODO
     while (heartbeat_tokens) {
       if (!slot->promoted) slot->promote();
-      if (&slot->next == spork_deque_back) break;
+      if (&slot->next == spork_deque_back) break; // TODO
       else slot = slot->next;
     }
   }

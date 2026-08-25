@@ -14,6 +14,8 @@ LLVMOPT := -fpass-plugin=./gempass/build/SporkUnroll.so
 
 %: %.cpp *.hpp Makefile
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) $< -o $@
+%.ss: %.cpp *.hpp Makefile
+	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -DUSE_SIGNAL_SAFE_ATOMIC $(DBGFLAG) $< -o $@
 
 # scheduler_expanded.cpp: scheduler.cpp *.hpp Makefile
 # 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -E $< -o $@

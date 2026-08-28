@@ -15,9 +15,11 @@
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Transforms/Scalar/LoopPassManager.h"
 #include "llvm/Transforms/Scalar/LoopUnrollPass.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Utils/UnrollLoop.h"
 
 #include <algorithm>
 #include <cassert>
@@ -112,33 +114,12 @@ static unsigned determineStandardUnrollCount(Loop *L,
     }
   }
 
-  TargetTransformInfo::UnrollingPreferences UP;
-  UP.Threshold = 300;
-  UP.MaxPercentThresholdBoost = 400;
-  UP.OptSizeThreshold = 0;
-  UP.PartialThreshold = 150;
-  UP.PartialOptSizeThreshold = 0;
-  UP.Count = 0;
-  UP.DefaultUnrollRuntimeCount = 8;
-  UP.MaxCount = std::numeric_limits<unsigned>::max();
-  UP.MaxUpperBound = std::numeric_limits<unsigned>::max();
-  UP.FullUnrollMaxCount = std::numeric_limits<unsigned>::max();
-  UP.BEInsns = 2;
-  UP.Partial = true;
-  UP.Runtime = true;
-  UP.AllowRemainder = true;
-  UP.UnrollRemainder = false;
-  UP.AllowExpensiveTripCount = false;
-  UP.Force = false;
-  UP.UpperBound = false;
-  UP.UnrollAndJam = false;
-  UP.UnrollAndJamInnerLoopThreshold = 60;
-  UP.MaxIterationsCountToAnalyze = 0;
-  UP.SCEVExpansionBudget = 4;
-  UP.RuntimeUnrollMultiExit = false;
-  UP.AddAdditionalAccumulators = false;
-
-  TTI.getUnrollingPreferences(L, SE, UP, nullptr);
+  OptimizationRemarkEmitter ORE(L->getHeader()->getParent());
+  TargetTransformInfo::UnrollingPreferences UP = llvm::gatherUnrollingPreferences(
+      L, SE, TTI, /*BFI=*/nullptr, /*PSI=*/nullptr, ORE, /*OptLevel=*/3,
+      /*UserThreshold=*/std::nullopt, /*UserCount=*/std::nullopt,
+      /*UserAllowPartial=*/true, /*UserRuntime=*/true,
+      /*UserUpperBound=*/std::nullopt, /*UserFullUnrollMaxCount=*/std::nullopt);
 
   unsigned MaxThreshold = UP.PartialThreshold;
   if (MaxThreshold == 0)

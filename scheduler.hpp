@@ -30,7 +30,6 @@
 
 // TODO: consistent name casing (camel or snake)
 // TODO: consider adaptive heartbeat timer intervals
-// TODO: consider if writing pointers is async-signal-safe
 
 namespace spork {
 
@@ -148,103 +147,51 @@ namespace { // private
     }
 
     inline T* load() const noexcept {
-      T* p = ptr.load(std::memory_order_relaxed); // or below
-      // asm volatile("" ::: "memory"); // or above
-      std::atomic_signal_fence(std::memory_order_acquire);
+      T* p = ptr.load(std::memory_order_relaxed);
+      // asm volatile("" ::: "memory"); // or below
+      std::atomic_signal_fence(std::memory_order_acquire); // or above
       return p;
     }
 
-    consteval async_signal_safe_pointer() noexcept : ptr(nullptr) {}
+    inline consteval async_signal_safe_pointer() noexcept : ptr(nullptr) {}
 
-    async_signal_safe_pointer(T* p) noexcept {
+    inline async_signal_safe_pointer(T* p) noexcept {
       store(p);
     }
 
-    T& operator*() {
+    inline T& operator*() {
       return *load();
     }
 
-    const T& operator*() const {
+    inline const T& operator*() const {
       return *load();
     }
 
-    T* operator->() noexcept {
+    inline T* operator->() noexcept {
       return load();
     }
 
-    const T* operator->() const noexcept {
+    inline const T* operator->() const noexcept {
       return load();
     }
+    
+    // inline T* operator&() noexcept {
+    //   return load();
+    // }
 
-    async_signal_safe_pointer<T>& operator=(async_signal_safe_pointer<T>&& other) noexcept {
+    // inline const T* operator&() const noexcept {
+    //   return load();
+    // }
+
+    inline async_signal_safe_pointer<T>& operator=(async_signal_safe_pointer<T>&& other) noexcept {
       store(other.load());
       return *this;
     }
     
-    bool operator==(async_signal_safe_pointer<T>&& other) const noexcept {
+    inline bool operator==(async_signal_safe_pointer<T>&& other) const noexcept {
       return load() == other.load();
     }
   };
-
-  // template <typename T>
-  // class async_signal_safe {
-  //   // std::atomic<T> a;
-  //   public:
-  //   #ifdef USE_SIGNAL_SAFE_ATOMIC
-  //   using t = std::atomic<T>;
-  //   static_assert(t::is_always_lock_free);
-  //   #else
-  //   using t = volatile T;
-  //   #endif
-  // };
-  // template <typename T>
-  // using async_signal_safe_t = typename async_signal_safe<T>::t;
-
-  // template <typename T>
-  // T async_signal_safe_load(const async_signal_safe_t<T>& p) {
-  //   #ifdef USE_SIGNAL_SAFE_ATOMIC
-  //   T v = p.load(std::memory_order_relaxed);
-  //   std::atomic_signal_fence(std::memory_order_acquire);
-  //   // asm volatile("" ::: "memory");
-  //   #else
-  //   T v = p;
-  //   #endif
-  //   return v;
-  // }
-
-  // template <typename T>
-  // void async_signal_safe_store(async_signal_safe_t<T>& p, T v) {
-  //   #ifdef USE_SIGNAL_SAFE_ATOMIC
-  //   std::atomic_signal_fence(std::memory_order_release);
-  //   // asm volatile("" ::: "memory");
-  //   p.store(v, std::memory_order_relaxed);
-  //   #else
-  //   p = v;
-  //   #endif
-  // }
-
-  // template <typename T>
-  // T async_signal_safe_load_ptr(const async_signal_safe_t<T*>& p) {
-  //   #ifdef USE_SIGNAL_SAFE_ATOMIC
-  //   T v = *p.load(std::memory_order_relaxed);
-  //   std::atomic_signal_fence(std::memory_order_acquire);
-  //   // asm volatile("" ::: "memory");
-  //   #else
-  //   T v = *p;
-  //   #endif
-  //   return v;
-  // }
-  
-  // template <typename T>
-  // void async_signal_safe_store_ptr(async_signal_safe_t<T*>& p, T v) {
-  //   #ifdef USE_SIGNAL_SAFE_ATOMIC
-  //   std::atomic_signal_fence(std::memory_order_release);
-  //   // asm volatile("" ::: "memory");
-  //   *p.store(v, std::memory_order_relaxed);
-  //   #else
-  //   *p = v;
-  //   #endif
-  // }
 
   // TODO: make sure prom doesn't throw any exceptions
   struct PromFn {
@@ -258,7 +205,8 @@ namespace { // private
     // -> perhaps also make it std::atomic<bool>?
     volatile bool promoted;
     const PromFn* promfn;
-    // `prev` does not need to be volatile itself, since the signal handler never uses it
+    // `prev` does not need to be async signal safe itself,
+    // since the signal handler never uses it
     async_signal_safe_pointer<SporkSlot>* prev;
     // Pointer to the next spork slot. Before following it,
     // check if this is already the back of the spork deque:
@@ -298,11 +246,12 @@ namespace { // private
     *prev = this;
     // if (heartbeat_tokens) [[unlikely]] eager_promote();
     // now commit these changes to the spork stack, allowing promotions
-    spork_deque_back = &next; // TODO
+    auto x = &next;
+    spork_deque_back = &next;
   }
   
   inline void SporkSlot::reset() {
-    spork_deque_back = &spork_deque_front.next; // TODO
+    spork_deque_back = &spork_deque_front.next;
   }
   
   // NOTE: `this` *must* be the slot at `spork_deque_back`
@@ -310,7 +259,7 @@ namespace { // private
   inline bool SporkSlot::close() {
     // TODO idea: just disable heartbeats for this and also constructor above,
     // then perhaps we can remove promoted slots from the spork stack?
-    spork_deque_back = prev; // TODO
+    spork_deque_back = prev;
     return promoted;
   }
   
@@ -326,7 +275,7 @@ namespace { // private
     SporkSlot* slot = spork_deque_front.next.load();
     while (heartbeat_tokens) {
       if (!slot->promoted) slot->promote();
-      if (&slot->next == spork_deque_back) break; // TODO
+      if (&slot->next == spork_deque_back) break;
       else slot = slot->next.load();
     }
   }

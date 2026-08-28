@@ -1,4 +1,5 @@
-CLANGPP := ~/code/llvm-project/build/bin/clang++ -stdlib=libc++
+CLANGPP := $(HOME)/code/llvm-project/build/bin/clang++ -stdlib=libc++
+# CLANGPP := ./llvm-project/build/bin/clang++ -stdlib=libc++ -v
 #CLANGPP := clang++ -stdlib=libc++
 # CLANGPP := g++
 # OPTLLVM := ~/code/llvm-project/build/bin/opt
@@ -12,25 +13,25 @@ SETPATH := LD_PRELOAD=/usr/local/lib/libjemalloc.so
 OPTIONS := -xc++ -std=c++20 -O3
 LLVMOPT := -fpass-plugin=./gempass/build/SporkUnroll.so
 
-%: %.cpp *.hpp Makefile
-	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(DBGFLAG) $< -o $@
-%.ss: %.cpp *.hpp Makefile
-	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -DUSE_SIGNAL_SAFE_ATOMIC $(DBGFLAG) $< -o $@
+%: %.cpp *.hpp Makefile gempass/build/SporkUnroll.so
+	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(LLVMOPT) $(DBGFLAG) $< -o $@
+%.ss: %.cpp *.hpp Makefile gempass/build/SporkUnroll.so
+	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(LLVMOPT) -DUSE_SIGNAL_SAFE_ATOMIC $(DBGFLAG) $< -o $@
 
 # scheduler_expanded.cpp: scheduler.cpp *.hpp Makefile
 # 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -E $< -o $@
 
-%.s: %.cpp *.hpp Makefile
-	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) -S $< -o $@
+%.s: %.cpp *.hpp Makefile gempass/build/SporkUnroll.so
+	$(SETPATH) $(CLANGPP) $(INCLUDE) $(LIBRARY) $(OPTIONS) $(LLVMOPT) -S $< -o $@
 
 %.i: %.cpp *.hpp Makefile
 	$(SETPATH) $(CLANGPP) $(INCLUDE) $(OPTIONS) $(DBGFLAG) -E $< -o $@
 
 %.o: %.cpp *.hpp Makefile
-	$(SETPATH) $(CLANGPP) $(INCLUDE) $(OPTIONS) -S $< -o $@
+	$(SETPATH) $(CLANGPP) $(INCLUDE) $(OPTIONS) $(LLVMOPT) -S $< -o $@
 
-%.ll: %.cpp *.hpp Makefile
-	$(SETPATH) $(CLANGPP) $(INCLUDE) $(OPTIONS) -O2 -S -emit-llvm $< -o $@
+%.ll: %.cpp *.hpp Makefile gempass/build/SporkUnroll.so
+	$(SETPATH) $(CLANGPP) $(INCLUDE) $(OPTIONS) $(LLVMOPT) -O2 -S -emit-llvm $< -o $@
 
 %.opt.ll: %.ll *.hpp Makefile
 	$(SETPATH) $(OPTLLVM) -S -O3 $< -o $@

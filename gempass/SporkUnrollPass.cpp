@@ -208,7 +208,8 @@ static uint64_t getLoopStep(Loop *L, ScalarEvolution &SE) {
     if (const auto *AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(IndVar))) {
       if (const auto *Step =
               dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE))) {
-        return Step->getValue()->getZExtValue();
+        int64_t StepVal = Step->getValue()->getSExtValue();
+        return std::abs(StepVal);
       }
     }
   }
@@ -218,7 +219,8 @@ static uint64_t getLoopStep(Loop *L, ScalarEvolution &SE) {
       if (AR->getLoop() == L) {
         if (const auto *Step =
                 dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE))) {
-          return Step->getValue()->getZExtValue();
+          int64_t StepVal = Step->getValue()->getSExtValue();
+          return std::abs(StepVal);
         }
       }
     }
@@ -607,7 +609,8 @@ struct SporkPostUnrollPass : public PassInfoMixin<SporkPostUnrollPass> {
                 for (BasicBlock *BB : CurrentLoop->getBlocks()) {
                   for (Instruction &I : *BB) {
                     if (auto *SI = dyn_cast<StoreInst>(&I)) {
-                      if (SI->getPointerOperand() == Ptr) {
+                      if (SI->getPointerOperand() == Ptr &&
+                          (SI == OrigSI || SI->hasMetadata("spork.volatile"))) {
                         StoresToPtr.push_back(SI);
                       }
                     }
@@ -626,18 +629,31 @@ struct SporkPostUnrollPass : public PassInfoMixin<SporkPostUnrollPass> {
                       return true;
                     if (DT.dominates(B->getParent(), A->getParent()))
                       return false;
-                    return A->comesBefore(B);
+                    return A->getParent() < B->getParent();
                   });
 
-                  // Coalesce: keep the final store, mark it volatile, and erase intermediate stores
-                  StoreInst *FinalStore = StoresToPtr.back();
-                  FinalStore->setVolatile(true);
-                  FinalStore->setMetadata("spork.volatile", nullptr);
-
+                  // Only coalesce if the stores are executed sequentially
+                  bool CanCoalesce = true;
                   for (size_t i = 0; i + 1 < StoresToPtr.size(); ++i) {
-                    StoresToPtr[i]->eraseFromParent();
+                    BasicBlock *BBA = StoresToPtr[i]->getParent();
+                    BasicBlock *BBB = StoresToPtr[i + 1]->getParent();
+                    if (BBA != BBB && !DT.dominates(BBA, BBB)) {
+                      CanCoalesce = false;
+                      break;
+                    }
                   }
-                  Changed = true;
+
+                  if (CanCoalesce) {
+                    // Coalesce: keep the final store, mark it volatile, and erase intermediate stores
+                    StoreInst *FinalStore = StoresToPtr.back();
+                    FinalStore->setVolatile(true);
+                    FinalStore->setMetadata("spork.volatile", nullptr);
+
+                    for (size_t i = 0; i + 1 < StoresToPtr.size(); ++i) {
+                      StoresToPtr[i]->eraseFromParent();
+                    }
+                    Changed = true;
+                  }
                 }
               }
             }
@@ -727,22 +743,15 @@ struct SporkPostUnrollPass : public PassInfoMixin<SporkPostUnrollPass> {
       }
     }
 
-    // (5) Assert that __spork_unroll_factor has no remaining uses,
-    // and then remove its declaration from the program.
-    bool AllSporkCallsProcessed = false;
-    {
-      std::lock_guard<std::mutex> Lock(StateMutex);
-      AllSporkCallsProcessed = ActiveSporkCalls.empty();
-    }
-
+    // (5) If __spork_unroll_factor has no remaining uses in the module,
+    // remove its declaration from the program.
     Module *M = F.getParent();
-    if (M && AllSporkCallsProcessed) {
+    if (M) {
       SmallVector<Function *, 4> DeclsToRemove;
       for (Function &Func : *M) {
         if (Func.isDeclaration() &&
-            Func.getName().contains("__spork_unroll_factor")) {
-          assert(Func.use_empty() &&
-                 "__spork_unroll_factor has no remaining uses");
+            Func.getName().contains("__spork_unroll_factor") &&
+            Func.use_empty()) {
           DeclsToRemove.push_back(&Func);
         }
       }

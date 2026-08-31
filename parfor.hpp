@@ -17,7 +17,7 @@
 #define VOLATILE_UNROLL
 
 #ifdef VOLATILE_UNROLL
-extern void __spork_unroll_factor(volatile unsigned int& unroll_factor);
+extern "C" void __spork_unroll_factor(volatile unsigned int& unroll_factor);
 #endif
 
 namespace spork {

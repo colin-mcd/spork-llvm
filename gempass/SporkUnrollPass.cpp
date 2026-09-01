@@ -1,30 +1,28 @@
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/CodeMetrics.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/ScalarEvolution.h"
-#include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
-#include "llvm/IR/Analysis.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
-#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
-#include "llvm/IR/ValueHandle.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/Debug.h"
-#include "llvm/Support/raw_ostream.h"
-#include "llvm/Analysis/OptimizationRemarkEmitter.h"
-#include "llvm/Transforms/Scalar/LoopPassManager.h"
-#include "llvm/Transforms/Scalar/LoopUnrollPass.h"
-#include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Utils/LCSSA.h"
+#include "llvm/Transforms/Utils/LoopPeel.h"
+#include "llvm/Transforms/Utils/LoopSimplify.h"
 #include "llvm/Transforms/Utils/UnrollLoop.h"
 
 #include <algorithm>
-#include <cassert>
-#include <mutex>
-#include <vector>
+#include <optional>
 
 #define DEBUG_TYPE "spork-unroll"
 
@@ -32,785 +30,521 @@ using namespace llvm;
 
 namespace {
 
-// Determines if all indices of GEP are zero (i.e. no actual displacement).
-static bool GEPAllZero(GetElementPtrInst *GEP) {
-  for (Use &Idx : GEP->indices()) {
-    ConstantInt *CI = dyn_cast<ConstantInt>(Idx);
-    if (CI == nullptr || !CI->isZero())
-      return false;
-  }
-  return true;
+static constexpr StringLiteral SporkUnrollLoopName("__spork_unroll_loop");
+static constexpr StringLiteral
+    SporkGetUnrollFactorName("__spork_get_unroll_factor");
+static constexpr StringLiteral SporkProgressMetadata("spork.progress");
+
+// Both compile-time-only calls use an exact C ABI contract. The pointer is a
+// stable loop-site identity, allowing the marker and factor expression to be
+// matched even when they end up in different outlined functions.
+static bool isValidSporkLoopMarker(CallInst *Call) {
+  if (!Call || Call->arg_size() != 1 || !Call->getType()->isVoidTy() ||
+      !Call->getArgOperand(0)->getType()->isPointerTy())
+    return false;
+
+  Value *Called = Call->getCalledOperand()->stripPointerCasts();
+  auto *Callee = dyn_cast<Function>(Called);
+  return Callee && Callee->getName() == SporkUnrollLoopName &&
+         Callee->isDeclaration();
 }
 
-// Strip pointer casts / GEPs with zero offset to find the underlying instruction.
-// Returns nullptr if we cannot prove the value originates from an I.
-template <typename I>
-static I *resolveTo(Value *V) {
-  if (!V)
+static bool isValidSporkFactorCall(CallInst *Call) {
+  if (!Call || Call->arg_size() != 1 || !Call->getType()->isIntegerTy() ||
+      !Call->getArgOperand(0)->getType()->isPointerTy())
+    return false;
+
+  Value *Called = Call->getCalledOperand()->stripPointerCasts();
+  auto *Callee = dyn_cast<Function>(Called);
+  return Callee && Callee->getName() == SporkGetUnrollFactorName &&
+         Callee->isDeclaration();
+}
+
+static GlobalValue *getSiteToken(CallInst *Call) {
+  if (!Call)
     return nullptr;
-  if (I *i = dyn_cast<I>(V)) {
-    return i;
-  } else if (BitCastInst *BC = dyn_cast<BitCastInst>(V)) {
-    return resolveTo<I>(BC->getOperand(0));
-  } else if (AddrSpaceCastInst *AC = dyn_cast<AddrSpaceCastInst>(V)) {
-    return resolveTo<I>(AC->getOperand(0));
-  } else if (CastInst *CI = dyn_cast<CastInst>(V)) {
-    return resolveTo<I>(CI->getOperand(0));
-  } else if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(V)) {
-    if (GEPAllZero(GEP))
-      return resolveTo<I>(GEP->getPointerOperand());
-  } else if (LoadInst *LI = dyn_cast<LoadInst>(V)) {
-    return resolveTo<I>(LI->getPointerOperand());
+  return dyn_cast<GlobalValue>(Call->getArgOperand(0)->stripPointerCasts());
+}
+
+static Value *stripIntegerCasts(Value *V) {
+  while (auto *Cast = dyn_cast<CastInst>(V)) {
+    if (!Cast->getSrcTy()->isIntegerTy() || !Cast->getDestTy()->isIntegerTy())
+      break;
+    V = Cast->getOperand(0);
+  }
+  return V;
+}
+
+static AllocaInst *resolveAlloca(Value *V) {
+  SmallPtrSet<Value *, 8> Visited;
+  while (V && Visited.insert(V).second) {
+    V = V->stripPointerCasts();
+    if (auto *AI = dyn_cast<AllocaInst>(V))
+      return AI;
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(V)) {
+      if (!GEP->hasAllZeroIndices())
+        return nullptr;
+      V = GEP->getPointerOperand();
+      continue;
+    }
+    if (auto *LI = dyn_cast<LoadInst>(V)) {
+      V = LI->getPointerOperand();
+      continue;
+    }
+    return nullptr;
   }
   return nullptr;
 }
 
-static bool callIsSporkUnrollFactor(CallInst *Call) {
-  if (!Call)
-    return false;
-  Function *Callee = Call->getCalledFunction();
-  if (!Callee) {
-    Callee = dyn_cast<Function>(Call->getCalledOperand()->stripPointerCasts());
+// A marker denotes exactly the loop reached through its canonical preheader.
+// General dominance is intentionally insufficient because it also captures
+// nested loops and unrelated later loops.
+static Loop *findMarkedLoop(CallInst *Call, LoopInfo &LI) {
+  BasicBlock *MarkerBlock = Call->getParent();
+  Loop *Found = nullptr;
+
+  auto Consider = [&](BasicBlock *Preheader, BasicBlock *Header) {
+    Loop *L = LI.getLoopFor(Header);
+    if (!L || L->getHeader() != Header || L->getLoopPreheader() != Preheader)
+      return true;
+    if (Found && Found != L)
+      return false;
+    Found = L;
+    return true;
+  };
+
+  for (BasicBlock *Successor : successors(MarkerBlock)) {
+    if (!Consider(MarkerBlock, Successor))
+      return nullptr;
+
+    // If the successor was already the loop header, do not mistake an
+    // unconditional header for a bridge block.
+    if (Found && Found->getHeader() == Successor)
+      continue;
+
+    // LoopSimplify may split the marker-to-header edge when the source loop has
+    // a zero-trip guard. Accept exactly that one canonical preheader hop.
+    if (auto *Bridge = dyn_cast<BranchInst>(Successor->getTerminator());
+        Bridge && Bridge->isUnconditional() &&
+        !Consider(Successor, Bridge->getSuccessor(0)))
+      return nullptr;
   }
-  return Callee && Callee->getName().contains("__spork_unroll_factor");
+  return Found;
 }
 
-static bool isLoopStrictlyDominatedBy(Loop *L, CallInst *Call,
-                                      DominatorTree &DT) {
-  if (!Call || !L)
-    return false;
-  if (!DT.isReachableFromEntry(Call->getParent()))
-    return false;
-  if (L->contains(Call))
-    return false;
-  return DT.dominates(Call, L->getHeader());
-}
+struct ProgressStore {
+  StoreInst *Store = nullptr;
+  AllocaInst *Slot = nullptr;
+};
 
-static unsigned determineStandardUnrollCount(Loop *L,
-                                             const TargetTransformInfo &TTI,
-                                             ScalarEvolution &SE) {
-  if (!L)
-    return 1;
-
-  MDNode *LoopID = L->getLoopID();
-  if (LoopID) {
-    for (unsigned i = 1, e = LoopID->getNumOperands(); i < e; ++i) {
-      if (MDNode *MD = dyn_cast<MDNode>(LoopID->getOperand(i))) {
-        if (MD->getNumOperands() > 0) {
-          if (MDString *S = dyn_cast<MDString>(MD->getOperand(0))) {
-            if (S->getString() == "llvm.loop.unroll.disable")
-              return 1;
-            if (S->getString() == "llvm.loop.unroll.count") {
-              if (MD->getNumOperands() >= 2) {
-                if (auto *CI =
-                        mdconst::dyn_extract<ConstantInt>(MD->getOperand(1))) {
-                  return CI->getZExtValue();
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  OptimizationRemarkEmitter ORE(L->getHeader()->getParent());
-  TargetTransformInfo::UnrollingPreferences UP = llvm::gatherUnrollingPreferences(
-      L, SE, TTI, /*BFI=*/nullptr, /*PSI=*/nullptr, ORE, /*OptLevel=*/3,
-      /*UserThreshold=*/std::nullopt, /*UserCount=*/std::nullopt,
-      /*UserAllowPartial=*/true, /*UserRuntime=*/true,
-      /*UserUpperBound=*/std::nullopt, /*UserFullUnrollMaxCount=*/std::nullopt);
-
-  unsigned MaxThreshold = UP.PartialThreshold;
-  if (MaxThreshold == 0)
-    MaxThreshold = 150;
-
-  unsigned DefaultCount = UP.DefaultUnrollRuntimeCount;
-  if (DefaultCount == 0)
-    DefaultCount = 8;
-  if (UP.MaxCount > 0 && DefaultCount > UP.MaxCount)
-    DefaultCount = UP.MaxCount;
-
-  // Estimate loop size using instruction costs from TTI
-  unsigned LoopSize = 0;
-  for (BasicBlock *BB : L->getBlocks()) {
-    for (Instruction &I : *BB) {
-      if (!isa<DbgInfoIntrinsic>(&I) && !I.isTerminator()) {
-        auto Cost =
-            TTI.getInstructionCost(&I, TargetTransformInfo::TCK_CodeSize);
-        if (Cost.isValid())
-          LoopSize += Cost.getValue();
-        else
-          LoopSize += 1;
-      }
-    }
-  }
-
-  if (LoopSize == 0)
-    LoopSize = 1;
-
-  unsigned Count = DefaultCount;
-  while (Count > 1 && (LoopSize * Count > MaxThreshold)) {
-    Count >>= 1;
-  }
-
-  return Count;
-}
-
-static void enableLoopUnrolling(Loop *L, unsigned Count) {
-  if (!L || Count <= 1)
-    return;
-  BasicBlock *Header = L->getHeader();
-  if (!Header)
-    return;
-  LLVMContext &Ctx = Header->getContext();
-  MDNode *LoopID = L->getLoopID();
-  SmallVector<Metadata *, 4> MDs;
-  MDs.push_back(nullptr); // placeholder for self-reference
-
-  if (LoopID) {
-    for (unsigned i = 1, e = LoopID->getNumOperands(); i < e; ++i) {
-      if (MDNode *MD = dyn_cast<MDNode>(LoopID->getOperand(i))) {
-        if (MD->getNumOperands() > 0) {
-          if (MDString *S = dyn_cast<MDString>(MD->getOperand(0))) {
-            if (S->getString() == "llvm.loop.unroll.disable" ||
-                S->getString() == "llvm.loop.unroll.runtime.disable" ||
-                S->getString() == "llvm.loop.unroll.count")
-              continue;
-          }
-        }
-        MDs.push_back(MD);
-      }
-    }
-  }
-
-  Metadata *CountArgs[] = {
-      MDString::get(Ctx, "llvm.loop.unroll.count"),
-      ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(Ctx), Count))};
-  MDs.push_back(MDNode::get(Ctx, CountArgs));
-
-  Metadata *EnableArgs[] = {MDString::get(Ctx, "llvm.loop.unroll.enable")};
-  MDs.push_back(MDNode::get(Ctx, EnableArgs));
-
-  MDNode *NewLoopID = MDNode::get(Ctx, MDs);
-  NewLoopID->replaceOperandWith(0, NewLoopID);
-  L->setLoopID(NewLoopID);
-}
-
-static uint64_t getLoopStep(Loop *L, ScalarEvolution &SE) {
-  if (!L)
-    return 0;
-  BasicBlock *Header = L->getHeader();
-  if (!Header)
-    return 0;
-
-  if (PHINode *IndVar = L->getInductionVariable(SE)) {
-    if (const auto *AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(IndVar))) {
-      if (const auto *Step =
-              dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE))) {
-        int64_t StepVal = Step->getValue()->getSExtValue();
-        return std::abs(StepVal);
-      }
-    }
-  }
-
-  for (PHINode &PN : Header->phis()) {
-    if (const auto *AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(&PN))) {
-      if (AR->getLoop() == L) {
-        if (const auto *Step =
-                dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE))) {
-          int64_t StepVal = Step->getValue()->getSExtValue();
-          return std::abs(StepVal);
-        }
-      }
-    }
-  }
-
-  return 0;
-}
-
-static void collectLoads(Value *V, SmallVectorImpl<LoadInst *> &Loads,
-                         SmallPtrSetImpl<Value *> &Visited) {
+static void collectDependentLoads(Value *V, SmallPtrSetImpl<Value *> &Visited,
+                                  SmallVectorImpl<LoadInst *> &Loads) {
   if (!V || !Visited.insert(V).second)
     return;
-
-  for (User *U : V->users()) {
-    if (auto *LI = dyn_cast<LoadInst>(U)) {
-      Loads.push_back(LI);
-    } else if (auto *BC = dyn_cast<BitCastInst>(U)) {
-      collectLoads(BC, Loads, Visited);
-    } else if (auto *AC = dyn_cast<AddrSpaceCastInst>(U)) {
-      collectLoads(AC, Loads, Visited);
-    } else if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
-      if (GEPAllZero(GEP))
-        collectLoads(GEP, Loads, Visited);
-    } else if (auto *SI = dyn_cast<StoreInst>(U)) {
-      // If the variable pointer V is stored into another slot (e.g. a closure struct),
-      // follow loads from that slot to find further loads of V.
-      if (SI->getValueOperand() == V) {
-        Value *PtrSlot = SI->getPointerOperand();
-        for (User *SlotUser : PtrSlot->users()) {
-          if (auto *SlotLoad = dyn_cast<LoadInst>(SlotUser)) {
-            collectLoads(SlotLoad, Loads, Visited);
-          }
-        }
-      }
-    }
+  if (auto *LI = dyn_cast<LoadInst>(V)) {
+    Loads.push_back(LI);
+    return;
   }
+  if (auto *I = dyn_cast<Instruction>(V))
+    for (Value *Operand : I->operands())
+      collectDependentLoads(Operand, Visited, Loads);
 }
 
-static bool replaceUnrollFactorUses(CallInst *Call, Value *UnrollFactorArg,
-                                    uint64_t UnrollFactor, LLVMContext &Ctx) {
-  bool Changed = false;
-  if (!UnrollFactorArg && !Call)
-    return Changed;
+// The only supported progress update is one unconditional volatile store in a
+// unique latch, storing the latch value of LLVM's recognized induction PHI.
+static std::optional<ProgressStore> findProgressStore(Loop *L,
+                                                      ScalarEvolution &SE,
+                                                      CallInst *Marker,
+                                                      DominatorTree &DT) {
+  BasicBlock *Latch = L->getLoopLatch();
+  PHINode *Induction = L->getInductionVariable(SE);
+  if (!Latch || !Induction)
+    return std::nullopt;
 
-  Type *IntTy = nullptr;
-  if (UnrollFactorArg && UnrollFactorArg->getType()->isIntegerTy())
-    IntTy = UnrollFactorArg->getType();
-  else if (Call && Call->getType()->isIntegerTy())
-    IntTy = Call->getType();
-  else
-    IntTy = Type::getInt32Ty(Ctx);
+  Value *NextInduction = Induction->getIncomingValueForBlock(Latch);
+  if (!NextInduction)
+    return std::nullopt;
 
-  ConstantInt *ConstFactor =
-      ConstantInt::get(cast<IntegerType>(IntTy), UnrollFactor);
+  StoreInst *Candidate = nullptr;
+  for (Instruction &I : *Latch) {
+    auto *SI = dyn_cast<StoreInst>(&I);
+    if (!SI || !SI->isVolatile())
+      continue;
+    if (Candidate)
+      return std::nullopt;
+    Candidate = SI;
+  }
+  if (!Candidate || stripIntegerCasts(Candidate->getValueOperand()) !=
+                        stripIntegerCasts(NextInduction))
+    return std::nullopt;
 
-  // 1. Resolve to AllocaInst if any
-  AllocaInst *AI = nullptr;
-  if (UnrollFactorArg) {
-    AI = resolveTo<AllocaInst>(UnrollFactorArg);
-    if (!AI)
-      AI = dyn_cast<AllocaInst>(UnrollFactorArg->stripPointerCasts());
-    if (!AI) {
-      if (auto *LI = dyn_cast<LoadInst>(UnrollFactorArg)) {
-        AI = resolveTo<AllocaInst>(LI->getPointerOperand());
-        if (!AI)
-          AI = dyn_cast<AllocaInst>(
-              LI->getPointerOperand()->stripPointerCasts());
-      }
-    }
+  auto *LatchBranch = dyn_cast<BranchInst>(Latch->getTerminator());
+  if (!LatchBranch || !LatchBranch->isConditional())
+    return std::nullopt;
+  SmallPtrSet<Value *, 16> Visited;
+  SmallVector<LoadInst *, 2> ExitLoads;
+  collectDependentLoads(LatchBranch->getCondition(), Visited, ExitLoads);
+  llvm::erase_if(ExitLoads, [](LoadInst *LI) { return !LI->isVolatile(); });
+  if (ExitLoads.size() != 1 || !ExitLoads.front()->getType()->isIntegerTy())
+    return std::nullopt;
+
+  AllocaInst *ProgressSlot = resolveAlloca(Candidate->getPointerOperand());
+  if (!ProgressSlot)
+    return std::nullopt;
+
+  // Normal code in the loop must not observe intermediate progress values.
+  // The asynchronous promotion callback is the intended external observer.
+  for (User *U : ProgressSlot->users()) {
+    auto *LI = dyn_cast<LoadInst>(U);
+    if (!LI)
+      continue;
+    // Eager promotion may read progress before entering the marked body. A
+    // normal read in the loop or after it would make coalescing observable.
+    if (L->contains(LI) || !DT.dominates(LI, Marker))
+      return std::nullopt;
   }
 
-  if (AI) {
-    // Store the constant factor into the alloca variable at the alloca site
-    // so that any closures, eager promotion (which runs before the loop!),
-    // and signal handlers see the initialized unroll factor from the beginning.
-    BasicBlock::iterator InsertPt = AI->getNextNode()
-                                        ? AI->getNextNode()->getIterator()
-                                        : AI->getParent()->end();
-    auto *SI = new StoreInst(ConstFactor, AI, InsertPt);
-    SI->setVolatile(true);
-    Changed = true;
-  } else if (UnrollFactorArg && UnrollFactorArg->getType()->isPointerTy() &&
-             Call && Call->getParent()) {
-    auto *SI = new StoreInst(ConstFactor, UnrollFactorArg, Call->getIterator());
-    SI->setVolatile(true);
-    Changed = true;
+  AllocaInst *BoundSlot = resolveAlloca(ExitLoads.front()->getPointerOperand());
+  if (!BoundSlot || BoundSlot == ProgressSlot)
+    return std::nullopt;
+
+  return ProgressStore{Candidate, ProgressSlot};
+}
+
+struct UnrollDecision {
+  unsigned Count = 0;
+  TargetTransformInfo::UnrollingPreferences Preferences;
+};
+
+// Calls and nested loops can introduce work whose amount is not bounded by the
+// marked loop's induction variable.  Spork publishes its factor to runtime
+// code, so do not speculate about either: leave the loop intact and publish
+// the factor-one fallback instead.
+static bool hasPotentiallyUnboundedWork(const Loop *L) {
+  if (!L->getSubLoops().empty())
+    return true;
+
+  for (const BasicBlock *BB : L->blocks())
+    for (const Instruction &I : *BB)
+      if (isa<CallBase>(I))
+        return true;
+
+  return false;
+}
+
+// Mirror the public, target-aware decision setup used by LoopUnrollPass, then
+// delegate the actual count choice to LLVM's computeUnrollCount().
+static std::optional<UnrollDecision>
+computeNativeUnrollDecision(Loop *L, LoopInfo &LI, ScalarEvolution &SE,
+                            DominatorTree &DT, AssumptionCache &AC,
+                            const TargetTransformInfo &TTI,
+                            OptimizationRemarkEmitter &ORE) {
+  if (!L->isLoopSimplifyForm() || !L->isLCSSAForm(DT))
+    return std::nullopt;
+
+  TargetTransformInfo::UnrollingPreferences UP = gatherUnrollingPreferences(
+      L, SE, TTI, /*BFI=*/nullptr, /*PSI=*/nullptr, ORE, /*OptLevel=*/3,
+      /*UserThreshold=*/std::nullopt,
+      /*UserCount=*/std::nullopt,
+      /*UserAllowPartial=*/true,
+      /*UserRuntime=*/true,
+      /*UserUpperBound=*/std::nullopt,
+      /*UserFullUnrollMaxCount=*/std::nullopt);
+  TargetTransformInfo::PeelingPreferences PP =
+      gatherPeelingPreferences(L, SE, TTI, /*UserAllowPeeling=*/false,
+                               /*UserAllowProfileBasedPeeling=*/false,
+                               /*UnrollingSpecficValues=*/true);
+
+  if (UP.Threshold == 0 && (!UP.Partial || UP.PartialThreshold == 0))
+    return std::nullopt;
+
+  SmallPtrSet<const Value *, 32> EphValues;
+  CodeMetrics::collectEphemeralValues(L, &AC, EphValues);
+  UnrollCostEstimator UCE(L, TTI, EphValues, UP.BEInsns);
+  if (!UCE.canUnroll() || UCE.NumInlineCandidates != 0)
+    return std::nullopt;
+
+  unsigned TripCount = 0;
+  unsigned TripMultiple = 1;
+  SmallVector<BasicBlock *, 8> ExitingBlocks;
+  L->getExitingBlocks(ExitingBlocks);
+  for (BasicBlock *Exiting : ExitingBlocks) {
+    unsigned TC = SE.getSmallConstantTripCount(L, Exiting);
+    if (TC && (!TripCount || TC < TripCount))
+      TripCount = TripMultiple = TC;
   }
 
-  if (AI) {
-    SmallVector<LoadInst *, 8> Loads;
-    SmallPtrSet<Value *, 8> Visited;
-    collectLoads(AI, Loads, Visited);
-    for (LoadInst *LI : Loads) {
-      if (!LI->getParent())
+  if (!TripCount) {
+    BasicBlock *Exiting = L->getLoopLatch();
+    if (!Exiting || !L->isLoopExiting(Exiting))
+      Exiting = L->getExitingBlock();
+    if (Exiting)
+      TripMultiple = SE.getSmallConstantTripMultiple(L, Exiting);
+  }
+
+  UP.AllowRemainder &= UCE.ConvergenceAllowsRuntime;
+  unsigned MaxTripCount = 0;
+  bool MaxOrZero = false;
+  if (!TripCount) {
+    MaxTripCount = SE.getSmallConstantMaxTripCount(L);
+    MaxOrZero = SE.isBackedgeTakenCountMaxOrZero(L);
+  }
+
+  bool UseUpperBound = false;
+  (void)computeUnrollCount(L, TTI, DT, &LI, &AC, SE, EphValues, &ORE, TripCount,
+                           MaxTripCount, MaxOrZero, TripMultiple, UCE, UP, PP,
+                           UseUpperBound);
+  unsigned Count = UP.Count;
+  if (PP.PeelCount || Count < 2)
+    return std::nullopt;
+
+  // UnrollLoop performs this same clamp internally. Do it here as well so the
+  // factor published to parfor is the effective count, not merely the request.
+  if (MaxTripCount && Count > MaxTripCount)
+    Count = MaxTripCount;
+  if (Count < 2)
+    return std::nullopt;
+
+  UP.Runtime &= UCE.ConvergenceAllowsRuntime;
+  UP.Runtime &= TripCount == 0 && TripMultiple % Count != 0;
+  return UnrollDecision{Count, UP};
+}
+
+static bool comesBeforeInUnrolledChain(StoreInst *A, StoreInst *B,
+                                       DominatorTree &DT) {
+  if (A->getParent() == B->getParent())
+    return A->comesBefore(B);
+  return DT.dominates(A, B);
+}
+
+// Coalesce only when the utility produced exactly Count sequential clones in
+// the main unrolled body. Otherwise restore every store and keep factor 1.
+static bool coalesceProgressStores(Function &F, Loop *MainLoop,
+                                   Loop *RemainderLoop, MDNode *Tag,
+                                   unsigned Count, DominatorTree &DT) {
+  SmallVector<StoreInst *, 8> Tagged;
+  SmallVector<StoreInst *, 8> MainStores;
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      auto *SI = dyn_cast<StoreInst>(&I);
+      if (!SI || SI->getMetadata(SporkProgressMetadata) != Tag)
         continue;
-      Type *Ty = LI->getType();
-      ConstantInt *CI =
-          Ty->isIntegerTy()
-              ? ConstantInt::get(cast<IntegerType>(Ty), UnrollFactor)
-              : ConstFactor;
-      LI->replaceAllUsesWith(CI);
-      LI->eraseFromParent();
-      Changed = true;
-    }
-  }
-
-  // 2. If UnrollFactorArg itself is an integer instruction/value
-  if (UnrollFactorArg) {
-    if (auto *I = dyn_cast<Instruction>(UnrollFactorArg)) {
-      if (I->getParent() != nullptr && I->getType()->isIntegerTy()) {
-        I->replaceAllUsesWith(ConstantInt::get(
-            cast<IntegerType>(I->getType()), UnrollFactor));
-        Changed = true;
-        if (isa<LoadInst>(I))
-          I->eraseFromParent();
+      Tagged.push_back(SI);
+      if (!RemainderLoop || !RemainderLoop->contains(SI)) {
+        if (!MainLoop || MainLoop->contains(SI))
+          MainStores.push_back(SI);
       }
-    } else if (UnrollFactorArg->getType()->isIntegerTy() &&
-               !isa<Constant>(UnrollFactorArg)) {
-      UnrollFactorArg->replaceAllUsesWith(ConstFactor);
-      Changed = true;
     }
   }
 
-  // 3. If Call returned a value and was used
-  if (Call && Call->getType()->isIntegerTy() && !Call->use_empty()) {
-    Call->replaceAllUsesWith(
-        ConstantInt::get(cast<IntegerType>(Call->getType()), UnrollFactor));
+  auto RestoreAll = [&]() {
+    for (StoreInst *SI : Tagged) {
+      SI->setVolatile(true);
+      SI->setMetadata(SporkProgressMetadata, nullptr);
+    }
+  };
+
+  if (MainStores.size() != Count) {
+    RestoreAll();
+    return false;
+  }
+
+  llvm::sort(MainStores, [&](StoreInst *A, StoreInst *B) {
+    return comesBeforeInUnrolledChain(A, B, DT);
+  });
+  for (size_t I = 0; I + 1 < MainStores.size(); ++I) {
+    if (!comesBeforeInUnrolledChain(MainStores[I], MainStores[I + 1], DT)) {
+      RestoreAll();
+      return false;
+    }
+  }
+
+  StoreInst *Final = MainStores.back();
+  for (StoreInst *SI : Tagged) {
+    SI->setMetadata(SporkProgressMetadata, nullptr);
+    SI->setVolatile(true);
+  }
+  for (StoreInst *SI : MainStores)
+    if (SI != Final)
+      SI->eraseFromParent();
+  return true;
+}
+
+static bool
+transformMarkedLoops(Function &F, FunctionAnalysisManager &FAM,
+                     DenseMap<GlobalValue *, unsigned> &SiteFactors,
+                     const DenseMap<GlobalValue *, unsigned> &MarkerCounts,
+                     unsigned &SiteNumber) {
+  SmallVector<CallInst *, 4> Markers;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (auto *Call = dyn_cast<CallInst>(&I); isValidSporkLoopMarker(Call))
+        Markers.push_back(Call);
+
+  if (Markers.empty())
+    return false;
+
+  auto &LI = FAM.getResult<LoopAnalysis>(F);
+  auto &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
+  auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+  auto &AC = FAM.getResult<AssumptionAnalysis>(F);
+  auto &TTI = FAM.getResult<TargetIRAnalysis>(F);
+  OptimizationRemarkEmitter ORE(&F);
+  LLVMContext &Ctx = F.getContext();
+  bool Changed = false;
+
+  for (CallInst *Call : Markers) {
+    GlobalValue *Token = getSiteToken(Call);
+    Loop *L = findMarkedLoop(Call, LI);
+    std::optional<ProgressStore> Progress =
+        L ? findProgressStore(L, SE, Call, DT) : std::nullopt;
+
+    std::optional<UnrollDecision> Decision;
+    if (Token && MarkerCounts.lookup(Token) == 1 && L && Progress &&
+        !hasPotentiallyUnboundedWork(L))
+      Decision = computeNativeUnrollDecision(L, LI, SE, DT, AC, TTI, ORE);
+
+    unsigned Factor = 1;
+
+    if (Decision) {
+      MDNode *Tag =
+          MDNode::getDistinct(Ctx, ConstantAsMetadata::get(ConstantInt::get(
+                                       Type::getInt32Ty(Ctx), SiteNumber++)));
+      Progress->Store->setMetadata(SporkProgressMetadata, Tag);
+
+      UnrollLoopOptions ULO;
+      ULO.Count = Decision->Count;
+      ULO.Force = true;
+      // loop_end is asynchronously shortened by the promotion callback.
+      // Runtime remainder generation would derive a fixed trip count and
+      // could stop observing that volatile bound. Generic cloning retains a
+      // bound check in every unrolled iteration.
+      ULO.Runtime = false;
+      ULO.AllowExpensiveTripCount =
+          Decision->Preferences.AllowExpensiveTripCount;
+      ULO.UnrollRemainder = Decision->Preferences.UnrollRemainder;
+      ULO.ForgetAllSCEV = false;
+      ULO.SCEVExpansionBudget = Decision->Preferences.SCEVExpansionBudget;
+      ULO.RuntimeUnrollMultiExit = Decision->Preferences.RuntimeUnrollMultiExit;
+      ULO.AddAdditionalAccumulators =
+          Decision->Preferences.AddAdditionalAccumulators;
+
+      Loop *RemainderLoop = nullptr;
+      LoopUnrollResult Result =
+          UnrollLoop(L, ULO, &LI, &SE, &DT, &AC, &TTI, &ORE,
+                     /*PreserveLCSSA=*/true, &RemainderLoop);
+      if (Result == LoopUnrollResult::Unmodified) {
+        Progress->Store->setVolatile(true);
+        Progress->Store->setMetadata(SporkProgressMetadata, nullptr);
+      } else {
+        Loop *MainLoop =
+            Result == LoopUnrollResult::PartiallyUnrolled ? L : nullptr;
+        if (coalesceProgressStores(F, MainLoop, RemainderLoop, Tag,
+                                   Decision->Count, DT))
+          Factor = Decision->Count;
+        Changed = true;
+      }
+    }
+
+    if (Token) {
+      auto Inserted = SiteFactors.insert({Token, Factor});
+      // A token is supposed to identify one static loop. If malformed IR
+      // reuses it for sites with different decisions, publish the safe
+      // single-iteration value for every matching factor expression.
+      if (!Inserted.second && Inserted.first->second != Factor)
+        Inserted.first->second = 1;
+    }
+
+    // The marker is compile-time-only. A recognized but unsupported site is
+    // a safe no-op whose matching factor expression becomes 1.
+    Call->eraseFromParent();
     Changed = true;
   }
 
   return Changed;
 }
 
-struct TrackedLoop {
-  BasicBlock *Header = nullptr;
-  uint64_t OrigStep = 0;
-  uint64_t OrigTripCount = 0;
-  std::vector<WeakVH> CachedLatchOps;
-};
+static bool
+replaceFactorCalls(Module &M,
+                   const DenseMap<GlobalValue *, unsigned> &SiteFactors) {
+  SmallVector<CallInst *, 8> Calls;
+  for (Function &F : M)
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (auto *Call = dyn_cast<CallInst>(&I); isValidSporkFactorCall(Call))
+          Calls.push_back(Call);
 
-struct TrackedCall {
-  CallInst *Call = nullptr;
-  WeakVH UnrollFactorArg;
-  std::vector<TrackedLoop> Loops;
-};
+  for (CallInst *Call : Calls) {
+    unsigned Factor = 1;
+    if (GlobalValue *Token = getSiteToken(Call)) {
+      auto It = SiteFactors.find(Token);
+      if (It != SiteFactors.end())
+        Factor = It->second;
+    }
+    Call->replaceAllUsesWith(
+        ConstantInt::get(cast<IntegerType>(Call->getType()), Factor));
+    Call->eraseFromParent();
+  }
+  return !Calls.empty();
+}
 
-static std::mutex StateMutex;
-static DenseMap<Function *, std::vector<TrackedCall>> ActiveSporkCalls;
-
-// -----------------------------------------------------------------------------
-// Pre-Unroll Pass
-// -----------------------------------------------------------------------------
-struct SporkPreUnrollPass : public PassInfoMixin<SporkPreUnrollPass> {
-  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
-    LLVMContext &Ctx = F.getContext();
+struct SporkUnrollPass : PassInfoMixin<SporkUnrollPass> {
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
+    FunctionAnalysisManager &FAM =
+        MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
+    DenseMap<GlobalValue *, unsigned> SiteFactors;
+    DenseMap<GlobalValue *, unsigned> MarkerCounts;
+    unsigned SiteNumber = 0;
     bool Changed = false;
 
-    // Collect all calls to __spork_unroll_factor
-    SmallVector<CallInst *, 4> SporkCalls;
-    for (auto &BB : F) {
-      for (auto &I : BB) {
-        if (auto *Call = dyn_cast<CallInst>(&I)) {
-          if (callIsSporkUnrollFactor(Call)) {
-            SporkCalls.push_back(Call);
-          }
-        }
-      }
-    }
+    // A token must identify exactly one static marker. Count first so a reused
+    // token is rejected before any loop using it can be transformed.
+    for (Function &F : M)
+      for (BasicBlock &BB : F)
+        for (Instruction &I : BB)
+          if (auto *Call = dyn_cast<CallInst>(&I); isValidSporkLoopMarker(Call))
+            if (GlobalValue *Token = getSiteToken(Call))
+              ++MarkerCounts[Token];
 
-    if (SporkCalls.empty())
-      return PreservedAnalyses::all();
+    for (Function &F : M)
+      if (!F.isDeclaration())
+        Changed |=
+            transformMarkedLoops(F, FAM, SiteFactors, MarkerCounts, SiteNumber);
 
-    auto &LI = FAM.getResult<LoopAnalysis>(F);
-    auto &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
-    auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
-    auto &TTI = FAM.getResult<TargetIRAnalysis>(F);
-
-    // (1) Immediately before LoopUnrollPass, identify all loops that are strictly
-    // dominated by a call to the external function __spork_unroll_factor(unroll_factor)
-    DenseMap<CallInst *, SmallVector<Loop *, 4>> CallToLoops;
-    for (Loop *L : LI.getLoopsInPreorder()) {
-      CallInst *NearestCall = nullptr;
-      for (CallInst *Call : SporkCalls) {
-        if (isLoopStrictlyDominatedBy(L, Call, DT)) {
-          if (!NearestCall || DT.dominates(NearestCall, Call)) {
-            NearestCall = Call;
-          }
-        }
-      }
-      if (NearestCall) {
-        CallToLoops[NearestCall].push_back(L);
-      }
-    }
-
-    std::vector<TrackedCall> TrackedCalls;
-
-    for (CallInst *Call : SporkCalls) {
-      TrackedCall TC;
-      TC.Call = Call;
-      if (Call->arg_size() >= 1)
-        TC.UnrollFactorArg = Call->getArgOperand(0);
-
-      auto It = CallToLoops.find(Call);
-      if (It == CallToLoops.end() || It->second.empty()) {
-        TrackedCalls.push_back(std::move(TC));
-        continue;
-      }
-
-      SmallVector<Metadata *, 4> LoopMDList;
-
-      for (Loop *TargetLoop : It->second) {
-        TrackedLoop TL;
-        TL.Header = TargetLoop->getHeader();
-        TL.OrigStep = getLoopStep(TargetLoop, SE);
-        TL.OrigTripCount = SE.getSmallConstantTripCount(TargetLoop);
-
-        unsigned Count = determineStandardUnrollCount(TargetLoop, TTI, SE);
-        if (Count > 1) {
-          enableLoopUnrolling(TargetLoop, Count);
-          Changed = true;
-        }
-
-        // (2) Each such loop should cache a list of volatile loads/stores that occur
-        // in the loop latch, then mark those loads/stores as not volatile.
-        SmallVector<BasicBlock *, 4> Latches;
-        TargetLoop->getLoopLatches(Latches);
-        if (Latches.empty()) {
-          if (BasicBlock *Latch = TargetLoop->getLoopLatch())
-            Latches.push_back(Latch);
-        }
-
-        for (BasicBlock *LatchBB : Latches) {
-          for (Instruction &I : *LatchBB) {
-            if (auto *LI = dyn_cast<LoadInst>(&I)) {
-              if (LI->isVolatile()) {
-                TL.CachedLatchOps.push_back(LI);
-                LI->setVolatile(false);
-                LI->setMetadata("spork.volatile", MDNode::get(Ctx, {}));
-                Changed = true;
-              }
-            } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
-              if (SI->isVolatile()) {
-                TL.CachedLatchOps.push_back(SI);
-                SI->setVolatile(false);
-                SI->setMetadata("spork.volatile", MDNode::get(Ctx, {}));
-                Changed = true;
-              }
-            }
-          }
-        }
-
-        Metadata *MDs[] = {
-          ValueAsMetadata::get(TL.Header),
-          ConstantAsMetadata::get(
-              ConstantInt::get(Type::getInt64Ty(Ctx), TL.OrigStep)),
-          ConstantAsMetadata::get(
-              ConstantInt::get(Type::getInt64Ty(Ctx), TL.OrigTripCount))
-        };
-        LoopMDList.push_back(MDNode::get(Ctx, MDs));
-
-        TC.Loops.push_back(std::move(TL));
-      }
-
-      Call->setMetadata("spork.state", MDNode::get(Ctx, LoopMDList));
-      TrackedCalls.push_back(std::move(TC));
-    }
-
-    {
-      std::lock_guard<std::mutex> Lock(StateMutex);
-      ActiveSporkCalls[&F] = std::move(TrackedCalls);
-    }
-
+    // Replace every recognized placeholder, including unmatched ones. This
+    // guarantees a factor-one fallback and prevents a compile-time-only call
+    // from surviving to the linker.
+    Changed |= replaceFactorCalls(M, SiteFactors);
     return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
   }
 };
 
-// -----------------------------------------------------------------------------
-// Post-Unroll Pass
-// -----------------------------------------------------------------------------
-struct SporkPostUnrollPass : public PassInfoMixin<SporkPostUnrollPass> {
-  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
-    auto &LI = FAM.getResult<LoopAnalysis>(F);
-    auto &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
-    auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
-    LLVMContext &Ctx = F.getContext();
-    bool Changed = false;
+} // namespace
 
-    std::vector<TrackedCall> TrackedCalls;
-    {
-      std::lock_guard<std::mutex> Lock(StateMutex);
-      auto It = ActiveSporkCalls.find(&F);
-      if (It != ActiveSporkCalls.end()) {
-        TrackedCalls = std::move(It->second);
-        ActiveSporkCalls.erase(It);
-      }
-    }
-
-    // Fallback: If not found in ActiveSporkCalls (e.g. separate opt invocations),
-    // reconstruct from Call metadata.
-    if (TrackedCalls.empty()) {
-      for (auto &BB : F) {
-        for (auto &I : BB) {
-          if (auto *Call = dyn_cast<CallInst>(&I)) {
-            if (!callIsSporkUnrollFactor(Call))
-              continue;
-            TrackedCall TC;
-            TC.Call = Call;
-            if (Call->arg_size() >= 1)
-              TC.UnrollFactorArg = Call->getArgOperand(0);
-
-            if (Call->hasMetadata("spork.state")) {
-              MDNode *MD = Call->getMetadata("spork.state");
-              SmallVector<MDNode *, 4> LoopMDs;
-              if (MD->getNumOperands() == 3 &&
-                  isa<ValueAsMetadata>(MD->getOperand(0))) {
-                LoopMDs.push_back(MD);
-              } else {
-                for (const auto &Op : MD->operands()) {
-                  if (auto *LoopMD = dyn_cast<MDNode>(Op.get())) {
-                    LoopMDs.push_back(LoopMD);
-                  }
-                }
-              }
-              for (MDNode *LoopMD : LoopMDs) {
-                if (LoopMD->getNumOperands() >= 3) {
-                  if (auto *HeaderMD =
-                          dyn_cast<ValueAsMetadata>(LoopMD->getOperand(0))) {
-                    if (auto *Header =
-                            dyn_cast<BasicBlock>(HeaderMD->getValue())) {
-                      TrackedLoop TL;
-                      TL.Header = Header;
-                      TL.OrigStep =
-                          cast<ConstantInt>(
-                              cast<ConstantAsMetadata>(LoopMD->getOperand(1))
-                                  ->getValue())
-                              ->getZExtValue();
-                      TL.OrigTripCount =
-                          cast<ConstantInt>(
-                              cast<ConstantAsMetadata>(LoopMD->getOperand(2))
-                                  ->getValue())
-                              ->getZExtValue();
-                      TC.Loops.push_back(std::move(TL));
-                    }
-                  }
-                }
-              }
-            }
-            TrackedCalls.push_back(std::move(TC));
-          }
-        }
-      }
-    }
-
-    if (TrackedCalls.empty())
-      return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
-
-    SmallVector<CallInst *, 4> CallsToRemove;
-
-    for (TrackedCall &TC : TrackedCalls) {
-      CallInst *Call = TC.Call;
-      Value *UnrollFactorArg = TC.UnrollFactorArg;
-
-      uint64_t MaxUnrollFactor = 1;
-      bool AnyLoopUnrolled = false;
-
-      // (3) After the loop unrolling pass, if such a loop was unrolled,
-      // it should determine the unrolling factor of the loop and then replace
-      // all uses of the unroll_factor variable with a constantint value
-      // that is the actual unrolling factor of the loop.
-      for (TrackedLoop &TL : TC.Loops) {
-        uint64_t LoopFactor = 1;
-        Loop *CurrentLoop = LI.getLoopFor(TL.Header);
-        if (CurrentLoop && CurrentLoop->getHeader() == TL.Header) {
-          // Loop still exists (partial unroll or not unrolled)
-          uint64_t NewStep = getLoopStep(CurrentLoop, SE);
-          if (TL.OrigStep > 0 && NewStep > TL.OrigStep) {
-            LoopFactor = NewStep / TL.OrigStep;
-          }
-
-          // Coalesce latch updates: find cloned stores to latch pointer
-          for (WeakVH &VH : TL.CachedLatchOps) {
-            if (Value *V = VH) {
-              if (auto *OrigSI = dyn_cast<StoreInst>(V)) {
-                Value *Ptr = OrigSI->getPointerOperand();
-                SmallVector<StoreInst *, 8> StoresToPtr;
-                for (BasicBlock *BB : CurrentLoop->getBlocks()) {
-                  for (Instruction &I : *BB) {
-                    if (auto *SI = dyn_cast<StoreInst>(&I)) {
-                      if (SI->getPointerOperand() == Ptr &&
-                          (SI == OrigSI || SI->hasMetadata("spork.volatile"))) {
-                        StoresToPtr.push_back(SI);
-                      }
-                    }
-                  }
-                }
-
-                if (StoresToPtr.size() > 1) {
-                  LoopFactor =
-                      std::max(LoopFactor, (uint64_t)StoresToPtr.size());
-
-                  // Sort stores by execution order using DominatorTree
-                  llvm::sort(StoresToPtr, [&](StoreInst *A, StoreInst *B) {
-                    if (A->getParent() == B->getParent())
-                      return A->comesBefore(B);
-                    if (DT.dominates(A->getParent(), B->getParent()))
-                      return true;
-                    if (DT.dominates(B->getParent(), A->getParent()))
-                      return false;
-                    return A->getParent() < B->getParent();
-                  });
-
-                  // Only coalesce if the stores are executed sequentially
-                  bool CanCoalesce = true;
-                  for (size_t i = 0; i + 1 < StoresToPtr.size(); ++i) {
-                    BasicBlock *BBA = StoresToPtr[i]->getParent();
-                    BasicBlock *BBB = StoresToPtr[i + 1]->getParent();
-                    if (BBA != BBB && !DT.dominates(BBA, BBB)) {
-                      CanCoalesce = false;
-                      break;
-                    }
-                  }
-
-                  if (CanCoalesce) {
-                    // Coalesce: keep the final store, mark it volatile, and erase intermediate stores
-                    StoreInst *FinalStore = StoresToPtr.back();
-                    FinalStore->setVolatile(true);
-                    FinalStore->setMetadata("spork.volatile", nullptr);
-
-                    for (size_t i = 0; i + 1 < StoresToPtr.size(); ++i) {
-                      StoresToPtr[i]->eraseFromParent();
-                    }
-                    Changed = true;
-                  }
-                }
-              }
-            }
-          }
-        } else {
-          // Loop is gone! Fully unrolled.
-          LoopFactor = TL.OrigTripCount;
-        }
-
-        if (LoopFactor > 1) {
-          AnyLoopUnrolled = true;
-          MaxUnrollFactor = std::max(MaxUnrollFactor, LoopFactor);
-        }
-      }
-
-      uint64_t FinalFactor =
-          (AnyLoopUnrolled && MaxUnrollFactor > 1) ? MaxUnrollFactor : 1;
-      Changed |=
-          replaceUnrollFactorUses(Call, UnrollFactorArg, FinalFactor, Ctx);
-
-      // (4) Next, it should go back through each loop associated with a
-      // __spork_unroll_factor(unroll_factor) call and for each load/store that was
-      // turned from volatile into not volatile, if it has a parent still, mark it again as volatile.
-      for (TrackedLoop &TL : TC.Loops) {
-        for (WeakVH &VH : TL.CachedLatchOps) {
-          if (Value *V = VH) {
-            if (auto *I = dyn_cast<Instruction>(V)) {
-              if (I->getParent() != nullptr) {
-                if (auto *LI = dyn_cast<LoadInst>(I)) {
-                  LI->setVolatile(true);
-                  Changed = true;
-                } else if (auto *SI = dyn_cast<StoreInst>(I)) {
-                  SI->setVolatile(true);
-                  Changed = true;
-                }
-                I->setMetadata("spork.volatile", nullptr);
-              }
-            }
-          }
-        }
-      }
-
-      if (Call)
-        CallsToRemove.push_back(Call);
-    }
-
-    // Fallback: restore any remaining instructions with spork.volatile metadata
-    for (auto &BB : F) {
-      for (auto &I : BB) {
-        if (I.hasMetadata("spork.volatile")) {
-          if (auto *LI = dyn_cast<LoadInst>(&I)) {
-            LI->setVolatile(true);
-            Changed = true;
-          } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
-            SI->setVolatile(true);
-            Changed = true;
-          }
-          I.setMetadata("spork.volatile", nullptr);
-        }
-      }
-    }
-
-    for (CallInst *Call : CallsToRemove) {
-      if (Call->getParent()) {
-        if (!Call->use_empty() && Call->getType()->isIntegerTy()) {
-          Call->replaceAllUsesWith(
-              ConstantInt::get(cast<IntegerType>(Call->getType()), 1));
-        }
-        Call->eraseFromParent();
-        Changed = true;
-      }
-    }
-
-    // Ensure any remaining calls in this function are removed
-    for (auto &BB : F) {
-      for (auto &I : make_early_inc_range(BB)) {
-        if (auto *Call = dyn_cast<CallInst>(&I)) {
-          if (callIsSporkUnrollFactor(Call)) {
-            if (!Call->use_empty() && Call->getType()->isIntegerTy()) {
-              Call->replaceAllUsesWith(
-                  ConstantInt::get(cast<IntegerType>(Call->getType()), 1));
-            }
-            Call->eraseFromParent();
-            Changed = true;
-          }
-        }
-      }
-    }
-
-    // (5) If __spork_unroll_factor has no remaining uses in the module,
-    // remove its declaration from the program.
-    Module *M = F.getParent();
-    if (M) {
-      SmallVector<Function *, 4> DeclsToRemove;
-      for (Function &Func : *M) {
-        if (Func.isDeclaration() &&
-            Func.getName().contains("__spork_unroll_factor") &&
-            Func.use_empty()) {
-          DeclsToRemove.push_back(&Func);
-        }
-      }
-      for (Function *Func : DeclsToRemove) {
-        Func->eraseFromParent();
-        Changed = true;
-      }
-    }
-
-    return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
-  }
-};
-
-} // end anonymous namespace
-
-// -----------------------------------------------------------------------------
-// Plugin Registration
-// -----------------------------------------------------------------------------
 llvm::PassPluginLibraryInfo getSporkUnrollPluginInfo() {
   return {
       LLVM_PLUGIN_API_VERSION, "SporkUnroll", LLVM_VERSION_STRING,
       [](PassBuilder &PB) {
-        PB.registerScalarOptimizerLateEPCallback(
-            [](FunctionPassManager &FPM, OptimizationLevel Level) {
-              FPM.addPass(SporkPreUnrollPass());
-
-              LoopUnrollOptions opts = LoopUnrollOptions(
-                  Level.getSpeedupLevel(), /*OnlyWhenForced=*/false,
-                  /*ForgetSCEV=*/false);
-              opts.setPartial(true);
-              opts.setRuntime(true);
-              FPM.addPass(LoopUnrollPass(opts));
-
-              FPM.addPass(SporkPostUnrollPass());
+        PB.registerOptimizerLastEPCallback(
+            [](ModulePassManager &MPM, OptimizationLevel, ThinOrFullLTOPhase) {
+              FunctionPassManager FPM;
+              FPM.addPass(LoopSimplifyPass());
+              FPM.addPass(LCSSAPass());
+              MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+              MPM.addPass(SporkUnrollPass());
             });
 
         PB.registerPipelineParsingCallback(
-            [](StringRef Name, FunctionPassManager &FPM,
+            [](StringRef Name, ModulePassManager &MPM,
                ArrayRef<PassBuilder::PipelineElement>) {
-              if (Name == "spork-pre-unroll") {
-                FPM.addPass(SporkPreUnrollPass());
-                return true;
-              }
-              if (Name == "spork-post-unroll") {
-                FPM.addPass(SporkPostUnrollPass());
-                return true;
-              }
-              if (Name == "spork-unroll") {
-                FPM.addPass(SporkPreUnrollPass());
-                LoopUnrollOptions opts = LoopUnrollOptions(
-                    /*OptLevel=*/3, /*OnlyWhenForced=*/false,
-                    /*ForgetSCEV=*/false);
-                opts.setPartial(true);
-                opts.setRuntime(true);
-                FPM.addPass(LoopUnrollPass(opts));
-                FPM.addPass(SporkPostUnrollPass());
-                return true;
-              }
-              return false;
+              if (Name != "spork-unroll")
+                return false;
+              FunctionPassManager FPM;
+              FPM.addPass(LoopSimplifyPass());
+              FPM.addPass(LCSSAPass());
+              MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+              MPM.addPass(SporkUnrollPass());
+              return true;
             });
       }};
 }

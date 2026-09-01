@@ -17,7 +17,8 @@
 #define VOLATILE_UNROLL
 
 #ifdef VOLATILE_UNROLL
-extern "C" void __spork_unroll_factor(volatile unsigned int& unroll_factor);
+extern "C" void __spork_unroll_loop(const void* site);
+extern "C" unsigned int __spork_get_unroll_factor(const void* site);
 #endif
 
 namespace spork {
@@ -95,20 +96,20 @@ namespace { // private
     // main code may only read `loop_end`; signal handler may write
     volatile idx loop_end = j;
     #ifdef VOLATILE_UNROLL
-    volatile unsigned int unroll_factor = 1;
+    static char unroll_site;
     #endif
   
     // ... and applies it to the following loop:
     bool promoted = with_prom_handler(
-      [&, body = fwd(body)] () {
+      [&, body = fwd(body)] () __attribute__((always_inline)) {
         #ifdef VOLATILE_UNROLL
-        __spork_unroll_factor(unroll_factor);
+        __spork_unroll_loop(&unroll_site);
         #endif
         for (; i < loop_end; sig_safe_i = static_cast<sig_atomic_t>(++i)) body(i, a);
       },
       [&] () {
         #ifdef VOLATILE_UNROLL
-        idx prom_i = sig_safe_i + unroll_factor;
+        idx prom_i = sig_safe_i + static_cast<idx>(__spork_get_unroll_factor(&unroll_site));
         #else
         idx prom_i = sig_safe_i + 1;
         #endif

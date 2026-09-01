@@ -423,7 +423,11 @@ inline bool with_prom_handler(const BodyLambda&& body, const PromLambda&& prom) 
   fwd(body)();
   return slot.close();
 }
-}
+} // namespace spork
+
+// namespace parlay {
+//   using WorkStealingJob = spork::WorkStealingJob;
+// }
 
 // Allows loop unrolling (even for volatile loop induction/bound variables),
 // returning the compiler-chosen unroll factor

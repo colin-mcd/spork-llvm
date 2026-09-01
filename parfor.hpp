@@ -105,15 +105,21 @@ namespace { // private
         #ifdef VOLATILE_UNROLL
         __spork_unroll_loop(&unroll_site);
         #endif
-        for (; i < loop_end; sig_safe_i = static_cast<sig_atomic_t>(++i)) body(i, a);
+        for (; i < loop_end; ) {
+          body(i, a);
+          ++i;
+          sig_safe_i = static_cast<sig_atomic_t>(i);
+        }
       },
       [&] () {
         #ifdef VOLATILE_UNROLL
-        idx prom_i = sig_safe_i + static_cast<idx>(__spork_get_unroll_factor(&unroll_site));
+        idx inc_i = __spork_get_unroll_factor(&unroll_site);
         #else
-        idx prom_i = sig_safe_i + 1;
+        idx inc_i = 1;
         #endif
-        if (prom_i >= loop_end) { r.i = 0; r.j = 0; l.i = 0; l.j = 0; return; }
+        idx ssi = static_cast<idx>(sig_safe_i);
+        if (loop_end - ssi <= inc_i) { r.i = 0; r.j = 0; l.i = 0; l.j = 0; return; }
+        idx prom_i = ssi + inc_i;
         idx mid = midpoint<idx>(prom_i, loop_end);
         loop_end = prom_i;
   

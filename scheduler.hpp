@@ -72,7 +72,8 @@ struct WorkStealingJob {
     start_heartbeats();
     run();
     pause_heartbeats();
-    assert(!done.test_and_set(std::memory_order_release));
+    bool was_done = done.test_and_set(std::memory_order_release);
+    assert(!was_done);
   }
 
   [[nodiscard]] bool finished() volatile const noexcept {

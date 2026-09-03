@@ -55,7 +55,7 @@ implementation of either function is needed after a successful plugin run.
 The protocol is used by:
 
 - `parfor.hpp`
-- `spork-parlaylib/include/parlay/internal/spork_parfor.h`
+- `hb-parlaylib/include/parlay/internal/spork_parfor.h`
 
 ## Transformation
 
@@ -195,5 +195,5 @@ transformation.
   and plugin registration.
 - `CMakeLists.txt`: out-of-tree LLVM pass-plugin build.
 - `../parfor.hpp`: standalone Spork `parfor` protocol.
-- `../spork-parlaylib/include/parlay/internal/spork_parfor.h`: Parlay-integrated
+- `../hb-parlaylib/include/parlay/internal/spork_parfor.h`: Parlay-integrated
   protocol used by PBBS.

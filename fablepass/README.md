@@ -44,7 +44,7 @@ marker `__spork_unroll_loop(&site)` immediately before the loop and a
 `__spork_get_unroll_factor(&site)` query in the promotion handler, keyed by a
 function-local `static char site`. Both calls are removed; the declarations
 are dropped once unused. Used by `../parfor.hpp` and
-`../spork-parlaylib/include/parlay/internal/spork_parfor.h`.
+`../hb-parlaylib/include/parlay/internal/spork_parfor.h`.
 
 ## Generated shape (transplant)
 

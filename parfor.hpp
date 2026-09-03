@@ -17,8 +17,8 @@
 #define VOLATILE_UNROLL
 
 #ifdef VOLATILE_UNROLL
-extern "C" void __spork_unroll_loop(const void* site);
-extern "C" unsigned int __spork_get_unroll_factor(const void* site);
+extern "C" void __spork_unroll_loop(const void* site) noexcept;
+extern "C" unsigned int __spork_get_unroll_factor(const void* site) noexcept;
 #endif
 
 namespace spork {

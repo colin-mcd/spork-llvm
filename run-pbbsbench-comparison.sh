@@ -364,9 +364,9 @@ build_one() {
   local benchmark_cflags="${cflags}"
   local build_status
 
-  # suffixArray's shared timing/checker sources explicitly initialize Spork.
-  # Other PBBS executables receive the same one-time startup via this header.
-  if [[ "${library}" == hb-parlaylib && "${benchmark}" != suffixArray/* ]]; then
+  # PBBS executables do not initialize Spork themselves; force-including this
+  # header starts the scheduler and heartbeat timer once, before main().
+  if [[ "${library}" == hb-parlaylib ]]; then
     benchmark_cflags+=" -include ${startup_header}"
   fi
 

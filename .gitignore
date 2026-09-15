@@ -3,3 +3,8 @@ scheduler
 deprecated.*
 fablepass/build/
 fablepass/.cache/
+__pycache__/
+llvm-project/
+report/
+pbbsbench-scaling/
+.cc-setup/

@@ -1,0 +1,12 @@
+[submodule "pbbsbench"]
+	path = pbbsbench
+	url = ./pbbsbench
+[submodule "ehb2-parlaylib"]
+	path = ehb2-parlaylib
+	url = ./ehb2-parlaylib/
+[submodule "hb-parlaylib"]
+	path = hb-parlaylib
+	url = ./hb-parlaylib/
+[submodule "parlaylib"]
+	path = parlaylib
+	url = ./parlaylib/

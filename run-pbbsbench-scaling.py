@@ -3,8 +3,9 @@
 
 Runs every benchmark that pbbsbench/runall marks as parallel (the boolean in
 each test tuple) on the large PBBS inputs, once per library (stock parlaylib,
-hb-parlaylib, and ehb2-parlaylib with steal requests only and no timer
-heartbeats), across a list of core counts.  Each run performs
+hb-parlaylib, ehb2-parlaylib with steal requests only and no timer heartbeats,
+and stock parlaylib on its alternative scheduler backends: parlaylib-openmp,
+parlaylib-tbb and parlaylib-opencilk), across a list of core counts.  Each run performs
 ``warmup + trials`` in-process rounds; the first ``warmup`` rounds are
 discarded and the remaining ``trials`` rounds are averaged.
 
@@ -34,6 +35,7 @@ import signal
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -45,9 +47,71 @@ STARTUP_HEADER = os.path.join(PBBS_DIR, "common", "spork_benchmark_startup.h")
 SMT_CONTROL = "/sys/devices/system/cpu/smt/control"
 SMT_ACTIVE = "/sys/devices/system/cpu/smt/active"
 DEFAULT_CORES = [1, 2, 4, 6, 8, 10, 20, 40, 80]
-LIBRARIES = ["parlaylib", "hb-parlaylib", "ehb2-parlaylib"]
-# Libraries built with the Spork unroll plugin and the heartbeat startup header.
+# Stock parlaylib on its alternative scheduler backends
+# (https://cmuparlay.github.io/parlaylib/installation.html).  Each uses the
+# stock headers, selected with use-parlaylib.sh, plus a backend macro and the
+# matching compiler/linker flags.  A backend is verified at preflight by
+# compiling a probe program; one that cannot be built is skipped when it was
+# selected implicitly (--library all) and is an error when named explicitly.
+#   parlaylib-openmp   LLVM's libomp: installed under /usr/local if present,
+#                      else the build in llvm-project/build-openmp (cmake -S
+#                      llvm-project/runtimes -DLLVM_ENABLE_RUNTIMES=openmp;
+#                      ninja omp), else GCC's libgomp, whose task scheduling
+#                      is far slower
+#   parlaylib-tbb      oneTBB (libtbb-dev)
+#   parlaylib-opencilk the OpenCilk compiler (a separate LLVM): $OPENCILK_CXX,
+#                      --opencilk-cxx, or /opt/opencilk/bin/clang++ (a release
+#                      tarball unpacked under /opt and symlinked); thread count
+#                      from CILK_NWORKERS
+# CilkPlus is not offered: no current compiler supports -fcilkplus.
+OPENCILK_CXX_DEFAULT = os.environ.get("OPENCILK_CXX") or \
+    next((p for p in ["/opt/opencilk/bin/clang++"] if os.path.exists(p)), None)
+LLVM_OMP_DIR = os.path.join(SCRIPT_DIR, "llvm-project", "build-openmp", "openmp", "runtime", "src")
+GCC_OMP_INCLUDE = next(iter(sorted(glob.glob("/usr/lib/gcc/*/*/include/omp.h"))), None)
+if os.path.exists("/usr/local/include/omp.h") and os.path.exists("/usr/local/lib/libomp.so"):
+    # LLVM's libomp installed system-wide (cmake -P build-openmp/cmake_install.cmake).
+    OMP_CFLAGS = "-DPARLAY_OPENMP -fopenmp"
+    OMP_LFLAGS = "-fopenmp"
+elif os.path.exists(os.path.join(LLVM_OMP_DIR, "libomp.so")):
+    OMP_CFLAGS = "-DPARLAY_OPENMP -fopenmp -I " + LLVM_OMP_DIR
+    OMP_LFLAGS = "-fopenmp -L %s -lomp -Wl,-rpath,%s" % (LLVM_OMP_DIR, LLVM_OMP_DIR)
+else:
+    # omp.h comes from the GCC install; -idirafter keeps that directory's
+    # own stddef.h etc. behind libc++'s headers.
+    OMP_CFLAGS = "-DPARLAY_OPENMP -fopenmp=libgomp" + \
+                 (" -idirafter " + os.path.dirname(GCC_OMP_INCLUDE) if GCC_OMP_INCLUDE else "")
+    OMP_LFLAGS = "-fopenmp=libgomp"
+BACKENDS = {
+    "parlaylib-openmp": {
+        "cflags": OMP_CFLAGS,
+        "lflags": OMP_LFLAGS,
+        "threads_env": "OMP_NUM_THREADS",
+    },
+    "parlaylib-tbb": {
+        # oneTBB has no thread-count variable; the header narrows the affinity
+        # mask and caps the pool from PARLAY_NUM_THREADS.
+        "cflags": "-DPARLAY_TBB -include " + os.path.join(PBBS_DIR, "common", "tbb_num_threads.h"),
+        "lflags": "-ltbb",
+        "threads_env": None,
+    },
+    "parlaylib-opencilk": {
+        "cflags": "-DPARLAY_OPENCILK -fopencilk",
+        "lflags": "-fopencilk",
+        "threads_env": "CILK_NWORKERS",
+        "cxx": "opencilk",   # resolved from --opencilk-cxx / OPENCILK_CXX
+    },
+}
+LIBRARIES = ["parlaylib", "hb-parlaylib", "ehb2-parlaylib"] + list(BACKENDS)
+
+
+def base_library(lib):
+    """The library directory a name refers to (backends share stock parlaylib)."""
+    return "parlaylib" if lib in BACKENDS else lib
+# Libraries built with the Spork unroll plugin.
 SPORK_LIBRARIES = ["hb-parlaylib", "ehb2-parlaylib"]
+# Of those, the ones that also need the heartbeat startup header force-included
+# (ehb2 sets itself up when its scheduler is constructed).
+STARTUP_HEADER_LIBRARIES = ["hb-parlaylib"]
 
 BASE_CFLAGS = "-mcx16 -O3 -g -std=c++20 -DNDEBUG -I . -stdlib=libc++ -w"
 LFLAGS = "-pthread -ldl -L/usr/local/lib -ljemalloc -stdlib=libc++"
@@ -94,7 +158,11 @@ def parse_args():
                         % ",".join(map(str, DEFAULT_CORES)))
     p.add_argument("--library", action="append", choices=["all", "both"] + LIBRARIES,
                    help="which Parlay implementation(s) to benchmark; repeatable"
-                        " (default: all of %s)" % ", ".join(LIBRARIES))
+                        " (default: all of %s; a backend whose toolchain is missing"
+                        " is skipped unless named explicitly)" % ", ".join(LIBRARIES))
+    p.add_argument("--opencilk-cxx", default=OPENCILK_CXX_DEFAULT,
+                   metavar="PATH", help="OpenCilk clang++ for parlaylib-opencilk"
+                        " (default: $OPENCILK_CXX, else /opt/opencilk/bin/clang++ if present)")
     p.add_argument("--only", action="append", default=[], metavar="GLOB",
                    help="only run benchmarks matching this glob, e.g. 'comparisonSort/*'"
                         " (repeatable)")
@@ -342,7 +410,7 @@ def current_library():
 
 
 def select_library(lib):
-    subprocess.run([os.path.join(SCRIPT_DIR, "use-%s.sh" % lib)],
+    subprocess.run([os.path.join(SCRIPT_DIR, "use-%s.sh" % base_library(lib))],
                    check=True, stdout=subprocess.DEVNULL)
 
 
@@ -388,6 +456,7 @@ class Runner:
         chosen = args.library or ["all"]
         self.libraries = (list(LIBRARIES) if {"all", "both"} & set(chosen)
                           else [l for l in LIBRARIES if l in chosen])
+        self.explicit_libraries = {l for l in chosen if l in LIBRARIES}
         self.plugin = os.path.join(SCRIPT_DIR, args.pass_name, "build", "SporkUnroll.so")
         now = datetime.datetime.now()
         stamp = now.strftime("%Y%m%d-%H%M%S")
@@ -431,15 +500,57 @@ class Runner:
         return selected
 
     # ---- preflight -------------------------------------------------------
+    def compiler_for(self, lib):
+        if BACKENDS.get(lib, {}).get("cxx") == "opencilk":
+            return self.args.opencilk_cxx
+        return CLANGXX
+
+    def probe_backend(self, lib):
+        """Try to build and run a tiny program on this backend; return None or an error string."""
+        cxx = self.compiler_for(lib)
+        if not cxx:
+            return "no OpenCilk compiler given (--opencilk-cxx or OPENCILK_CXX)"
+        if not os.path.exists(cxx):
+            return "compiler not found: %s" % cxx
+        b = BACKENDS[lib]
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "probe.cpp")
+            exe = os.path.join(d, "probe")
+            with open(src, "w") as f:
+                f.write("#include <parlay/parallel.h>\n#include <atomic>\n#include <cstdio>\n"
+                        "int main() { std::atomic<long> s{0};"
+                        " parlay::parallel_for(0, 100000, [&](size_t i) { s += i; });"
+                        " std::printf(\"%ld %zu\\n\", s.load(), parlay::num_workers()); }\n")
+            cmd = [cxx] + shlex.split(BASE_CFLAGS + " " + b["cflags"]) + \
+                  ["-I", os.path.join(SCRIPT_DIR, "parlaylib", "include"), src, "-o", exe] + \
+                  shlex.split(LFLAGS + " " + b["lflags"])
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            if r.returncode != 0:
+                return "probe failed to build:\n" + r.stdout.strip()
+            r = subprocess.run([exe], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            if r.returncode != 0 or not r.stdout.startswith("4999950000 "):
+                return "probe failed to run: " + r.stdout.strip()
+        return None
+
     def preflight(self):
         for path in [CLANGXX, os.path.join(SCRIPT_DIR, "use-parlaylib.sh")] + \
-                [os.path.join(SCRIPT_DIR, "use-%s.sh" % lib) for lib in self.libraries]:
+                [os.path.join(SCRIPT_DIR, "use-%s.sh" % base_library(lib)) for lib in self.libraries]:
             if not os.path.exists(path):
                 sys.exit("error: required file not found: %s" % path)
+        for lib in [l for l in self.libraries if l in BACKENDS]:
+            err = self.probe_backend(lib)
+            if err is None:
+                continue
+            if lib in self.explicit_libraries:
+                sys.exit("error: %s is not usable: %s" % (lib, err))
+            print("warning: skipping %s: %s" % (lib, err.splitlines()[0]), file=sys.stderr)
+            self.libraries.remove(lib)
         if any(lib in SPORK_LIBRARIES for lib in self.libraries):
-            for path in [self.plugin, STARTUP_HEADER]:
-                if not os.path.exists(path):
-                    sys.exit("error: required file not found: %s" % path)
+            if not os.path.exists(self.plugin):
+                sys.exit("error: required file not found: %s" % self.plugin)
+        if any(lib in STARTUP_HEADER_LIBRARIES for lib in self.libraries):
+            if not os.path.exists(STARTUP_HEADER):
+                sys.exit("error: required file not found: %s" % STARTUP_HEADER)
         if not self.args.no_numa and not shutil.which("numactl"):
             print("warning: numactl not found; running without memory interleaving",
                   file=sys.stderr)
@@ -465,12 +576,17 @@ class Runner:
         return os.path.join(self.bin_dir, lib, bench.log_stem, bench.binary_name)
 
     def build_one(self, lib, bench, family_locks):
-        cflags = BASE_CFLAGS
+        cflags, lflags = BASE_CFLAGS, LFLAGS
         if lib in SPORK_LIBRARIES:
-            cflags += " -fpass-plugin=%s -include %s" % (self.plugin, STARTUP_HEADER)
+            cflags += " -fpass-plugin=%s" % self.plugin
+        if lib in STARTUP_HEADER_LIBRARIES:
+            cflags += " -include %s" % STARTUP_HEADER
+        if lib in BACKENDS:
+            cflags += " " + BACKENDS[lib]["cflags"]
+            lflags += " " + BACKENDS[lib]["lflags"]
         log = os.path.join(self.log_dir, lib, bench.log_stem + ".build.log")
-        cmd = ["make", "-B", "-s", "-C", bench.dir, "CC=" + CLANGXX,
-               "CFLAGS=" + cflags, "LFLAGS=" + LFLAGS]
+        cmd = ["make", "-B", "-s", "-C", bench.dir, "CC=" + self.compiler_for(lib),
+               "CFLAGS=" + cflags, "LFLAGS=" + lflags]
         print("[%s] building %s" % (lib, bench.name), flush=True)
         # Variants of one family share ../bench (checker, Time.C); serialize them.
         with family_locks[bench.family]:
@@ -574,6 +690,9 @@ class Runner:
             cmd += ["-o", out_file]
         cmd += inputs
         env = dict(os.environ, PARLAY_NUM_THREADS=str(cores))
+        threads_env = BACKENDS.get(lib, {}).get("threads_env")
+        if threads_env:
+            env[threads_env] = str(cores)
         log = os.path.join(self.log_dir, lib, "%s__p%d__%s.log"
                            % (bench.log_stem, cores, inp["label"].replace(" ", "_").replace("/", "_")))
         key = "%s %s [%s] p=%d" % (lib, bench.name, inp["label"], cores)
@@ -583,7 +702,9 @@ class Runner:
         # stdout goes straight to the log file (not through a pipe) so that
         # `tail -f` on the log shows each round as PBBS prints it.
         with open(log, "w") as f:
-            f.write("$ PARLAY_NUM_THREADS=%d %s\n" % (cores, " ".join(shlex.quote(c) for c in cmd)))
+            f.write("$ PARLAY_NUM_THREADS=%d %s%s\n"
+                    % (cores, "%s=%d " % (threads_env, cores) if threads_env else "",
+                       " ".join(shlex.quote(c) for c in cmd)))
             f.flush()
             try:
                 r = subprocess.run(cmd, cwd=bench.dir, env=env, stdout=f,

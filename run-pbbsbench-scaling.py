@@ -101,19 +101,27 @@ BACKENDS = {
         "cxx": "opencilk",   # resolved from --opencilk-cxx / OPENCILK_CXX
     },
 }
-LIBRARIES = ["parlaylib", "hb-parlaylib", "ehb2-parlaylib"] + list(BACKENDS)
+LIBRARIES = ["parlaylib", "pf-parlaylib", "hb-parlaylib", "hb2-parlaylib", "hbf-parlaylib",
+             "ehb2-parlaylib", "ehbf-parlaylib"] + list(BACKENDS)
 
 
 def base_library(lib):
     """The library directory a name refers to (backends share stock parlaylib)."""
     return "parlaylib" if lib in BACKENDS else lib
 # Libraries built with the Spork unroll plugin.
-SPORK_LIBRARIES = ["hb-parlaylib", "ehb2-parlaylib"]
+SPORK_LIBRARIES = ["hb-parlaylib", "hb2-parlaylib", "hbf-parlaylib", "ehb2-parlaylib", "ehbf-parlaylib"]
 # Of those, the ones that also need the heartbeat startup header force-included
 # (ehb2 sets itself up when its scheduler is constructed).
-STARTUP_HEADER_LIBRARIES = ["hb-parlaylib"]
+STARTUP_HEADER_LIBRARIES = ["hb-parlaylib", "hb2-parlaylib", "hbf-parlaylib"]
+# Libraries that hand stacks over at a join; they switch with Boost.Context.
+FIBER_LIBRARIES = ["pf-parlaylib", "hbf-parlaylib", "ehbf-parlaylib"]
 
 BASE_CFLAGS = "-mcx16 -O3 -g -std=c++20 -DNDEBUG -I . -stdlib=libc++ -w"
+# Extra flags for one-off experiments, e.g. EXTRA_CFLAGS=-DNOGRAINS.  Recorded
+# in the run's config so a result can be traced back to the flags that made it.
+EXTRA_CFLAGS = os.environ.get("EXTRA_CFLAGS", "")
+if EXTRA_CFLAGS:
+    BASE_CFLAGS += " " + EXTRA_CFLAGS
 LFLAGS = "-pthread -ldl -L/usr/local/lib -ljemalloc -stdlib=libc++"
 
 
@@ -581,6 +589,8 @@ class Runner:
             cflags += " -fpass-plugin=%s" % self.plugin
         if lib in STARTUP_HEADER_LIBRARIES:
             cflags += " -include %s" % STARTUP_HEADER
+        if lib in FIBER_LIBRARIES:
+            lflags += " -lboost_context"
         if lib in BACKENDS:
             cflags += " " + BACKENDS[lib]["cflags"]
             lflags += " " + BACKENDS[lib]["lflags"]
@@ -792,6 +802,7 @@ class Runner:
             "max_inputs": self.args.max_inputs,
             "bin_dir": self.bin_dir,
             "benchmarks": [b.name for b in self.benchmarks],
+            "extra_cflags": EXTRA_CFLAGS,
             "hostname": os.uname().nodename,
             "started": self.started,
         }

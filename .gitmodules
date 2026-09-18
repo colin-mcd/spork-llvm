@@ -3,10 +3,21 @@
 	url = ./pbbsbench
 [submodule "ehb2-parlaylib"]
 	path = ehb2-parlaylib
-	url = ./ehb2-parlaylib/
+	url = ../hb-parlaylib.git
+	branch = ehb2
 [submodule "hb-parlaylib"]
 	path = hb-parlaylib
-	url = ./hb-parlaylib/
+	url = ../hb-parlaylib.git
+	branch = master
 [submodule "parlaylib"]
 	path = parlaylib
-	url = ./parlaylib/
+	url = ../hb-parlaylib.git
+	branch = fix-flatten-iterator-oob
+[submodule "hbf-parlaylib"]
+	path = hbf-parlaylib
+	url = ../hb-parlaylib.git
+	branch = hbf
+[submodule "ehbf-parlaylib"]
+	path = ehbf-parlaylib
+	url = ../hb-parlaylib.git
+	branch = ehbf

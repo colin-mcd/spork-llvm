@@ -1,6 +1,6 @@
 # Spork unroll pass (probe-driven)
 
-`fablepass/SporkUnrollPass.cpp` is an LLVM new-pass-manager plugin for the
+`SporkUnrollPass/SporkUnrollPass.cpp` is an LLVM new-pass-manager plugin for the
 interruptible loop in Spork's `parfor`. It is an alternative to `gempass`,
 which asks LLVM's unroll cost model for a count and then rewrites LLVM's
 unrolled clone chain by hand. That design cannot take advantage of
@@ -138,10 +138,10 @@ the token publishes factor 1 and nothing is transformed.
 ## Building and using
 
 ```sh
-cmake -S fablepass -B fablepass/build \
+cmake -S SporkUnrollPass -B SporkUnrollPass/build \
   -DLLVM_DIR="$PWD/llvm-project/build/lib/cmake/llvm" -DCMAKE_BUILD_TYPE=Release
-cmake --build fablepass/build -j8
-llvm-project/build/bin/clang++ -O3 -fpass-plugin="$PWD/fablepass/build/SporkUnroll.so" ...
+cmake --build SporkUnrollPass/build -j8
+llvm-project/build/bin/clang++ -O3 -fpass-plugin="$PWD/SporkUnrollPass/build/SporkUnroll.so" ...
 ```
 
 The repository `Makefile` uses this plugin by default (`make sum`); pass
@@ -156,8 +156,8 @@ multi-block body, store-only body) and prints `ALL OK`.
 |---|---|---|
 | `seqsum` (sequential loop) | 63 ms | n/a |
 | gempass | | ~30 ms |
-| fablepass, fallback rewrite (batch 64) | 80 ms | 26 ms |
-| fablepass, transplant (batch 64 = VF 16 x IC 4) | 64 ms | 26 ms |
+| SporkUnrollPass, fallback rewrite (batch 64) | 80 ms | 26 ms |
+| SporkUnrollPass, transplant (batch 64 = VF 16 x IC 4) | 64 ms | 26 ms |
 
 The single-worker number is the one that matters for code quality: the
 transplanted loop is LLVM's own vectorized loop, so it runs at the speed of

@@ -5,7 +5,7 @@ set -uo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 pbbs_dir="${script_dir}/pbbsbench"
 clangxx="${script_dir}/llvm-project/build/bin/clang++"
-pass_name=fablepass
+pass_name=SporkUnrollPass
 plugin=""
 only_pattern=""
 startup_header="${pbbs_dir}/common/spork_benchmark_startup.h"
@@ -45,7 +45,7 @@ Options:
   --output DIR           Report/log directory.
   --run-timeout SEC      Timeout per target run (default: 900).
   --build-timeout SEC    Timeout per target build (default: 900).
-  --pass NAME            Spork unroll plugin to use: fablepass (default) or
+  --pass NAME            Spork unroll plugin to use: SporkUnrollPass (default) or
                          gempass (uses NAME/build/SporkUnroll.so).
   --only PATTERN         Only build/run benchmarks matching this shell glob
                          (e.g. 'suffixArray/*'). May be repeated.

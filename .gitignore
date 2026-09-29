@@ -1,8 +1,8 @@
 scheduler
 *.o
 deprecated.*
-fablepass/build/
-fablepass/.cache/
+SporkUnrollPass/build/
+SporkUnrollPass/.cache/
 __pycache__/
 llvm-project/
 report/

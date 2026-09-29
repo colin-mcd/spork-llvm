@@ -12,8 +12,8 @@ DBGFLAG := -ggdb
 LIBRARY := -lpthread
 SETPATH := LD_PRELOAD=/usr/local/lib/libjemalloc.so
 OPTIONS := -xc++ -std=c++20 -O3
-# Which Spork unroll plugin to use: fablepass (probe-driven) or gempass.
-PASS ?= fablepass
+# Which Spork unroll plugin to use: SporkUnrollPass (probe-driven) or gempass.
+PASS ?= SporkUnrollPass
 LLVMOPT := -fpass-plugin=./$(PASS)/build/SporkUnroll.so
 
 %: %.cpp *.hpp Makefile $(PASS)/build/SporkUnroll.so
@@ -45,9 +45,9 @@ pass/build/RtsSporkPass.so: pass/RtsSporkPass.cpp pass/rts_spork_table.h Makefil
 gempass/build/SporkUnroll.so: gempass/SporkUnrollPass.cpp Makefile
 	$(MAKE) -C gempass/build
 
-fablepass/build/SporkUnroll.so: fablepass/SporkUnrollPass.cpp Makefile
-	cmake -S fablepass -B fablepass/build -DLLVM_DIR="$(CURDIR)/llvm-project/build/lib/cmake/llvm" -DCMAKE_BUILD_TYPE=Release
-	$(MAKE) -C fablepass/build
+SporkUnrollPass/build/SporkUnroll.so: SporkUnrollPass/SporkUnrollPass.cpp Makefile
+	cmake -S SporkUnrollPass -B SporkUnrollPass/build -DLLVM_DIR="$(CURDIR)/llvm-project/build/lib/cmake/llvm" -DCMAKE_BUILD_TYPE=Release
+	$(MAKE) -C SporkUnrollPass/build
 
 llvmtest: scheduler.cpp *.hpp gempass/build/SporkUnroll.so Makefile
 #	$(SETPATH) $(CLANGPP) $(INCLUDE) $(OPTIONS) $(LIBRARY) $(DBGFLAG) $(LLVMOPT) -O3 $< -o $@

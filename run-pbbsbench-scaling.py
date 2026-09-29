@@ -12,6 +12,10 @@ discarded and the remaining ``trials`` rounds are averaged.
 SMT is disabled through /sys/devices/system/cpu/smt/control for the duration
 of the benchmark (and restored afterwards).  See ``--smt`` for alternatives.
 
+With --gbbs the suite is GBBS (https://github.com/ParAlg/gbbs) instead of
+PBBS: the same libraries, core counts and statistics, run on the graph inputs
+PBBS already generates under testData/graphData/data.
+
 Outputs (in --output):
   report.md    Markdown tables: mean +- P90 error per benchmark and core count.
   results.tsv  One row per (library, benchmark, input, cores) with statistics.
@@ -42,6 +46,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PBBS_DIR = os.path.join(SCRIPT_DIR, "pbbsbench")
+GBBS_DIR = os.path.join(SCRIPT_DIR, "gbbs")
 CLANGXX = os.path.join(SCRIPT_DIR, "llvm-project", "build", "bin", "clang++")
 STARTUP_HEADER = os.path.join(PBBS_DIR, "common", "spork_benchmark_startup.h")
 SMT_CONTROL = "/sys/devices/system/cpu/smt/control"
@@ -101,7 +106,7 @@ BACKENDS = {
         "cxx": "opencilk",   # resolved from --opencilk-cxx / OPENCILK_CXX
     },
 }
-LIBRARIES = ["parlaylib", "pf-parlaylib", "hb-parlaylib", "hb2-parlaylib", "hbf-parlaylib",
+LIBRARIES = ["parlaylib", "pf-parlaylib", "hb-parlaylib", "hb2-parlaylib", "hb3-parlaylib", "hbf-parlaylib",
              "ehb2-parlaylib", "ehbf-parlaylib"] + list(BACKENDS)
 
 
@@ -109,20 +114,90 @@ def base_library(lib):
     """The library directory a name refers to (backends share stock parlaylib)."""
     return "parlaylib" if lib in BACKENDS else lib
 # Libraries built with the Spork unroll plugin.
-SPORK_LIBRARIES = ["hb-parlaylib", "hb2-parlaylib", "hbf-parlaylib", "ehb2-parlaylib", "ehbf-parlaylib"]
+SPORK_LIBRARIES = ["hb-parlaylib", "hb2-parlaylib", "hb3-parlaylib", "hbf-parlaylib", "ehb2-parlaylib", "ehbf-parlaylib"]
 # Of those, the ones that also need the heartbeat startup header force-included
 # (ehb2 sets itself up when its scheduler is constructed).
-STARTUP_HEADER_LIBRARIES = ["hb-parlaylib", "hb2-parlaylib", "hbf-parlaylib"]
-# Libraries that hand stacks over at a join; they switch with Boost.Context.
-FIBER_LIBRARIES = ["pf-parlaylib", "hbf-parlaylib", "ehbf-parlaylib"]
+STARTUP_HEADER_LIBRARIES = ["hb-parlaylib", "hb2-parlaylib", "hb3-parlaylib", "hbf-parlaylib"]
+# Libraries that hand stacks over at a join and still link Boost.Context for
+# the switch.  hbf-parlaylib carries its own copy (internal/fcontext.h).
+FIBER_LIBRARIES = ["pf-parlaylib", "ehbf-parlaylib"]
 
-BASE_CFLAGS = "-mcx16 -O3 -g -std=c++20 -DNDEBUG -I . -stdlib=libc++ -w"
+BASE_CFLAGS = "-mcx16 -O3 -std=c++20 -DNDEBUG -I . -stdlib=libc++ -w"
 # Extra flags for one-off experiments, e.g. EXTRA_CFLAGS=-DNOGRAINS.  Recorded
 # in the run's config so a result can be traced back to the flags that made it.
 EXTRA_CFLAGS = os.environ.get("EXTRA_CFLAGS", "")
 if EXTRA_CFLAGS:
     BASE_CFLAGS += " " + EXTRA_CFLAGS
 LFLAGS = "-pthread -ldl -L/usr/local/lib -ljemalloc -stdlib=libc++"
+
+
+# --------------------------------------------------------------------------
+# GBBS (https://github.com/ParAlg/gbbs), selected with --gbbs
+# --------------------------------------------------------------------------
+# Upstream moved to Bazel and no longer ships the per-benchmark Makefiles its
+# README describes, so the harness compiles each benchmark itself: the
+# benchmark's own translation unit plus a handful of gbbs support sources,
+# against whichever Parlay the use-*.sh scripts symlinked into
+# gbbs/external/parlaylib (the path gbbs's own makefile.benchmarks expects).
+GBBS_CFLAGS = "-DGBBSLONG -DAMORTIZEDPD -DUSEMALLOC"
+# Support sources under gbbs/gbbs.  status_macros.cc and progress_reporting.cc
+# are left out: they need GoogleTest and Abseil, and nothing we build calls them.
+GBBS_SUPPORT = [
+    "gbbs/io.cc",
+    "gbbs/graph_io.cc",
+    "gbbs/encodings/byte.cc",
+    "gbbs/encodings/byte_pd.cc",
+    "gbbs/encodings/byte_pd_amortized.cc",
+    "gbbs/helpers/parse_command_line.cc",
+    "gbbs/helpers/directed_edge.cc",
+    "gbbs/helpers/undirected_edge.cc",
+]
+# Graphs PBBS generates in testData/graphData/data.  PBBS writes an adjacency
+# file only through graphFromEdges with symmetrisation on, so every one of
+# these is undirected and gbbs reads it with -s.  They are the same three
+# graphs PBBS's own breadthFirstSearch uses.
+GBBS_DATA_DIR = os.path.join(PBBS_DIR, "testData", "graphData", "data")
+GBBS_GRAPHS = [
+    "randLocalGraph_J_10_20000000",
+    "rMatGraph_J_12_16000000",
+    "3Dgrid_J_64000000",
+]
+# (benchmark directory, binary/source stem, run options).  The source is
+# <directory>/<stem>.cc under gbbs/benchmarks.
+#
+# Left out on purpose:
+#   PageRank                      includes absl/container/flat_hash_set.h
+#   CycleCounting/Parallel5Cycle  about four minutes per round on rMat
+#   CliqueCounting                builds and runs, but takes eleven minutes to
+#                                 compile per library; add it back if you want it
+#   ApproximateSetCover, StronglyConnectedComponents, SSWidestPath
+#                                 produced no timing within the probe window
+#   the weighted benchmarks (IntegralWeightSSSP, GeneralWeightSSSP,
+#   PositiveWeightSSSP, MinimumSpanningForest) need a WeightedAdjacencyGraph;
+#   PBBS's weighted generator writes floating-point weights and gbbs parses
+#   integers, and pbbsbench's adjGraphAddWeights no longer compiles.
+GBBS_BENCHMARKS = [
+    ("ApproximateDensestSubgraph/ApproxPeelingBKV12", "DensestSubgraph", "-s"),
+    ("BFS/NonDeterministicBFS", "BFS", "-s -src 10"),
+    ("Biconnectivity/TarjanVishkin", "Biconnectivity", "-s"),
+    ("Connectivity/WorkEfficientSDB14", "Connectivity", "-s"),
+    ("DegeneracyOrder/BarenboimElkin08", "DegeneracyOrder", "-s"),
+    ("GraphColoring/Hasenplaugh14", "GraphColoring", "-s"),
+    ("KCore/JulienneDBS17", "KCore", "-s"),
+    ("LowDiameterDecomposition/MPX13", "LowDiameterDecomposition", "-s"),
+    ("MaximalIndependentSet/RandomGreedy", "MaximalIndependentSet", "-s"),
+    ("MaximalMatching/RandomGreedy", "MaximalMatching", "-s"),
+    ("SSBetweenessCentrality/Brandes", "SSBetweennessCentrality", "-s -src 10"),
+    ("Spanner/MPXV15", "Spanner", "-s"),
+    ("SpanningForest/SDB14", "SpanningForest", "-s"),
+    ("TriangleCounting/ShunTangwongsan15", "Triangle", "-s"),
+]
+# Benchmarks that run only when named with --only, never by default.
+# MaximalMatching's eff_for processes each batch of edges in vertex-id order,
+# which on randLocal wastes up to 650x the work (57 s per round under stock,
+# vs 0.2 s with the batch shuffled): it measures that pathology, not the
+# scheduler, and takes 8-40 minutes per input at the default round counts.
+GBBS_OPT_IN = {"MaximalMatching/RandomGreedy"}
 
 
 # --------------------------------------------------------------------------
@@ -171,16 +246,20 @@ def parse_args():
     p.add_argument("--opencilk-cxx", default=OPENCILK_CXX_DEFAULT,
                    metavar="PATH", help="OpenCilk clang++ for parlaylib-opencilk"
                         " (default: $OPENCILK_CXX, else /opt/opencilk/bin/clang++ if present)")
+    p.add_argument("--gbbs", action="store_true",
+                   help="benchmark GBBS instead of PBBS: the gbbs/ checkout, built"
+                        " against the same libraries and run on the PBBS graph inputs")
     p.add_argument("--only", action="append", default=[], metavar="GLOB",
                    help="only run benchmarks matching this glob, e.g. 'comparisonSort/*'"
-                        " (repeatable)")
+                        " (repeatable); also the only way to run the gbbs benchmarks in"
+                        " GBBS_OPT_IN, such as 'MaximalMatching/*'")
     p.add_argument("--primary-only", action="store_true",
                    help="skip the benchmarks runall marks as extended (third tuple field 1)")
     p.add_argument("--max-inputs", type=positive_int, metavar="N",
                    help="only run the first N inputs listed in each family's testInputs"
                         " (default: all)")
-    p.add_argument("--pass", dest="pass_name", default="fablepass",
-                   help="Spork unroll plugin directory: fablepass (default) or gempass")
+    p.add_argument("--pass", dest="pass_name", default="SporkUnrollPass",
+                   help="Spork unroll plugin directory: SporkUnrollPass (default) or gempass")
     p.add_argument("--output", metavar="DIR",
                    help="result directory (default: pbbsbench-scaling/<timestamp>)")
     p.add_argument("--no-build", action="store_true",
@@ -214,11 +293,15 @@ def parse_args():
     return args
 
 
-def latest_run_with_binaries(exclude, needed):
-    """Newest pbbsbench-scaling/<stamp> directory (other than `exclude`) whose bin/
-    holds every path in `needed` (relative to bin/).  Directories with only some of
-    them, e.g. a build still in progress or one built with --only, are skipped."""
-    root = os.path.join(SCRIPT_DIR, "pbbsbench-scaling")
+def results_root(gbbs):
+    """Where run directories live; the two suites keep separate trees."""
+    return os.path.join(SCRIPT_DIR, "gbbs-scaling" if gbbs else "pbbsbench-scaling")
+
+
+def latest_run_with_binaries(exclude, needed, root):
+    """Newest <root>/<stamp> directory (other than `exclude`) whose bin/ holds every
+    path in `needed` (relative to bin/).  Directories with only some of them, e.g. a
+    build still in progress or one built with --only, are skipped."""
     candidates = sorted((d for d in glob.glob(os.path.join(root, "*"))
                          if os.path.isdir(os.path.join(d, "bin")) and
                          os.path.realpath(d) != os.path.realpath(exclude)),
@@ -257,6 +340,11 @@ def parallel_benchmarks_from_runall():
 
 
 class Benchmark:
+    # How this suite's binaries are told how many rounds to run, and the line
+    # they print once per round with that round's time.
+    rounds_flag = "-r"
+    time_prefix = "Parlay time:"
+
     def __init__(self, name, extended):
         self.name = name                      # e.g. comparisonSort/sampleSort
         self.family = name.split("/")[0]
@@ -284,6 +372,29 @@ class Benchmark:
     @property
     def log_stem(self):
         return self.name.replace("/", "__")
+
+
+class GbbsBenchmark(Benchmark):
+    """One gbbs benchmark: a single .cc linked against the gbbs support objects.
+
+    gbbs has neither a runall nor per-family testInputs, so the name, binary,
+    run options and input graphs come from the tables at the top of this file."""
+
+    rounds_flag = "-rounds"
+    time_prefix = "### Running Time:"
+
+    def __init__(self, name, binary, run_opts):
+        self.name = name
+        self.family = name.split("/")[0]
+        self.extended = False
+        self.dir = GBBS_DIR                  # cwd for the compiler and the binary
+        self.source = os.path.join("benchmarks", name, binary + ".cc")
+        self.binary_name = binary
+        self.check_program = None            # gbbs ships no correctness checkers
+        self.data_dir = GBBS_DATA_DIR
+        self.inputs = [{"files": [g], "label": g + (" " + run_opts if run_opts else ""),
+                        "run_opts": run_opts, "check_opts": ""}
+                       for g in GBBS_GRAPHS]
 
 
 # --------------------------------------------------------------------------
@@ -470,7 +581,7 @@ class Runner:
         stamp = now.strftime("%Y%m%d-%H%M%S")
         self.started = now.isoformat(timespec="seconds")
         self.output = os.path.abspath(args.output or
-                                      os.path.join(SCRIPT_DIR, "pbbsbench-scaling", stamp))
+                                      os.path.join(results_root(args.gbbs), stamp))
         self.bin_dir = os.path.join(self.output, "bin")
         self.log_dir = os.path.join(self.output, "logs")
         self.initial_library = current_library()
@@ -484,7 +595,8 @@ class Runner:
             if args.reuse_bin == "latest":
                 needed = [os.path.join(lib, b.log_stem, b.binary_name)
                           for lib in self.libraries for b in self.benchmarks]
-                src = latest_run_with_binaries(self.output, needed)
+                src = latest_run_with_binaries(self.output, needed,
+                                               results_root(args.gbbs))
             else:
                 src = os.path.abspath(args.reuse_bin)
                 if not os.path.isdir(os.path.join(src, "bin")):
@@ -493,13 +605,22 @@ class Runner:
 
     # ---- discovery -------------------------------------------------------
     def discover(self):
+        if self.args.gbbs:
+            names = [(n, False) for n, _binary, _opts in GBBS_BENCHMARKS]
+            gbbs_spec = {n: (binary, opts) for n, binary, opts in GBBS_BENCHMARKS}
+        else:
+            names = parallel_benchmarks_from_runall()
+            gbbs_spec = None
         selected = []
-        for name, extended in parallel_benchmarks_from_runall():
+        for name, extended in names:
             if self.args.primary_only and extended:
                 continue
             if self.args.only and not any(fnmatch.fnmatch(name, g) for g in self.args.only):
                 continue
-            bench = Benchmark(name, extended)
+            if gbbs_spec and name in GBBS_OPT_IN and not self.args.only:
+                continue
+            bench = (GbbsBenchmark(name, *gbbs_spec[name]) if gbbs_spec
+                     else Benchmark(name, extended))
             if self.args.max_inputs:
                 bench.inputs = bench.inputs[:self.args.max_inputs]
             selected.append(bench)
@@ -559,6 +680,16 @@ class Runner:
         if any(lib in STARTUP_HEADER_LIBRARIES for lib in self.libraries):
             if not os.path.exists(STARTUP_HEADER):
                 sys.exit("error: required file not found: %s" % STARTUP_HEADER)
+        if self.args.gbbs:
+            if not os.path.isdir(os.path.join(GBBS_DIR, "benchmarks")):
+                sys.exit("error: --gbbs needs a gbbs checkout at %s"
+                         " (git clone https://github.com/ParAlg/gbbs.git)" % GBBS_DIR)
+            missing = [f for f in GBBS_SUPPORT if not os.path.exists(os.path.join(GBBS_DIR, f))]
+            if missing:
+                sys.exit("error: gbbs checkout is missing %s" % ", ".join(missing))
+            if self.args.check:
+                print("warning: gbbs ships no correctness checkers; --check does nothing",
+                      file=sys.stderr)
         if not self.args.no_numa and not shutil.which("numactl"):
             print("warning: numactl not found; running without memory interleaving",
                   file=sys.stderr)
@@ -583,10 +714,12 @@ class Runner:
     def binary_path(self, lib, bench):
         return os.path.join(self.bin_dir, lib, bench.log_stem, bench.binary_name)
 
-    def build_one(self, lib, bench, family_locks):
+    def build_flags(self, lib):
         cflags, lflags = BASE_CFLAGS, LFLAGS
         if lib in SPORK_LIBRARIES:
-            cflags += " -fpass-plugin=%s" % self.plugin
+            # VOLATILE_UNROLL opts the spork loops into the plugin's unrolling
+            # (empty, like the #define some spork libraries still carry).
+            cflags += " -fpass-plugin=%s -DVOLATILE_UNROLL=" % self.plugin
         if lib in STARTUP_HEADER_LIBRARIES:
             cflags += " -include %s" % STARTUP_HEADER
         if lib in FIBER_LIBRARIES:
@@ -594,6 +727,55 @@ class Runner:
         if lib in BACKENDS:
             cflags += " " + BACKENDS[lib]["cflags"]
             lflags += " " + BACKENDS[lib]["lflags"]
+        return cflags, lflags
+
+    def gbbs_obj_dir(self, lib):
+        return os.path.join(self.bin_dir, lib, "_gbbs_support")
+
+    def build_gbbs_support(self, lib):
+        """Compile the gbbs sources every benchmark links, once per library.
+
+        They include Parlay headers, so they cannot be shared between libraries.
+        Returns the object paths, or None if a compile failed."""
+        cflags, _lflags = self.build_flags(lib)
+        cflags += " " + GBBS_CFLAGS + " -I . -I external/parlaylib/include"
+        out_dir = self.gbbs_obj_dir(lib)
+        os.makedirs(out_dir, exist_ok=True)
+        log = os.path.join(self.log_dir, lib, "_gbbs_support.build.log")
+        objs = []
+        print("[%s] building the gbbs support objects" % lib, flush=True)
+        with open(log, "w") as f:
+            for src in GBBS_SUPPORT:
+                obj = os.path.join(out_dir, src.replace("/", "_")[:-3] + ".o")
+                cmd = [self.compiler_for(lib)] + shlex.split(cflags) + ["-c", src, "-o", obj]
+                f.write("$ " + " ".join(shlex.quote(c) for c in cmd) + "\n")
+                f.flush()
+                r = subprocess.run(cmd, cwd=GBBS_DIR, stdout=f, stderr=subprocess.STDOUT)
+                if r.returncode != 0:
+                    print("[%s] BUILD FAILED gbbs support (see %s)" % (lib, log), flush=True)
+                    return None
+                objs.append(obj)
+        return objs
+
+    def build_one_gbbs(self, lib, bench, objs):
+        cflags, lflags = self.build_flags(lib)
+        cflags += " " + GBBS_CFLAGS + " -I . -I external/parlaylib/include"
+        dst = self.binary_path(lib, bench)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        log = os.path.join(self.log_dir, lib, bench.log_stem + ".build.log")
+        cmd = [self.compiler_for(lib)] + shlex.split(cflags) + [bench.source] + objs + \
+              ["-o", dst] + shlex.split(lflags)
+        print("[%s] building %s" % (lib, bench.name), flush=True)
+        with open(log, "w") as f:
+            f.write("$ " + " ".join(shlex.quote(c) for c in cmd) + "\n")
+            f.flush()
+            r = subprocess.run(cmd, cwd=GBBS_DIR, stdout=f, stderr=subprocess.STDOUT)
+        if r.returncode != 0 or not os.path.exists(dst):
+            self.failures.append((lib, bench.name, "BUILD_FAILED", "see " + log))
+            print("[%s] BUILD FAILED %s (see %s)" % (lib, bench.name, log), flush=True)
+
+    def build_one(self, lib, bench, family_locks):
+        cflags, lflags = self.build_flags(lib)
         log = os.path.join(self.log_dir, lib, bench.log_stem + ".build.log")
         cmd = ["make", "-B", "-s", "-C", bench.dir, "CC=" + self.compiler_for(lib),
                "CFLAGS=" + cflags, "LFLAGS=" + lflags]
@@ -617,6 +799,18 @@ class Runner:
             os.makedirs(os.path.join(self.log_dir, lib), exist_ok=True)
             print("=== Building with %s (%d jobs) ===" % (lib, self.args.build_jobs))
             select_library(lib)
+            if self.args.gbbs:
+                objs = self.build_gbbs_support(lib)
+                if objs is None:
+                    for b in self.benchmarks:
+                        self.failures.append((lib, b.name, "BUILD_FAILED",
+                                              "gbbs support objects did not compile"))
+                    continue
+                with ThreadPoolExecutor(max_workers=self.args.build_jobs) as pool:
+                    for f in [pool.submit(self.build_one_gbbs, lib, b, objs)
+                              for b in self.benchmarks]:
+                        f.result()
+                continue
             with ThreadPoolExecutor(max_workers=self.args.build_jobs) as pool:
                 futures = [pool.submit(self.build_one, lib, b, family_locks)
                            for b in self.benchmarks]
@@ -694,8 +888,8 @@ class Runner:
         cmd = self.run_command_prefix(cores) + [binary]
         if inp["run_opts"]:
             cmd += shlex.split(inp["run_opts"])
-        cmd += ["-r", str(rounds)]
-        if do_check:
+        cmd += [bench.rounds_flag, str(rounds)]
+        if do_check and bench.check_program:
             out_file = os.path.join(self.output, "check_%s_%s.out" % (lib, bench.log_stem))
             cmd += ["-o", out_file]
         cmd += inputs
@@ -733,7 +927,7 @@ class Runner:
             return None
         times = []
         for line in output.splitlines():
-            if line.startswith("Parlay time:"):
+            if line.startswith(bench.time_prefix):
                 try:
                     times.append(float(line.rsplit(":", 1)[1]))
                 except ValueError:
@@ -744,7 +938,7 @@ class Runner:
                                   % (key, len(times), rounds, log)))
             print("  BAD OUTPUT %s (%d/%d timings)" % (key, len(times), rounds), flush=True)
             return None
-        if do_check and out_file:
+        if do_check and out_file and bench.check_program:
             self.run_check(lib, bench, inp, inputs, out_file)
         return times[self.args.warmup:self.args.warmup + self.args.trials]
 
@@ -795,6 +989,7 @@ class Runner:
     # ---- output ----------------------------------------------------------
     def config(self):
         return {
+            "suite": "gbbs" if self.args.gbbs else "pbbs",
             "warmup": self.args.warmup, "trials": self.args.trials,
             "cores": self.cores, "libraries": self.libraries,
             "smt_mode": self.args.smt, "numactl": not self.args.no_numa,
@@ -843,7 +1038,7 @@ class Runner:
                     for r in self.results}
         bench_names = [b.name for b in self.benchmarks]
         out = []
-        out.append("# PBBS core-scaling benchmark")
+        out.append("# %s core-scaling benchmark" % ("GBBS" if self.args.gbbs else "PBBS"))
         out.append("")
         out.append("- Host: `%s`" % os.uname().nodename)
         out.append("- Libraries: %s" % ", ".join("`%s`" % l for l in self.libraries))
@@ -947,6 +1142,7 @@ class Runner:
 
     # ---- main ------------------------------------------------------------
     def dry_run(self):
+        print("Suite: %s" % ("gbbs" if self.args.gbbs else "pbbs"))
         print("Output: %s" % self.output)
         if self.args.no_build or self.args.reuse_bin:
             print("Binaries: %s (not rebuilding)" % self.bin_dir)

@@ -2,15 +2,23 @@
 """Core-scaling benchmark of the PBBS parallel programs.
 
 Runs every benchmark that pbbsbench/runall marks as parallel (the boolean in
-each test tuple) on the large PBBS inputs, once per library (stock parlaylib,
-hb-parlaylib, ehb2-parlaylib with steal requests only and no timer heartbeats,
-and stock parlaylib on its alternative scheduler backends: parlaylib-openmp,
-parlaylib-tbb and parlaylib-opencilk), across a list of core counts.  Each run performs
+each test tuple) on the large PBBS inputs, once per library (parlaylib, which
+is ParlayLib with the loop-body capture fixes, and orig-parlaylib, unmodified
+ParlayLib; hb-parlaylib, spork-parlaylib and the other Spork libraries;
+ParlayLib on its alternative scheduler backends, parlaylib-openmp,
+parlaylib-tbb, parlaylib-opencilk and parlaylib-sequential, with orig-*
+versions of the first three on unmodified ParlayLib; and parlaylib-auto,
+parlaylib-openmp-auto and parlaylib-opencilk-auto, which leave the grain of
+every loop and par_do_if to the scheduler), across a list of core counts.
+Each run performs
 ``warmup + trials`` in-process rounds; the first ``warmup`` rounds are
 discarded and the remaining ``trials`` rounds are averaged.
 
 SMT is disabled through /sys/devices/system/cpu/smt/control for the duration
 of the benchmark (and restored afterwards).  See ``--smt`` for alternatives.
+Multi-core runs interleave their memory across NUMA nodes (numactl -i all);
+1-core runs are pinned to one CPU with their memory bound to its node, so a
+run cannot land on one socket with its memory on the other (see --one-core-cpu).
 
 With --gbbs the suite is GBBS (https://github.com/ParAlg/gbbs) instead of
 PBBS: the same libraries, core counts and statistics, run on the graph inputs
@@ -52,9 +60,10 @@ STARTUP_HEADER = os.path.join(PBBS_DIR, "common", "spork_benchmark_startup.h")
 SMT_CONTROL = "/sys/devices/system/cpu/smt/control"
 SMT_ACTIVE = "/sys/devices/system/cpu/smt/active"
 DEFAULT_CORES = [1, 2, 4, 6, 8, 10, 20, 40, 80]
-# Stock parlaylib on its alternative scheduler backends
+# ParlayLib on its alternative scheduler backends
 # (https://cmuparlay.github.io/parlaylib/installation.html).  Each uses the
-# stock headers, selected with use-parlaylib.sh, plus a backend macro and the
+# headers of the library directory named by its "base" (cap-parlaylib for the
+# default names, parlaylib for the orig-* ones), plus a backend macro and the
 # matching compiler/linker flags.  A backend is verified at preflight by
 # compiling a probe program; one that cannot be built is skipped when it was
 # selected implicitly (--library all) and is an error when named explicitly.
@@ -68,6 +77,10 @@ DEFAULT_CORES = [1, 2, 4, 6, 8, 10, 20, 40, 80]
 #                      --opencilk-cxx, or /opt/opencilk/bin/clang++ (a release
 #                      tarball unpacked under /opt and symlinked); thread count
 #                      from CILK_NWORKERS
+#   parlaylib-sequential the sequential baseline: parallel_for is a plain for
+#                      loop and par_do calls its two lambdas one after the
+#                      other (internal/scheduler_plugins/sequential.h); runs
+#                      only at 1 core ("max_cores")
 # CilkPlus is not offered: no current compiler supports -fcilkplus.
 OPENCILK_CXX_DEFAULT = os.environ.get("OPENCILK_CXX") or \
     next((p for p in ["/opt/opencilk/bin/clang++"] if os.path.exists(p)), None)
@@ -88,11 +101,13 @@ else:
     OMP_LFLAGS = "-fopenmp=libgomp"
 BACKENDS = {
     "parlaylib-openmp": {
+        "base": "cap-parlaylib",
         "cflags": OMP_CFLAGS,
         "lflags": OMP_LFLAGS,
         "threads_env": "OMP_NUM_THREADS",
     },
     "parlaylib-tbb": {
+        "base": "cap-parlaylib",
         # oneTBB has no thread-count variable; the header narrows the affinity
         # mask and caps the pool from PARLAY_NUM_THREADS.
         "cflags": "-DPARLAY_TBB -include " + os.path.join(PBBS_DIR, "common", "tbb_num_threads.h"),
@@ -100,27 +115,86 @@ BACKENDS = {
         "threads_env": None,
     },
     "parlaylib-opencilk": {
+        "base": "cap-parlaylib",
         "cflags": "-DPARLAY_OPENCILK -fopencilk",
         "lflags": "-fopencilk",
         "threads_env": "CILK_NWORKERS",
         "cxx": "opencilk",   # resolved from --opencilk-cxx / OPENCILK_CXX
     },
+    "parlaylib-sequential": {
+        "base": "cap-parlaylib",
+        "cflags": "-DPARLAY_SEQUENTIAL",
+        "lflags": "",
+        "threads_env": None,
+        "max_cores": 1,
+    },
 }
-LIBRARIES = ["parlaylib", "pf-parlaylib", "hb-parlaylib", "hb2-parlaylib", "hb3-parlaylib", "hbf-parlaylib",
-             "ehb2-parlaylib", "ehbf-parlaylib"] + list(BACKENDS)
+# The same scheduler backends on unmodified ParlayLib: the same flags, built
+# from the stock parlaylib directory.  There is no orig- version of
+# parlaylib-sequential: its parallel_for is a plain loop inlined into the
+# caller, so the capture fixes do not change it (measured: 1.006x).
+for _backend in ("parlaylib-openmp", "parlaylib-tbb", "parlaylib-opencilk"):
+    BACKENDS["orig-" + _backend] = dict(BACKENDS[_backend], base="parlaylib")
+# The same schedulers choosing the grain of every loop themselves, as Spork
+# does.  -DPARLAY_IGNORE_GRANULARITY makes parallel_for ignore its granularity
+# argument (spork-parlaylib's never reads it), so every loop, in the benchmarks
+# and inside ParlayLib alike, gets its scheduler's rule for granularity 0:
+#   parlaylib-auto           ParlayLib's scheduler: runs 1, 2, 4, ... iterations
+#                            serially until a batch takes 1 us, then splits the
+#                            rest into tasks of at most max(iterations run,
+#                            n/(128P))
+#   parlaylib-openmp-auto    a taskloop with no clause: libomp makes
+#                            min(n, 10P) tasks
+#   parlaylib-opencilk-auto  a plain cilk_for: a compile-time strip size where
+#                            the compiler can cost the body (no calls, constant
+#                            inner trip counts), else min(2048, n/8P) at run time
+# It also makes par_do_if and par_do3_if fork whatever their condition, as
+# spork-parlaylib's do, so recursions such as quickHull's and the oct-tree
+# builds fork at every level (runs before 2026-10-28 20:40 kept the conditions).
+# Cutoffs that stay, in spork-parlaylib too: quicksort's 256, the sorts' base
+# cases, block sizes such as _block_size and _merge_base, and the benchmarks'
+# own if (n < X) paths.  The one difference left is reduce, which here runs up
+# to 1024 elements, and blocks of max(1024, 4 sqrt(n)), serially, where
+# spork-parlaylib's is a single reducing loop.
+AUTO_GRAIN_CFLAGS = "-DPARLAY_IGNORE_GRANULARITY"
+BACKENDS["parlaylib-auto"] = {
+    "base": "cap-parlaylib",
+    "cflags": AUTO_GRAIN_CFLAGS,
+    "lflags": "",
+    "threads_env": None,
+}
+for _backend in ("parlaylib-openmp", "parlaylib-opencilk"):
+    BACKENDS[_backend + "-auto"] = dict(
+        BACKENDS[_backend], cflags=BACKENDS[_backend]["cflags"] + " " + AUTO_GRAIN_CFLAGS)
+
+# Library names and the directories that hold their headers.  "parlaylib" is
+# ParlayLib with the scheduler-independent loop-body fixes made in hbf-parlaylib
+# (directory cap-parlaylib, branch capture-fixes of the ParlayLib repository):
+# loop bodies hold their captures by value where that is free
+# (internal/capped_copy.h), so byte-store loops need not reload them every
+# iteration.  "orig-parlaylib" is unmodified ParlayLib (directory parlaylib).
+# Every other library's directory has its own name.
+LIBRARY_DIRS = {"parlaylib": "cap-parlaylib", "orig-parlaylib": "parlaylib"}
+DIR_LIBRARIES = {d: name for name, d in LIBRARY_DIRS.items()}
+LIBRARIES = ["parlaylib", "orig-parlaylib", "pf-parlaylib", "hb-parlaylib",
+             "spork-parlaylib"] + list(BACKENDS)
+
+
+def runs_at(lib, cores):
+    """Whether lib is run at this core count (the sequential baseline only at 1)."""
+    return cores <= BACKENDS.get(lib, {}).get("max_cores", cores)
 
 
 def base_library(lib):
-    """The library directory a name refers to (backends share stock parlaylib)."""
-    return "parlaylib" if lib in BACKENDS else lib
+    """The library directory a name refers to (a backend builds from its "base")."""
+    return BACKENDS[lib]["base"] if lib in BACKENDS else LIBRARY_DIRS.get(lib, lib)
 # Libraries built with the Spork unroll plugin.
-SPORK_LIBRARIES = ["hb-parlaylib", "hb2-parlaylib", "hb3-parlaylib", "hbf-parlaylib", "ehb2-parlaylib", "ehbf-parlaylib"]
-# Of those, the ones that also need the heartbeat startup header force-included
-# (ehb2 sets itself up when its scheduler is constructed).
-STARTUP_HEADER_LIBRARIES = ["hb-parlaylib", "hb2-parlaylib", "hb3-parlaylib", "hbf-parlaylib"]
+SPORK_LIBRARIES = ["hb-parlaylib", "spork-parlaylib"]
+# Of those, the ones that also need the heartbeat startup header force-included.
+STARTUP_HEADER_LIBRARIES = ["hb-parlaylib", "spork-parlaylib"]
 # Libraries that hand stacks over at a join and still link Boost.Context for
-# the switch.  hbf-parlaylib carries its own copy (internal/fcontext.h).
-FIBER_LIBRARIES = ["pf-parlaylib", "ehbf-parlaylib"]
+# the switch.  spork-parlaylib carries its own copy (internal/fcontext.h).
+FIBER_LIBRARIES = ["pf-parlaylib"]
 
 BASE_CFLAGS = "-mcx16 -O3 -std=c++20 -DNDEBUG -I . -stdlib=libc++ -w"
 # Extra flags for one-off experiments, e.g. EXTRA_CFLAGS=-DNOGRAINS.  Recorded
@@ -281,6 +355,13 @@ def parse_args():
                         " thread per core; keep: do nothing about SMT")
     p.add_argument("--no-numa", action="store_true",
                    help="do not wrap multi-core runs in 'numactl -i all'")
+    p.add_argument("--one-core-cpu", type=nonneg_int, default=None, metavar="CPU",
+                   help="CPU that 1-core runs are pinned to, with their memory bound to that"
+                        " CPU's NUMA node (default: the lowest-numbered usable CPU on node 0"
+                        " other than CPU 0)")
+    p.add_argument("--no-pin", action="store_true",
+                   help="do not pin 1-core runs (they then run wherever the OS places them,"
+                        " with memory on whichever node it lands on)")
     p.add_argument("--timeout", type=nonneg_int, default=7200,
                    help="seconds allowed per benchmark process, 0 for unlimited (default: 7200)")
     p.add_argument("--dry-run", action="store_true",
@@ -438,6 +519,13 @@ def online_cpus():
     return sorted(os.sched_getaffinity(0))
 
 
+def cpu_node(cpu):
+    """The NUMA node of a CPU, or None if sysfs does not say."""
+    for path in glob.glob("/sys/devices/system/cpu/cpu%d/node[0-9]*" % cpu):
+        return int(os.path.basename(path)[len("node"):])
+    return None
+
+
 def one_thread_per_core(cpus):
     """Pick the lowest-numbered sibling of each physical core from `cpus`."""
     chosen = set()
@@ -524,8 +612,9 @@ class SmtManager:
 def current_library():
     target = os.readlink(os.path.join(PBBS_DIR, "parlaylib")) if \
         os.path.islink(os.path.join(PBBS_DIR, "parlaylib")) else ""
-    base = os.path.basename(target.rstrip("/"))
-    return base if base in LIBRARIES else None
+    name = DIR_LIBRARIES.get(os.path.basename(target.rstrip("/")),
+                             os.path.basename(target.rstrip("/")))
+    return name if name in LIBRARIES else None
 
 
 def select_library(lib):
@@ -589,6 +678,8 @@ class Runner:
         self.results = []           # per (library, benchmark, input, cores)
         self.failures = []
         self.cores = list(args.cores)
+        self.one_core_cpu = None        # set by choose_one_core_cpu before the runs
+        self.one_core_node = None
         self.finalized = False
         self.benchmarks = self.discover()
         if args.reuse_bin:
@@ -651,7 +742,7 @@ class Runner:
                         " parlay::parallel_for(0, 100000, [&](size_t i) { s += i; });"
                         " std::printf(\"%ld %zu\\n\", s.load(), parlay::num_workers()); }\n")
             cmd = [cxx] + shlex.split(BASE_CFLAGS + " " + b["cflags"]) + \
-                  ["-I", os.path.join(SCRIPT_DIR, "parlaylib", "include"), src, "-o", exe] + \
+                  ["-I", os.path.join(SCRIPT_DIR, base_library(lib), "include"), src, "-o", exe] + \
                   shlex.split(LFLAGS + " " + b["lflags"])
             r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             if r.returncode != 0:
@@ -666,6 +757,11 @@ class Runner:
                 [os.path.join(SCRIPT_DIR, "use-%s.sh" % base_library(lib)) for lib in self.libraries]:
             if not os.path.exists(path):
                 sys.exit("error: required file not found: %s" % path)
+        for lib in [l for l in self.libraries if not any(runs_at(l, c) for c in self.cores)]:
+            if lib in self.explicit_libraries:
+                sys.exit("error: %s runs only at %d core(s), which --cores does not include"
+                         % (lib, BACKENDS[lib]["max_cores"]))
+            self.libraries.remove(lib)
         for lib in [l for l in self.libraries if l in BACKENDS]:
             err = self.probe_backend(lib)
             if err is None:
@@ -694,6 +790,9 @@ class Runner:
             print("warning: numactl not found; running without memory interleaving",
                   file=sys.stderr)
             self.args.no_numa = True
+        if not self.args.no_pin and not shutil.which("numactl"):
+            print("warning: numactl not found; 1-core runs will not be pinned", file=sys.stderr)
+            self.args.no_pin = True
         if self.args.smt == "pin" and not shutil.which("taskset"):
             sys.exit("error: --smt pin requires taskset")
 
@@ -709,6 +808,26 @@ class Runner:
         if not usable:
             sys.exit("error: no requested core count fits on this machine")
         self.cores = usable
+        if 1 in self.cores and not self.args.no_pin:
+            self.choose_one_core_cpu()
+
+    def choose_one_core_cpu(self):
+        """Pick the CPU (and its NUMA node) that 1-core runs are pinned to."""
+        cpus = ([int(c) for c in self.smt.pin_list.split(",")] if self.smt.pin_list
+                else online_cpus())
+        if self.args.one_core_cpu is not None:
+            cpu = self.args.one_core_cpu
+            if cpu not in cpus:
+                sys.exit("error: --one-core-cpu %d is not a usable CPU (usable: %s)"
+                         % (cpu, ",".join(map(str, cpus))))
+        else:
+            # CPU 0 takes most housekeeping interrupts; prefer another CPU on node 0.
+            candidates = [c for c in cpus if c != 0 and cpu_node(c) in (0, None)] or cpus
+            cpu = candidates[0]
+        self.one_core_cpu = cpu
+        self.one_core_node = cpu_node(cpu)
+        print("1-core runs: pinned to CPU %d%s" % (cpu, "" if self.one_core_node is None
+              else ", memory bound to NUMA node %d" % self.one_core_node))
 
     # ---- build -----------------------------------------------------------
     def binary_path(self, lib, bench):
@@ -839,8 +958,8 @@ class Runner:
         """Generate every needed input once; benchmarks whose inputs fail are skipped."""
         print("=== Generating input data ===")
         # Generators are built against whatever pbbsbench/parlay points at;
-        # use stock parlaylib so plain g++ can compile them.
-        select_library("parlaylib")
+        # use unmodified parlaylib so plain g++ can compile them.
+        select_library("orig-parlaylib")
         wanted = {}
         for b in self.benchmarks:
             for inp in b.inputs:
@@ -874,6 +993,11 @@ class Runner:
     # ---- run -------------------------------------------------------------
     def run_command_prefix(self, cores):
         prefix = []
+        if cores == 1 and self.one_core_cpu is not None:
+            prefix += ["numactl", "--physcpubind=%d" % self.one_core_cpu]
+            if self.one_core_node is not None:
+                prefix += ["--membind=%d" % self.one_core_node]
+            return prefix
         if self.smt.pin_list:
             prefix += ["taskset", "-c", self.smt.pin_list]
         if cores > 1 and not self.args.no_numa:
@@ -959,14 +1083,14 @@ class Runner:
     def run_all(self):
         built = {(lib, b.name) for lib in self.libraries for b in self.benchmarks
                  if os.path.exists(self.binary_path(lib, b))}
-        total = len(built) * len(self.cores)
+        total = sum(1 for lib, _name in built for c in self.cores if runs_at(lib, c))
         done = 0
         print("=== Running: %d warmup + %d trials per input, cores %s ==="
               % (self.args.warmup, self.args.trials, self.cores))
         for bench in self.benchmarks:
             for cores in self.cores:
                 for lib in self.libraries:
-                    if (lib, bench.name) not in built:
+                    if (lib, bench.name) not in built or not runs_at(lib, cores):
                         continue
                     done += 1
                     print("[%d/%d] %s %s on %d core(s)" % (done, total, lib, bench.name, cores),
@@ -993,6 +1117,7 @@ class Runner:
             "warmup": self.args.warmup, "trials": self.args.trials,
             "cores": self.cores, "libraries": self.libraries,
             "smt_mode": self.args.smt, "numactl": not self.args.no_numa,
+            "one_core_cpu": self.one_core_cpu, "one_core_node": self.one_core_node,
             "pass": self.args.pass_name, "check": self.args.check,
             "max_inputs": self.args.max_inputs,
             "bin_dir": self.bin_dir,
@@ -1049,6 +1174,11 @@ class Runner:
                    " (pinned to CPUs %s)" % self.smt.pin_list if self.smt.pin_list else ""))
         out.append("- Memory interleaving: %s" % ("`numactl -i all` for >1 core"
                                                    if not self.args.no_numa else "off"))
+        if 1 in self.cores:
+            out.append("- 1-core runs: %s" % (
+                "not pinned" if self.one_core_cpu is None else
+                "pinned to CPU %d%s" % (self.one_core_cpu, "" if self.one_core_node is None
+                                        else ", memory bound to NUMA node %d" % self.one_core_node)))
         out.append("- Spork plugin: `%s`" % self.args.pass_name)
         out.append("- Cell format: mean seconds ± P90 error, where the P90 error is the 90th"
                    " percentile of |trial − mean| over the timed trials.")
@@ -1150,6 +1280,9 @@ class Runner:
         print("Cores: %s" % " ".join(map(str, self.cores)))
         print("Rounds: %d warmup + %d trials" % (self.args.warmup, self.args.trials))
         print("SMT mode: %s" % self.args.smt)
+        print("1-core runs: %s" % ("not pinned" if self.args.no_pin else
+              "pinned to CPU %d" % self.args.one_core_cpu if self.args.one_core_cpu is not None
+              else "pinned (CPU chosen after SMT setup)"))
         for b in self.benchmarks:
             print("%s%s (binary %s, data %s)" % (b.name, " [ext]" if b.extended else "",
                                                 b.binary_name, os.path.relpath(b.data_dir, PBBS_DIR)))

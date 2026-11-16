@@ -57,6 +57,9 @@ def parse_args():
                    help="as in run-pbbsbench-scaling.py (default: off)")
     p.add_argument("--pass", dest="pass_name", default="SporkUnrollPass",
                    help="Spork unroll plugin directory (default: SporkUnrollPass)")
+    p.add_argument("--llvm", choices=sorted(harness.LLVM_TOOLCHAINS), default=harness.DEFAULT_LLVM,
+                   help="as in run-pbbsbench-scaling.py: the LLVM for every library but OpenCilk,"
+                        " 19 (stock LLVM 19.1.7; default) or repo (clang 24)")
     p.add_argument("--output", help="result directory (default: microbench/results/<timestamp>)")
     return p.parse_args()
 
@@ -76,19 +79,19 @@ def build_flags(lib, plugin):
     return cflags, lflags
 
 
-def compiler(lib):
+def compiler(lib, clangxx):
     if harness.BACKENDS.get(lib, {}).get("cxx") == "opencilk":
         if not harness.OPENCILK_CXX_DEFAULT:
             sys.exit("error: %s needs the OpenCilk compiler (set OPENCILK_CXX)" % lib)
         return harness.OPENCILK_CXX_DEFAULT
-    return harness.CLANGXX
+    return clangxx
 
 
-def build(lib, bench, out, plugin):
+def build(lib, bench, out, clangxx, plugin):
     cflags, lflags = build_flags(lib, plugin)
     include = os.path.join(SCRIPT_DIR, harness.base_library(lib), "include")
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    cmd = ([compiler(lib)] + shlex.split(cflags) + ["-I", include, os.path.join(BENCH_DIR, bench + ".cpp"),
+    cmd = ([compiler(lib, clangxx)] + shlex.split(cflags) + ["-I", include, os.path.join(BENCH_DIR, bench + ".cpp"),
            "-o", out] + shlex.split(lflags))
     r = subprocess.run(cmd, capture_output=True, text=True, cwd=SCRIPT_DIR)
     if r.returncode != 0:
@@ -136,14 +139,17 @@ def main():
         sizes[name] = int(value)
     cores_list = [int(c) for c in args.cores.split(",")]
     output = args.output or os.path.join(BENCH_DIR, "results", datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
-    plugin = os.path.join(SCRIPT_DIR, args.pass_name, "build", "SporkUnroll.so")
+    clangxx, plugin_build = harness.LLVM_TOOLCHAINS[args.llvm]
+    if not os.path.exists(clangxx):
+        sys.exit("error: compiler not found: %s" % clangxx)
+    plugin = os.path.join(SCRIPT_DIR, args.pass_name, plugin_build, "SporkUnroll.so")
     if any(lib in harness.SPORK_LIBRARIES for lib in libraries) and not os.path.exists(plugin):
         sys.exit("error: plugin not found: %s" % plugin)
 
-    print("Building into %s" % output, flush=True)
+    print("Building into %s with %s" % (output, harness.compiler_version(clangxx)), flush=True)
     for lib in libraries:
         for bench in benches:
-            build(lib, bench, os.path.join(output, "bin", lib, bench), plugin)
+            build(lib, bench, os.path.join(output, "bin", lib, bench), clangxx, plugin)
 
     smt = harness.SmtManager(args.smt)
     results = []   # (bench, n, lib, cores, times)

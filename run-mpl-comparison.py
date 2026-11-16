@@ -42,9 +42,12 @@ Setup, in mpl-artifact/ (see its README.md):
                       sync installs) and inputs/words256.txt generated.  The C++
                       edits are left uncommitted there (git status, git diff).
 MPL benchmarks are compiled as the hb branch's scripts/compile.py compiles
-them with config/local-hb.json.  The C++ ones are compiled with the repo clang
-and the PBBS harness's flags (heartbeat libraries: Spork plugin and startup
-header; generic x86-64 unless --cpp-native) and linked with jemalloc.
+them with config/local-hb.json.  The C++ ones are compiled with stock LLVM
+19.1.7's clang (--llvm repo: the repo's clang 24, the default until
+2026-11-05) and the PBBS harness's flags (heartbeat libraries: the Spork
+plugin built against that LLVM and the startup header; generic x86-64 unless
+--cpp-native) and linked with jemalloc.  With --reuse-bin, the record names
+the clang that built the reused binaries.
 
 Two sequential baselines run at 1 core only:
   mlton  the same -ng MPL sources built with MLton (apt) as the hb branch's
@@ -94,8 +97,15 @@ import sys
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_ARTIFACT = os.path.join(SCRIPT_DIR, "mpl-artifact")
 SMT_CONTROL = "/sys/devices/system/cpu/smt/control"
-CLANG = os.path.join(SCRIPT_DIR, "llvm-project", "build", "bin", "clang++")
-SPORK_PLUGIN = os.path.join(SCRIPT_DIR, "SporkUnrollPass", "build", "SporkUnroll.so")
+# The LLVM that builds the C++ benchmarks (--llvm), as in run-pbbsbench-scaling.py:
+# its clang and the Spork plugin built against it.  "19" (the default) is stock
+# LLVM 19.1.7, "repo" the repo's llvm-project (clang 24).
+LLVM_TOOLCHAINS = {
+    "19": (os.path.join(SCRIPT_DIR, "llvm-19", "build", "bin", "clang++"),
+           os.path.join(SCRIPT_DIR, "SporkUnrollPass", "build-llvm19", "SporkUnroll.so")),
+    "repo": (os.path.join(SCRIPT_DIR, "llvm-project", "build", "bin", "clang++"),
+             os.path.join(SCRIPT_DIR, "SporkUnrollPass", "build", "SporkUnroll.so")),
+}
 STARTUP_HEADER = os.path.join(SCRIPT_DIR, "pbbsbench", "common", "spork_benchmark_startup.h")
 # Benchmark harnesses that must not run at the same time as this one.
 HARNESSES = r"[r]un-(pbbsbench-scaling|microbench|hbc-comparison|mpl-comparison)\.py"
@@ -194,6 +204,9 @@ def parse_args():
     p.add_argument("--cpp-native", action="store_true",
                    help="build the C++ benchmarks for -march=native (default generic x86-64)")
     p.add_argument("--cpp-flags", default="", help="extra C++ compiler flags, e.g. -DSPORK_NO_CLOCK")
+    p.add_argument("--llvm", choices=sorted(LLVM_TOOLCHAINS), default="19",
+                   help="LLVM for the C++ benchmarks, as in run-pbbsbench-scaling.py: 19 (stock LLVM "
+                        "19.1.7; default) or repo (the repo's llvm-project, clang 24)")
     p.add_argument("--one-core-cpu", type=int, default=None,
                    help="CPU for 1-core runs (default: the first core on NUMA node 0 other than CPU 0)")
     p.add_argument("--smt", choices=["off", "keep"], default="off",
@@ -230,6 +243,13 @@ def capture(cmd, cwd=None):
                               executable="/bin/bash").stdout.strip()
     except OSError:
         return ""
+
+
+def binary_compiler(path):
+    """The clang that compiled an executable: the "clang version" string in its
+    .comment section, which is that clang's --version line ("" if absent)."""
+    return capture(r"readelf -p .comment %s 2>/dev/null | sed -n 's/^ *\[ *[0-9a-f]*\] *//p' | "
+                   r"grep -m1 'clang version'" % shlex.quote(path))
 
 
 def parse_cpu_list(text):
@@ -356,6 +376,7 @@ class Comparison:
                         if not args.only or any(fnmatch.fnmatch(b.name, g) for g in args.only)]
         if not self.benches:
             sys.exit("error: no benchmarks selected")
+        self.clang, self.plugin = LLVM_TOOLCHAINS[args.llvm]
         self.artifact = os.path.abspath(args.artifact)
         self.pml = os.path.join(self.artifact, "parallel-ml-bench")
         self.mplc = os.path.join(self.artifact, "mpl", "build", "bin", "mpl")
@@ -400,14 +421,14 @@ class Comparison:
         lib_dir, heartbeat, extra = CPP_LIBS[system]
         flags = CPP_CFLAGS + (" " + extra if extra else "")
         if heartbeat:
-            flags += " -fpass-plugin=%s -DVOLATILE_UNROLL= -include %s" % (SPORK_PLUGIN, STARTUP_HEADER)
+            flags += " -fpass-plugin=%s -DVOLATILE_UNROLL= -include %s" % (self.plugin, STARTUP_HEADER)
         flags += " -I%s" % os.path.join(SCRIPT_DIR, lib_dir, "include")
         if self.args.cpp_native:
             flags += " -march=native"
         if self.args.cpp_flags:
             flags += " " + self.args.cpp_flags
         src = os.path.join(self.pml, "cpp", b.cpp + ".cpp")
-        return ("%s %s %s -o %s %s" % (CLANG, flags, src, shlex.quote(self.binary(b, system)), CPP_LFLAGS),
+        return ("%s %s %s -o %s %s" % (self.clang, flags, src, shlex.quote(self.binary(b, system)), CPP_LFLAGS),
                 os.path.join(self.pml, "cpp"))
 
     def placement(self, workers):
@@ -461,9 +482,10 @@ class Comparison:
                 need.append((os.path.join(self.pml, "mpl", "lib", "github.com", "mpllang", "mpllib",
                                           "sources.mpl.mlb"), "mpllib v0.4.0 missing from mpl/lib"))
             if any(s in CPP_LIBS for s in self.systems):
-                need.append((CLANG, "repo clang not built"))
+                need.append((self.clang, "clang for --llvm %s not built" % self.args.llvm))
             if any(CPP_LIBS[s][1] for s in self.systems if s in CPP_LIBS):
-                need += [(SPORK_PLUGIN, "Spork plugin not built"), (STARTUP_HEADER, "startup header missing")]
+                need += [(self.plugin, "Spork plugin for --llvm %s not built" % self.args.llvm),
+                         (STARTUP_HEADER, "startup header missing")]
             need += [(os.path.join(SCRIPT_DIR, CPP_LIBS[s][0], "include", "parlay"), "library missing")
                      for s in self.systems if s in CPP_LIBS]
         need += [(self.size(b), "input missing (in inputs/: cat words64.txt words64.txt words64.txt "
@@ -643,13 +665,21 @@ class Comparison:
         revs["parallel-ml-bench"] = git_revision(self.pml, untracked=True)
         return revs
 
+    def cpp_compiler(self):
+        """The clang that built the C++ binaries: --llvm's, or with --reuse-bin the one
+        the first reused C++ binary names ("" if none does)."""
+        if not self.args.reuse_bin:
+            return capture("%s --version | head -1" % shlex.quote(self.clang))
+        return next((c for c in (binary_compiler(self.binary(b, s)) for b in self.benches
+                                 for s in self.systems if s in CPP_LIBS) if c), "")
+
     def write_outputs(self):
         with open(os.path.join(self.out, "results.tsv"), "w") as f:
             f.write("workers\tbenchmark\tsystem\ttrial\tseconds\n")
             for (workers, name, system), ts in self.times.items():
                 for i, t in enumerate(ts):
                     f.write("%d\t%s\t%s\t%d\t%.6f\n" % (workers, name, system, i, t))
-        heartbeats, revisions = self.heartbeats(), self.revisions()
+        heartbeats, revisions, clang = self.heartbeats(), self.revisions(), self.cpp_compiler()
         config = {
             "date": datetime.datetime.now().isoformat(timespec="seconds"),
             "args": vars(self.args), "systems": self.systems, "workers": self.workers,
@@ -660,8 +690,7 @@ class Comparison:
             "heartbeats": heartbeats, "revisions": revisions,
             "cpp_edits": capture("git -C %s status --porcelain" % shlex.quote(self.pml)).splitlines(),
             "one_core_cpu": self.one_core_cpu, "cores": len(self.cores),
-            "compilers": {"clang": capture("%s --version | head -1" % CLANG),
-                          "mpl": revisions.get("mpl", "")},
+            "compilers": {"clang": clang, "mpl": revisions.get("mpl", "")},
             "cpu": capture("lscpu | grep 'Model name' | sed 's/.*: *//'"),
             "checks": [{"benchmark": n, "check": l, "values": {s: sorted(v) for s, v in vals.items()},
                         "status": st} for n, l, vals, st in self.check_rows()],
@@ -690,8 +719,9 @@ class Comparison:
                      self.args.warmup, self.args.trials, self.args.processes),
                  "- Sizes: `%s`; MPL grains: %s" % (self.args.size, grains),
                  "- Heartbeats: %s" % "; ".join("%s %s" % kv for kv in heartbeats.items()),
-                 "- C++: %s%s" % ("-march=native" if self.args.cpp_native else "generic x86-64",
-                                  ", flags %s" % self.args.cpp_flags if self.args.cpp_flags else ""),
+                 "- C++: `%s`, %s%s" % (clang or "unknown",
+                                        "-march=native" if self.args.cpp_native else "generic x86-64",
+                                        ", flags %s" % self.args.cpp_flags if self.args.cpp_flags else ""),
                  "- Revisions: %s" % ", ".join("%s %s" % kv for kv in revisions.items())]
         for workers in self.workers:
             systems = [s for s in self.systems if self.runs_at(s, workers)]

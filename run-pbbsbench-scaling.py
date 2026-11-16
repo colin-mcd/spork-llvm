@@ -14,6 +14,12 @@ Each run performs
 ``warmup + trials`` in-process rounds; the first ``warmup`` rounds are
 discarded and the remaining ``trials`` rounds are averaged.
 
+Every library but the OpenCilk backends is compiled with stock LLVM 19.1.7,
+the version OpenCilk 3.0 is based on, and the Spork plugin built against it;
+--llvm repo compiles them with the repo's clang (clang 24), the default until
+2026-11-05.  Runs on reused binaries (--reuse-bin, --no-build) record the
+clang that built them, which their .comment sections name, not --llvm's.
+
 SMT is disabled through /sys/devices/system/cpu/smt/control for the duration
 of the benchmark (and restored afterwards).  See ``--smt`` for alternatives.
 Multi-core runs interleave their memory across NUMA nodes (numactl -i all);
@@ -55,7 +61,16 @@ from concurrent.futures import ThreadPoolExecutor
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PBBS_DIR = os.path.join(SCRIPT_DIR, "pbbsbench")
 GBBS_DIR = os.path.join(SCRIPT_DIR, "gbbs")
-CLANGXX = os.path.join(SCRIPT_DIR, "llvm-project", "build", "bin", "clang++")
+# The LLVM that builds every library but the OpenCilk backends (--llvm), and
+# the build of the Spork plugin made against it: "19" (the default) is stock
+# LLVM 19.1.7 (llvm-19/, from ~/install-toolchains.sh), the version OpenCilk
+# 3.0 is based on, so that a comparison with parlaylib-opencilk is not also
+# one between compilers; "repo" is the repo's llvm-project (clang 24).
+LLVM_TOOLCHAINS = {
+    "19": (os.path.join(SCRIPT_DIR, "llvm-19", "build", "bin", "clang++"), "build-llvm19"),
+    "repo": (os.path.join(SCRIPT_DIR, "llvm-project", "build", "bin", "clang++"), "build"),
+}
+DEFAULT_LLVM = "19"
 STARTUP_HEADER = os.path.join(PBBS_DIR, "common", "spork_benchmark_startup.h")
 SMT_CONTROL = "/sys/devices/system/cpu/smt/control"
 SMT_ACTIVE = "/sys/devices/system/cpu/smt/active"
@@ -188,6 +203,33 @@ def runs_at(lib, cores):
 def base_library(lib):
     """The library directory a name refers to (a backend builds from its "base")."""
     return BACKENDS[lib]["base"] if lib in BACKENDS else LIBRARY_DIRS.get(lib, lib)
+
+
+def compiler_version(cxx):
+    """The first line of `cxx --version`, or None if it does not run."""
+    try:
+        r = subprocess.run([cxx, "--version"], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, text=True)
+    except OSError:
+        return None
+    return r.stdout.splitlines()[0] if r.returncode == 0 and r.stdout else None
+
+
+def binary_compiler(path):
+    """The clang that compiled an executable: the "clang version" string in its
+    .comment section, which is that clang's `--version` line (None if absent)."""
+    try:
+        r = subprocess.run(["readelf", "-p", ".comment", path], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, text=True)
+    except OSError:
+        return None
+    # Lines look like "  [    2d]  clang version 19.1.7 (https://... cd708029...)".
+    for line in r.stdout.splitlines():
+        if "clang version" in line and "]" in line:
+            return line.split("]", 1)[1].strip()
+    return None
+
+
 # Libraries built with the Spork unroll plugin.
 SPORK_LIBRARIES = ["hb-parlaylib", "spork-parlaylib"]
 # Of those, the ones that also need the heartbeat startup header force-included.
@@ -333,7 +375,13 @@ def parse_args():
                    help="only run the first N inputs listed in each family's testInputs"
                         " (default: all)")
     p.add_argument("--pass", dest="pass_name", default="SporkUnrollPass",
-                   help="Spork unroll plugin directory: SporkUnrollPass (default) or gempass")
+                   help="Spork unroll plugin directory: SporkUnrollPass (default) or gempass;"
+                        " none builds the spork libraries without a plugin")
+    p.add_argument("--llvm", choices=sorted(LLVM_TOOLCHAINS), default=DEFAULT_LLVM,
+                   help="LLVM for every library but the OpenCilk backends: 19 (stock LLVM 19.1.7"
+                        " in llvm-19/, the version OpenCilk 3.0 is based on; default) or repo (the"
+                        " repo's llvm-project, clang 24); the Spork plugin is the build made"
+                        " against it (<pass>/build-llvm19 or <pass>/build)")
     p.add_argument("--output", metavar="DIR",
                    help="result directory (default: pbbsbench-scaling/<timestamp>)")
     p.add_argument("--no-build", action="store_true",
@@ -347,8 +395,8 @@ def parse_args():
     p.add_argument("--build-jobs", type=positive_int, default=os.cpu_count() or 1,
                    help="concurrent benchmark builds (default: all %d CPUs)" % (os.cpu_count() or 1))
     p.add_argument("--check", action="store_true",
-                   help="run the PBBS correctness checker once per benchmark and library"
-                        " (at the largest core count)")
+                   help="build the PBBS correctness checkers and run each once per benchmark"
+                        " and library (at the largest core count); builds without it skip them")
     p.add_argument("--smt", choices=["off", "pin", "keep"], default="off",
                    help="off: disable SMT via sysfs while benchmarking (default, needs root"
                         " or sudo); pin: keep SMT on but restrict benchmarks to one hardware"
@@ -665,7 +713,11 @@ class Runner:
         self.libraries = (list(LIBRARIES) if {"all", "both"} & set(chosen)
                           else [l for l in LIBRARIES if l in chosen])
         self.explicit_libraries = {l for l in chosen if l in LIBRARIES}
-        self.plugin = os.path.join(SCRIPT_DIR, args.pass_name, "build", "SporkUnroll.so")
+        self.clangxx, plugin_build = LLVM_TOOLCHAINS[args.llvm]
+        self.llvm, self.clang_version = args.llvm, compiler_version(self.clangxx)
+        # --pass none: the spork libraries are built without a plugin (build_flags).
+        self.plugin = (None if args.pass_name == "none" else
+                       os.path.join(SCRIPT_DIR, args.pass_name, plugin_build, "SporkUnroll.so"))
         now = datetime.datetime.now()
         stamp = now.strftime("%Y%m%d-%H%M%S")
         self.started = now.isoformat(timespec="seconds")
@@ -693,6 +745,12 @@ class Runner:
                 if not os.path.isdir(os.path.join(src, "bin")):
                     sys.exit("error: --reuse-bin: %s has no bin/ directory" % src)
             self.bin_dir = os.path.join(src, "bin")
+        if args.reuse_bin or args.no_build:
+            # Reused binaries need not come from --llvm's clang: record the one that built them.
+            self.clang_version = self.binaries_compiler()
+            self.llvm = next((name for name, (cxx, _) in LLVM_TOOLCHAINS.items()
+                              if self.clang_version and compiler_version(cxx) == self.clang_version),
+                             None)
 
     # ---- discovery -------------------------------------------------------
     def discover(self):
@@ -723,7 +781,19 @@ class Runner:
     def compiler_for(self, lib):
         if BACKENDS.get(lib, {}).get("cxx") == "opencilk":
             return self.args.opencilk_cxx
-        return CLANGXX
+        return self.clangxx
+
+    def binaries_compiler(self):
+        """The clang that built the binaries of the libraries --llvm compiles, as the
+        first of them present names it (None if there is none)."""
+        for lib in self.libraries:
+            if self.compiler_for(lib) != self.clangxx:
+                continue
+            for b in self.benchmarks:
+                version = binary_compiler(self.binary_path(lib, b))
+                if version:
+                    return version
+        return None
 
     def probe_backend(self, lib):
         """Try to build and run a tiny program on this backend; return None or an error string."""
@@ -753,7 +823,7 @@ class Runner:
         return None
 
     def preflight(self):
-        for path in [CLANGXX, os.path.join(SCRIPT_DIR, "use-parlaylib.sh")] + \
+        for path in [self.clangxx, os.path.join(SCRIPT_DIR, "use-parlaylib.sh")] + \
                 [os.path.join(SCRIPT_DIR, "use-%s.sh" % base_library(lib)) for lib in self.libraries]:
             if not os.path.exists(path):
                 sys.exit("error: required file not found: %s" % path)
@@ -770,7 +840,7 @@ class Runner:
                 sys.exit("error: %s is not usable: %s" % (lib, err))
             print("warning: skipping %s: %s" % (lib, err.splitlines()[0]), file=sys.stderr)
             self.libraries.remove(lib)
-        if any(lib in SPORK_LIBRARIES for lib in self.libraries):
+        if self.plugin and any(lib in SPORK_LIBRARIES for lib in self.libraries):
             if not os.path.exists(self.plugin):
                 sys.exit("error: required file not found: %s" % self.plugin)
         if any(lib in STARTUP_HEADER_LIBRARIES for lib in self.libraries):
@@ -835,9 +905,12 @@ class Runner:
 
     def build_flags(self, lib):
         cflags, lflags = BASE_CFLAGS, LFLAGS
-        if lib in SPORK_LIBRARIES:
+        if lib in SPORK_LIBRARIES and self.plugin:
             # VOLATILE_UNROLL opts the spork loops into the plugin's unrolling
-            # (empty, like the #define some spork libraries still carry).
+            # (empty, like the #define some spork libraries still carry).  With
+            # --pass none neither is passed: the loops then pay their volatile
+            # bound and progress store every iteration, and nothing batches or
+            # vectorizes them for the plugin (spork_parfor.h).
             cflags += " -fpass-plugin=%s -DVOLATILE_UNROLL=" % self.plugin
         if lib in STARTUP_HEADER_LIBRARIES:
             cflags += " -include %s" % STARTUP_HEADER
@@ -898,6 +971,12 @@ class Runner:
         log = os.path.join(self.log_dir, lib, bench.log_stem + ".build.log")
         cmd = ["make", "-B", "-s", "-C", bench.dir, "CC=" + self.compiler_for(lib),
                "CFLAGS=" + cflags, "LFLAGS=" + lflags]
+        if not self.args.check:
+            # Only --check runs the checker, so only --check builds it: a checker that
+            # fails to compile (integerSort's crashes OpenCilk under
+            # PARLAY_IGNORE_GRANULARITY) must not cost the timed binary.  -o keeps make
+            # from remaking it where common/MakeBenchLink makes it a prerequisite.
+            cmd += ["-o", "../bench/%sCheck" % bench.binary_name, bench.binary_name, "testInputs"]
         print("[%s] building %s" % (lib, bench.name), flush=True)
         # Variants of one family share ../bench (checker, Time.C); serialize them.
         with family_locks[bench.family]:
@@ -1068,10 +1147,16 @@ class Runner:
 
     def run_check(self, lib, bench, inp, inputs, out_file):
         cmd = [bench.check_program] + shlex.split(inp["check_opts"]) + inputs + [out_file]
-        r = subprocess.run(cmd, cwd=bench.dir, stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, text=True)
-        problems = [l for l in r.stdout.splitlines() if l and not l.startswith(":")]
-        if r.returncode != 0 or problems:
+        try:
+            r = subprocess.run(cmd, cwd=bench.dir, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True)
+            output, returncode = r.stdout, r.returncode
+        except FileNotFoundError:
+            # Only builds with --check make checkers (see build_one), so binaries
+            # reused through --no-build or --reuse-bin can come without one.
+            output, returncode = "checker %s not built\n" % bench.check_program, 1
+        problems = [l for l in output.splitlines() if l and not l.startswith(":")]
+        if returncode != 0 or problems:
             self.failures.append((lib, bench.name, "CHECK_FAILED",
                                   "%s: %s" % (inp["label"], " | ".join(problems)[:300])))
             print("  CHECK FAILED %s %s [%s]" % (lib, bench.name, inp["label"]), flush=True)
@@ -1119,6 +1204,7 @@ class Runner:
             "smt_mode": self.args.smt, "numactl": not self.args.no_numa,
             "one_core_cpu": self.one_core_cpu, "one_core_node": self.one_core_node,
             "pass": self.args.pass_name, "check": self.args.check,
+            "llvm": self.llvm, "clang": self.clang_version,
             "max_inputs": self.args.max_inputs,
             "bin_dir": self.bin_dir,
             "benchmarks": [b.name for b in self.benchmarks],
@@ -1180,6 +1266,8 @@ class Runner:
                 "pinned to CPU %d%s" % (self.one_core_cpu, "" if self.one_core_node is None
                                         else ", memory bound to NUMA node %d" % self.one_core_node)))
         out.append("- Spork plugin: `%s`" % self.args.pass_name)
+        out.append("- Compiler for every library but the OpenCilk backends (`--llvm %s`): `%s`"
+                   % (self.llvm or "?", self.clang_version or "unknown"))
         out.append("- Cell format: mean seconds ± P90 error, where the P90 error is the 90th"
                    " percentile of |trial − mean| over the timed trials.")
         out.append("- Per-benchmark rows combine a benchmark's inputs by taking, for each"
@@ -1277,6 +1365,7 @@ class Runner:
         if self.args.no_build or self.args.reuse_bin:
             print("Binaries: %s (not rebuilding)" % self.bin_dir)
         print("Libraries: %s" % " ".join(self.libraries))
+        print("Compiler (--llvm %s): %s" % (self.llvm or "?", self.clang_version or "unknown"))
         print("Cores: %s" % " ".join(map(str, self.cores)))
         print("Rounds: %d warmup + %d trials" % (self.args.warmup, self.args.trials))
         print("SMT mode: %s" % self.args.smt)

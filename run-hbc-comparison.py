@@ -10,14 +10,10 @@ sets.
 Every library runs the benchmark's own source file, on the artifact's cached
 inputs and with its timing loop (utility::run / taskparts::benchmark), so only
 the implementation differs:
-  hbc      the artifact's HBC build, exactly as scripts/evaluation/scaling.sh
-           makes it (make hbc ... ACC=true CHUNKSIZE=1; for kmeans the manual
-           heartbeat version, make hbm, as the artifact does).  Its Makefiles
-           compile the sources to bitcode without -march=native and pass it
-           only to the final link, which leaves every function the bitcode
-           already holds compiled for generic x86-64; --hbc-native adds
-           -march=native to the bitcode step as well (HBC's transformation
-           then fails on cg and the spmv benchmarks)
+  hbc      the artifact's HBC build, as scripts/evaluation/scaling.sh makes
+           it (make hbc ... ACC=true CHUNKSIZE=1; for kmeans the manual
+           heartbeat version, make hbm, as the artifact does), except for the
+           target (below)
   spork    the USE_PARLAY implementation built against spork-parlaylib (every
            loop HBC parallelizes is a parallel loop there, inner loops included)
   cilk-auto
@@ -33,15 +29,34 @@ and two sequential baselines, which run on one core only:
   baseline the artifact's serial code (make baseline, -DUSE_BASELINE), built
            like hbc (clang 14, the same targets): hbc's baseline
   seq      the USE_PARLAY implementation on cap-parlaylib with
-           -DPARLAY_SEQUENTIAL (no scheduler; repo clang, spork's target): the
-           ParlayLib libraries' baseline
-All builds use the artifact's code generation flags (-O3 -march=native, no
-vectorization, no FP contraction) and its jemalloc, except that spork and seq
-target generic x86-64 by default (--spork-native builds both for
--march=native like the others).  --generic compiles every build for generic
-x86-64 instead, HBC's final link included.  --spork-vectorize lets the Spork
-plugin vectorize spork's parallel loops (it vectorizes a probe of each loop
-and inlines it in the loop's place); everything else stays unvectorized.
+           -DPARLAY_SEQUENTIAL (no scheduler; spork's compiler and target):
+           the ParlayLib libraries' baseline
+spork, stock and seq are compiled with stock LLVM 19.1.7, the version
+OpenCilk 3.0 is based on, spork with the Spork plugin built against it;
+--llvm repo compiles them with the repo's clang 24, the default until
+2026-11-05.  cilk and cilk-auto use OpenCilk's clang, and hbc, baseline and
+stock14 clang 14.  hbc's and baseline's builds optimize nothing until their
+last command, which compiles the linked bitcode at -O3 into the binary (the
+front end runs no passes, NOELLE only normalizes, HBC transforms);
+--hbc-final-llvm runs that command with --llvm's clang, which reads LLVM 14
+bitcode, so their optimizer and code generator are the ParlayLib libraries'
+while their front end, normalization and HBC stay on LLVM 14.  With
+--reuse-bin, the record names the clang that built the reused binaries (for
+hbc and baseline, as the reused run recorded it).
+All builds use the artifact's code generation flags (-O3, no FP contraction)
+and its jemalloc but leave vectorization on (the artifact's Makefiles turn it
+off; hbc and baseline get an OPTS without -fno-vectorize -fno-slp-vectorize),
+and target x86-64 with generic tuning (-march=x86-64 -mtune=generic), HBC's
+final link included, so every library runs code for the same target.
+--native builds for this machine instead: the ParlayLib builds get
+-march=native -mtune=native, and hbc and baseline the artifact's own target:
+its Makefiles compile the sources to bitcode without -march and pass
+-march=native only to the final link, which leaves every function the
+bitcode already holds generic, so only the loops HBC generates come out
+native.  --hbc-native compiles hbc's and baseline's bitcode for -march=native
+too (HBC's transformation then fails on cg and the spmv benchmarks).  Every
+build defines NDEBUG, so asserts are compiled out (the artifact's Makefiles
+leave them in; hbc and baseline get -DNDEBUG through FLAGS).
 
 Each run is one process that repeats the benchmark's timed body
 ``warmup + trials`` times with no time-based warmup; the first ``warmup``
@@ -85,6 +100,17 @@ import sys
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_ARTIFACT = os.path.join(SCRIPT_DIR, "hbc-artifact", "hbc-asplos24-artifact")
 LLVM14 = "/usr/lib/llvm-14"
+# The LLVM of stock, spork and seq (--llvm, passed to build.sh as PARLAY_LLVM),
+# as in run-pbbsbench-scaling.py: its clang and the Spork plugin built against
+# it.  "19" (the default) is stock LLVM 19.1.7, "repo" the repo's llvm-project
+# (clang 24).
+LLVM_TOOLCHAINS = {
+    "19": (os.path.join(SCRIPT_DIR, "llvm-19", "build", "bin", "clang++"),
+           os.path.join(SCRIPT_DIR, "SporkUnrollPass", "build-llvm19", "SporkUnroll.so")),
+    "repo": (os.path.join(SCRIPT_DIR, "llvm-project", "build", "bin", "clang++"),
+             os.path.join(SCRIPT_DIR, "SporkUnrollPass", "build", "SporkUnroll.so")),
+}
+LLVM_LIBS = ("stock", "spork", "seq")
 SMT_CONTROL = "/sys/devices/system/cpu/smt/control"
 
 # name, directory (relative to the artifact), HBC make target and variables,
@@ -112,15 +138,16 @@ BASELINE = {"hbc": "baseline", "spork": "seq", "stock": "seq", "cilk": "seq", "c
             "stock14": "seq"}
 # Libraries whose heartbeat settings are compiled in, read from their headers for the record.
 HEARTBEAT_LIBS = ("spork",)
-# The target of --generic.  The last -march on a command line wins, so it is
-# appended to the ParlayLib builds' flags; HBC's final link takes OPTS, which
-# every benchmark Makefile sets to -O3 -march=native -fno-vectorize
-# -fno-slp-vectorize, so --generic gives make that OPTS with this target.
+# The default target, which scripts/parlay/build.sh pins.  HBC's final link
+# takes OPTS, which every benchmark Makefile sets to -O3 -march=native
+# -fno-vectorize -fno-slp-vectorize, so make gets HBC_OPTS instead, which
+# leaves vectorization on: with this target, or with the Makefiles'
+# -march=native under --native or --hbc-native.  --native appends NATIVE_MARCH
+# to the ParlayLib builds' flags (the last -march and -mtune on a command line
+# win).
 GENERIC_MARCH = "-march=x86-64 -mtune=generic"
-HBC_GENERIC_OPTS = "OPTS=-O3 %s -fno-vectorize -fno-slp-vectorize" % GENERIC_MARCH
-# ParlayLib libraries built for generic x86-64 even without --generic (seq
-# follows spork, whose baseline it is).
-DEFAULT_GENERIC_LIBS = ("spork", "seq")
+HBC_OPTS = "OPTS=-O3 %s"
+NATIVE_MARCH = "-march=native -mtune=native"
 
 
 def parse_args():
@@ -146,19 +173,22 @@ def parse_args():
     p.add_argument("--heartbeat-us", type=int, default=None,
                    help="HBC heartbeat interval (default: HEARTBEAT_USECS from the artifact's env.sh); "
                         "spork's interval is compiled in (HEARTBEAT_INTERVAL_US)")
-    target = p.add_mutually_exclusive_group()
-    target.add_argument("--hbc-native", action="store_true",
-                        help="compile HBC's bitcode with -march=native too, like the native ParlayLib builds "
-                             "(by default the artifact's kernels are generic x86-64)")
-    target.add_argument("--generic", action="store_true",
-                        help="compile everything for generic x86-64: the ParlayLib builds and HBC's final "
-                             "link get %s (HBC's bitcode already is generic)" % GENERIC_MARCH)
-    p.add_argument("--spork-native", action="store_true",
-                   help="build spork and its baseline seq for -march=native like the other ParlayLib "
-                        "libraries (by default they target generic x86-64)")
-    p.add_argument("--spork-vectorize", action="store_true",
-                   help="let the Spork plugin vectorize spork's parallel loops (it vectorizes a probe "
-                        "of each loop and inlines it); by default nothing is vectorized, as in the artifact")
+    p.add_argument("--native", action="store_true",
+                   help="build for this machine instead of generic x86-64 (%s): the ParlayLib builds get "
+                        "%s, hbc and baseline the artifact's own target (bitcode generic x86-64, final link "
+                        "-march=native)" % (GENERIC_MARCH, NATIVE_MARCH))
+    p.add_argument("--hbc-native", action="store_true",
+                   help="compile hbc and baseline for -march=native throughout, bitcode included (HBC's "
+                        "transformation then fails on cg and the spmv benchmarks); the ParlayLib builds "
+                        "follow --native")
+    p.add_argument("--llvm", choices=sorted(LLVM_TOOLCHAINS), default="19",
+                   help="LLVM for stock, spork and seq, as in run-pbbsbench-scaling.py: 19 (stock LLVM "
+                        "19.1.7, the version OpenCilk 3.0 is based on; default) or repo (the repo's "
+                        "llvm-project, clang 24)")
+    p.add_argument("--hbc-final-llvm", action="store_true",
+                   help="compile hbc's and baseline's last step, the -O3 compile of the linked bitcode "
+                        "(all of their optimization and code generation), with --llvm's clang instead of "
+                        "clang 14; the front end, NOELLE and HBC stay on LLVM 14")
     p.add_argument("--smt", choices=["off", "keep"], default="off",
                    help="off: disable SMT for the runs and restore it afterwards (needs sudo); "
                         "keep: leave SMT as it is")
@@ -171,8 +201,6 @@ def parse_args():
                    help="skip building; take binaries from DIR/bin of an earlier run")
     p.add_argument("--dry-run", action="store_true", help="print the plan and exit")
     args = p.parse_args()
-    if args.generic and args.spork_native:
-        p.error("argument --spork-native: not allowed with argument --generic")
     try:
         args.workers = sorted({int(w) for w in args.workers.split(",") if w.strip()})
     except ValueError:
@@ -200,6 +228,13 @@ def capture(cmd, cwd=None):
                               executable="/bin/bash").stdout.strip()
     except OSError:
         return ""
+
+
+def binary_compiler(path):
+    """The clang that compiled an executable: the "clang version" string in its
+    .comment section, which is that clang's --version line ("" if absent)."""
+    return capture(r"readelf -p .comment %s 2>/dev/null | sed -n 's/^ *\[ *[0-9a-f]*\] *//p' | "
+                   r"grep -m1 'clang version'" % shlex.quote(path))
 
 
 def parse_cpu_list(text):
@@ -309,6 +344,11 @@ class Comparison:
         if "hbc" in self.libs and not self.args.reuse_bin:
             need += [(os.path.join(self.artifact, "heartbeatcompiler", "build", "lib", "Heartbeat.so"),
                       "HBC not built (heartbeatcompiler/build/lib/Heartbeat.so)")]
+        if (any(l in LLVM_LIBS for l in self.libs) or self.args.hbc_final_llvm) and not self.args.reuse_bin:
+            clang, plugin = LLVM_TOOLCHAINS[self.args.llvm]
+            need.append((clang, "clang for --llvm %s not built" % self.args.llvm))
+            if "spork" in self.libs:
+                need.append((plugin, "Spork plugin for --llvm %s not built" % self.args.llvm))
         for path, msg in need:
             if not os.path.exists(path):
                 sys.exit("error: %s: %s" % (msg, path))
@@ -347,9 +387,18 @@ class Comparison:
         os.makedirs(self.bin, exist_ok=True)
         env = self.hbc_env()
         # The Makefiles append their bitcode flags to FLAGS (FLAGS += ...), so
-        # a FLAGS from the environment is prepended to them.
-        hbc_env = dict(env, FLAGS="-march=native") if self.args.hbc_native else env
-        hbc_vars = shlex.quote(HBC_GENERIC_OPTS) if self.args.generic else ""
+        # a FLAGS from the environment is prepended to them.  NDEBUG goes there:
+        # the Makefiles leave asserts in, and build.sh compiles them out.
+        hbc_env = dict(env, FLAGS=("-march=native " if self.args.hbc_native else "") + "-DNDEBUG")
+        parlay_env = dict(env, PARLAY_LLVM=self.args.llvm)
+        native = self.args.native or self.args.hbc_native
+        hbc_vars = shlex.quote(HBC_OPTS % ("-march=native" if native else GENERIC_MARCH))
+        if self.args.hbc_final_llvm:
+            # The final binaries' recipes compile the linked bitcode with $(CXX) at OPTS: give just
+            # those recipes --llvm's clang.  "private" keeps it from their prerequisites, which
+            # compile sources to bitcode for LLVM 14's NOELLE with clang 14.
+            hbc_vars += " --eval=" + shlex.quote("heartbeat_compiler heartbeat_manual baseline: private CXX := %s"
+                                                 % LLVM_TOOLCHAINS[self.args.llvm][0])
 
         def make(name, bdir, lib, target, binary, make_vars):
             """Build lib with one of the artifact's make targets, as its scripts do."""
@@ -375,9 +424,8 @@ class Comparison:
                 cmd = "%s %s %s %s/%s-%s -DINPUT_%s %s %s" % (
                     os.path.join(self.artifact, "scripts", "parlay", "build.sh"), shlex.quote(bdir),
                     PARLAY_LIBS[lib], shlex.quote(self.bin), name, lib, self.args.input_size.upper(),
-                    macros.format(artifact=self.artifact), GENERIC_MARCH if self.generic(lib) else "")
-                lib_env = dict(env, SPORK_VECTORIZE="1") if self.vectorized(lib) else env
-                self.report_build(name, lib, sh(cmd, log, cwd=self.artifact, env=lib_env))
+                    macros.format(artifact=self.artifact), NATIVE_MARCH if self.args.native else "")
+                self.report_build(name, lib, sh(cmd, log, cwd=self.artifact, env=parlay_env))
 
     def report_build(self, name, lib, rc):
         status = "ok" if rc == 0 else "FAILED (see logs/build-%s-%s.log)" % (name, lib)
@@ -443,17 +491,9 @@ class Comparison:
                             name, lib, statistics.mean(trials), " ".join("%.3f" % t for t in trials)), flush=True)
 
     # ---- report ------------------------------------------------------------
-    def generic(self, lib):
-        """Whether ParlayLib library lib is built for generic x86-64 (else -march=native)."""
-        return self.args.generic or (lib in DEFAULT_GENERIC_LIBS and not self.args.spork_native)
-
-    def vectorized(self, lib):
-        """Whether library lib is built with the Spork plugin's vectorization on."""
-        return lib == "spork" and self.args.spork_vectorize
-
     def targets(self):
         """What each build was compiled for."""
-        if self.args.generic:
+        if not (self.args.native or self.args.hbc_native):
             parts = ["everything generic x86-64 (%s)" % GENERIC_MARCH]
         else:
             parts = []
@@ -462,10 +502,10 @@ class Comparison:
                 parts.append("%s -march=native, bitcode included" % " and ".join(made) if self.args.hbc_native
                              else "%s bitcode generic x86-64, final link -march=native (artifact default)"
                              % " and ".join(made))
-            parts += ["%s %s" % (lib, "generic x86-64" if self.generic(lib) else "-march=native")
+            parts += ["%s %s" % (lib, NATIVE_MARCH if self.args.native else "generic x86-64")
                       for lib in self.libs if lib not in ("hbc", "baseline")]
-        vec = [lib for lib in self.libs if self.vectorized(lib)]
-        parts.append("vectorized: %s (Spork plugin)" % ", ".join(vec) if vec else "nothing vectorized")
+        parts.append("vectorization on")
+        parts.append("asserts compiled out (-DNDEBUG)")
         return "; ".join(parts)
 
     def library_revision(self, lib):
@@ -485,6 +525,29 @@ class Comparison:
         header = os.path.join(SCRIPT_DIR, LIBRARY_DIRS[lib], "include", "parlay", "internal", "spork_scheduler.h")
         get = lambda name: capture("grep -oP '%s = \\K[0-9]+' %s" % (name, shlex.quote(header)))
         return {"interval_us": get("HEARTBEAT_INTERVAL_US"), "coarsening_factor": get("HEARTBEAT_COARSENING_FACTOR")}
+
+    def llvm_compiler(self):
+        """The clang that built stock, spork and seq: --llvm's, or with --reuse-bin the one
+        the first reused binary of them names ("" if none does)."""
+        if not self.args.reuse_bin:
+            return capture("%s --version | head -1" % shlex.quote(LLVM_TOOLCHAINS[self.args.llvm][0]))
+        return next((c for c in (binary_compiler(os.path.join(self.bin, "%s-%s" % (b[0], l)))
+                                 for b in self.benches for l in self.libs if l in LLVM_LIBS) if c), "")
+
+    def hbc_final_compiler(self):
+        """The clang of hbc's and baseline's final -O3 compile: clang 14, or --llvm's with
+        --hbc-final-llvm.  Their binaries name only clang 14 (compiling bitcode adds no .comment
+        entry), so with --reuse-bin it is what the reused run recorded: clang 14 for runs from
+        before the option, "" without a config.json."""
+        if not self.args.reuse_bin:
+            cxx = LLVM_TOOLCHAINS[self.args.llvm][0] if self.args.hbc_final_llvm else os.path.join(LLVM14, "bin", "clang++")
+            return capture("%s --version | head -1" % shlex.quote(cxx))
+        try:
+            with open(os.path.join(os.path.abspath(self.args.reuse_bin), "config.json")) as f:
+                compilers = json.load(f).get("compilers", {})
+        except (OSError, ValueError):
+            return ""
+        return compilers.get("hbc_final") or compilers.get("clang14", "")
 
     def mean(self, workers, name, lib):
         ts = self.times.get((workers, name, lib))
@@ -535,6 +598,7 @@ class Comparison:
             for (workers, name, lib), ts in self.times.items():
                 for i, t in enumerate(ts):
                     f.write("%d\t%s\t%s\t%d\t%.6f\n" % (workers, name, lib, i, t))
+        clang, hbc_final = self.llvm_compiler(), self.hbc_final_compiler()
         config = {
             "date": datetime.datetime.now().isoformat(timespec="seconds"),
             "args": vars(self.args), "libraries": self.libs, "workers": self.workers,
@@ -545,7 +609,8 @@ class Comparison:
             "revisions": {lib: self.library_revision(lib) for lib in self.libs},
             "compilers": {
                 "clang14": capture("%s/bin/clang++ --version | head -1" % LLVM14),
-                "repo_clang": capture("%s/llvm-project/build/bin/clang++ --version | head -1" % SCRIPT_DIR),
+                "clang": clang,   # stock, spork and seq
+                "hbc_final": hbc_final,   # hbc's and baseline's final -O3 compile
                 "opencilk": capture("/opt/opencilk/bin/clang++ --version 2>/dev/null | head -1")},
             "cpu": capture("lscpu | grep 'Model name' | sed 's/.*: *//'"),
             "failures": self.failures,
@@ -573,8 +638,15 @@ class Comparison:
                  "- Repetitions: %d warmup (discarded) + %d timed, %d process(es) per library" % (
                      self.args.warmup, self.args.trials, self.args.processes),
                  "- %s; input size `%s`" % ("; ".join(heartbeats), self.args.input_size),
-                 "- Targets: %s" % self.targets(),
-                 "- Revisions: %s" % ", ".join("%s %s" % kv for kv in config["revisions"].items())]
+                 "- Targets: %s" % self.targets()]
+        llvm_libs = [l for l in self.libs if l in LLVM_LIBS]
+        if llvm_libs:
+            lines.append("- Compiler for %s: `%s`" % (", ".join("`%s`" % l for l in llvm_libs), clang or "unknown"))
+        hbc_libs = [l for l in self.libs if l in ("hbc", "baseline")]
+        if hbc_libs:
+            lines.append("- Final -O3 compile of %s: `%s` (front end, NOELLE and HBC: clang 14)"
+                         % (", ".join("`%s`" % l for l in hbc_libs), hbc_final or "unknown"))
+        lines.append("- Revisions: %s" % ", ".join("%s %s" % kv for kv in config["revisions"].items()))
         for workers in self.workers:
             libs = [l for l in self.libs if self.runs_at(l, workers)]
             if not libs:

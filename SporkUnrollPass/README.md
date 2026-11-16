@@ -150,6 +150,24 @@ The repository `Makefile` uses this plugin by default (`make sum`); pass
 (shared token across two inlined copies, unsigned index, cast-free index,
 multi-block body, store-only body) and prints `ALL OK`.
 
+The source also builds against stock LLVM 19 (`llvm-19/`, the LLVM OpenCilk
+3.0 is based on, which the benchmark harnesses use unless given `--llvm repo`),
+into its own build directory:
+
+```sh
+cmake -S SporkUnrollPass -B SporkUnrollPass/build-llvm19 \
+  -DLLVM_DIR="$PWD/llvm-19/build/lib/cmake/llvm" -DCMAKE_BUILD_TYPE=Release
+cmake --build SporkUnrollPass/build-llvm19 -j8
+llvm-19/build/bin/clang++ -O3 -fpass-plugin="$PWD/SporkUnrollPass/build-llvm19/SporkUnroll.so" ...
+```
+
+LLVM 19's clang parses `-mllvm` options before it loads `-fpass-plugin`
+plugins, so the options above also need `-Xclang -load -Xclang <plugin>`.
+LLVM 19's vectorizer leaves a copy of the induction beside the vector loop's
+own counter; the pass merges the two (as IndVarSimplify would) before
+matching step loops, which gives it the decisions it makes under the repo's
+LLVM on `test/protocol_test.cpp`, generic and `-march=native`.
+
 ## Results on `sum.cpp` (800M shorts, `-march=native`)
 
 | Build | 1 worker | 20 workers |

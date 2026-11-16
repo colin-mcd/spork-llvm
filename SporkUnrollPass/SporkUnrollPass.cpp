@@ -43,6 +43,8 @@
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
@@ -55,7 +57,11 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Passes/PassBuilder.h"
+#if __has_include("llvm/Plugins/PassPlugin.h")
 #include "llvm/Plugins/PassPlugin.h"
+#else
+#include "llvm/Passes/PassPlugin.h" // LLVM 19
+#endif
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
@@ -67,6 +73,7 @@
 #include "llvm/Transforms/Utils/LCSSA.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/LoopSimplify.h"
+#include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include "llvm/Transforms/Vectorize/LoopVectorize.h"
 #include "llvm/Transforms/Vectorize/SLPVectorizer.h"
@@ -77,6 +84,41 @@
 #define DEBUG_TYPE "spork-unroll"
 
 using namespace llvm;
+
+// The plugin builds against the repo's LLVM and against stock LLVM 19 (the
+// version OpenCilk 3.0 is based on), not the versions in between.  LLVM 19
+// lacks three names used below; they are defined here in its terms.
+#if LLVM_VERSION_MAJOR <= 19
+namespace {
+// LLVM 19 has one BranchInst for both kinds of branch, where later LLVM has
+// CondBrInst and UncondBrInst.  These are views, like IntrinsicInst's
+// subclasses: never constructed, only the targets of isa, cast and dyn_cast.
+struct CondBrInst : BranchInst {
+  static bool classof(const Instruction *I) {
+    auto *B = dyn_cast<BranchInst>(I);
+    return B && B->isConditional();
+  }
+  static bool classof(const Value *V) {
+    return isa<Instruction>(V) && classof(cast<Instruction>(V));
+  }
+};
+
+struct UncondBrInst : BranchInst {
+  static bool classof(const Instruction *I) {
+    auto *B = dyn_cast<BranchInst>(I);
+    return B && B->isUnconditional();
+  }
+  static bool classof(const Value *V) {
+    return isa<Instruction>(V) && classof(cast<Instruction>(V));
+  }
+};
+
+// A pass the pass manager may skip (optnone functions, opt-bisect), which is
+// what every pass without an isRequired() is in LLVM 19.
+template <typename DerivedT>
+using OptionalPassInfoMixin = PassInfoMixin<DerivedT>;
+} // namespace
+#endif
 
 static cl::opt<unsigned> SporkMaxBatch(
     "spork-max-batch", cl::init(1024), cl::Hidden,
@@ -616,6 +658,31 @@ static void eraseProbe(ProbeInfo &PI, FunctionAnalysisManager &FAM) {
   PI.Probe = nullptr;
 }
 
+#if LLVM_VERSION_MAJOR <= 19
+// LLVM 19's vectorizer keeps the original induction beside the vector loop's
+// own counter, both {0,+,step}: one addresses memory, the other is compared
+// with the trip count.  Later LLVM emits a single induction, the one shape
+// matchStepLoop accepts.  Fold the copies into one, as IndVarSimplify would.
+static void mergeCongruentInductions(Function &F,
+                                     FunctionAnalysisManager &FAM) {
+  auto &LI = FAM.getResult<LoopAnalysis>(F);
+  auto &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
+  auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+  auto &TTI = FAM.getResult<TargetIRAnalysis>(F);
+  SmallVector<WeakTrackingVH, 16> DeadInsts;
+  for (Loop *L : LI.getLoopsInPreorder()) {
+    SCEVExpander Rewriter(SE, F.getParent()->getDataLayout(), "spork.iv");
+    Rewriter.replaceCongruentIVs(L, &DT, DeadInsts, &TTI);
+  }
+  if (DeadInsts.empty())
+    return;
+  RecursivelyDeleteTriviallyDeadInstructionsPermissive(DeadInsts);
+  PreservedAnalyses PA;
+  PA.preserveSet<CFGAnalyses>();
+  FAM.invalidate(F, PA);
+}
+#endif
+
 // Outline the sequential copy:
 //
 //   define <liveouts> @probe(inputs..., BoundTy %bound, ptr %progress,
@@ -819,6 +886,9 @@ static ProbeInfo buildProbe(Module &M, const LoopProtocol &P,
     FPM.addPass(LCSSAPass());
     FPM.run(*Probe, FAM);
   }
+#if LLVM_VERSION_MAJOR <= 19
+  mergeCongruentInductions(*Probe, FAM);
+#endif
   PI.Vectorized = hasVectorLoop(FAM.getResult<LoopAnalysis>(*Probe));
   if (!PI.Vectorized) {
     // Not vectorized: see what the unroller would do instead.
@@ -876,7 +946,7 @@ struct SinkPlan {
   BasicBlock *Exit;
   DominatorTree &DT;
   Instruction *Skip;
-  DenseMap<Instruction *, bool> Needs;
+  DenseMap<Instruction *, bool> Needs{}; // LLVM 19's default ctor is explicit
   const char *Failure = nullptr;
 
   bool needs(Instruction *I) {
@@ -1595,11 +1665,18 @@ llvm::PassPluginLibraryInfo getSporkUnrollPluginInfo() {
         // Runs after the function simplification pipeline (inlining, SROA,
         // LICM, IndVars, ...) and before the vector/unroll pipeline, so the
         // marked loop looks the way the vectorizer will see it.
+#if LLVM_VERSION_MAJOR <= 19
+        PB.registerOptimizerEarlyEPCallback(
+            [](ModulePassManager &MPM, OptimizationLevel Level) {
+              addSporkPipeline(MPM, Level.getSpeedupLevel());
+            });
+#else
         PB.registerOptimizerEarlyEPCallback(
             [](ModulePassManager &MPM, OptimizationLevel Level,
                ThinOrFullLTOPhase) {
               addSporkPipeline(MPM, static_cast<unsigned>(Level));
             });
+#endif
         PB.registerPipelineParsingCallback(
             [](StringRef Name, ModulePassManager &MPM,
                ArrayRef<PassBuilder::PipelineElement>) {
